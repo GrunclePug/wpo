@@ -16,12 +16,16 @@ from . import ENTRY_POINT, SKILL_ROOT
 
 def entrypoint() -> int:
     """Run the CLI with actionable errors for an unavailable T3 backend."""
+    from .boot import BootError
     from .t3 import T3Error
 
     try:
         return main()
     except T3Error as error:
         print(f"T3 backend: {error}", file=sys.stderr)
+        return 4
+    except BootError as error:
+        print(f"Boot safety: {error}", file=sys.stderr)
         return 4
 
 
