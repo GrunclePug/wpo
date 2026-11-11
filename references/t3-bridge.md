@@ -47,7 +47,9 @@ only; running/stalled entries are not new launch requests.
   read the entire file before acting, in chunks if its reader truncates output, and stop if the file
   cannot be read. The original request payload and prompt log retain the full context for recovery.
 - **Message request:** call the provided `t3_thread_send` plan in steer mode for the existing active
-  session. Record success only after native delivery succeeds.
+  session. Record success only after native delivery succeeds. The plan names the project's
+  user-facing coordinator for requested replies; a worker's immediate WP coordinator is a
+  separate thread. When the user asks for a report back, deliver it to that user-facing thread.
 - **Cancel request:** call the provided `task_cancel` plan. Do not interrupt a delegated child using
   `t3_thread_interrupt`. Record the cancellation callback; Python keeps its task IDs and files.
 - **Attention event:** inspect the reported WPO event and relevant artifacts, take authorized action
@@ -115,7 +117,10 @@ Reconcile known native IDs after completion. Only after verifying no native laun
 `wpo t3 retry-unlaunched --request <id>` requeue a stalled unlaunched request with the same retry key.
 
 The dashboard shows native request states, task links, recorded pending native approvals and the
-existing WPO board/log views. Live provider tool/token telemetry depends on actual callbacks;
+existing WPO board/log views. Opening a native session transcript reads its latest 100 conversation
+messages once through the supported `t3 thread show` CLI. Refreshing the transcript explicitly
+reads a new snapshot; it does not poll tasks or provide live tool activity. A CLI read failure
+is displayed alongside the retained local log. Live provider tool/token telemetry depends on actual callbacks;
 missing usage is explicitly unparsed, not a zero-cost session. T3 must be running, and its attached
 coordinator provider must be usable. A stopped T3 app or exhausted coordinator quota requires
 recovery after availability returns; a Python daemon cannot impersonate an active T3 agent.

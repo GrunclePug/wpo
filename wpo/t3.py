@@ -123,6 +123,33 @@ class Bridge:
         if not Path(configured).expanduser().is_file() and not shutil.which(configured):
             raise T3Error(f"T3 CLI {configured!r} is unavailable; configure t3.cli. No model CLI fallback is permitted.")
 
+    def thread_snapshot(self, request_id: str) -> dict:
+        """Read a session's latest conversation once, on an explicit transcript request."""
+        request = read_json(self.request_path(request_id), {})
+        thread_id = request.get("thread_id")
+        if request.get("kind") != "session" or not isinstance(thread_id, str) or not thread_id:
+            raise T3Error("This native session has no recorded T3 thread yet. Refresh after it starts.")
+        command = [str(Path(self.settings.get("cli", "t3")).expanduser()), "thread", "show", thread_id,
+                   "--messages", "100", "--json"]
+        if self.settings.get("base_dir"):
+            command += ["--base-dir", str(Path(self.settings["base_dir"]).expanduser())]
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=15, check=False)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise T3Error(f"Could not read the T3 conversation: {error}") from error
+        if completed.returncode:
+            raise T3Error(f"Could not read the T3 conversation: {(completed.stderr or completed.stdout).strip()[:1000]}")
+        try:
+            snapshot = json.loads(completed.stdout)
+        except ValueError as error:
+            raise T3Error("T3 returned an unreadable conversation response.") from error
+        if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("thread"), dict)
+                or snapshot["thread"].get("threadId") != thread_id or not isinstance(snapshot.get("messages"), list)
+                or any(not isinstance(message, dict) or message.get("role") not in ("user", "assistant")
+                       or not isinstance(message.get("text"), str) for message in snapshot["messages"])):
+            raise T3Error("T3 returned an unexpected conversation response.")
+        return snapshot
+
     def attention(self, event: dict) -> None:
         if not self.coordinator:
             return  # The original event journal remains the source of truth before attachment.
@@ -260,7 +287,13 @@ class Bridge:
                          "role": payload["native_role"], "target": payload["target"], "clientRequestId": request["id"]}
             return {"tool": "delegate_task", "arguments": arguments}
         if request["kind"] == "message":
-            return {"tool": "t3_thread_send", "arguments": {"threadId": payload["thread_id"], "message": payload["message"],
+            message = payload["message"]
+            if self.coordinator:
+                message += (f"\n\nWPO reply routing: the project's user-facing orchestrator is T3 thread {self.coordinator}. "
+                            "If the user's message asks you to report back to the user or orchestrator, send that requested reply "
+                            "to this user-facing thread using t3_thread_send. Your immediate WP coordinator is a different thread; "
+                            "an acknowledgement there alone does not reach the user's chat. Continue the assigned work after replying.")
+            return {"tool": "t3_thread_send", "arguments": {"threadId": payload["thread_id"], "message": message,
                                                             "mode": "steer", "clientRequestId": request["id"]}}
         if request["kind"] == "cancel":
             return {"tool": "task_cancel", "arguments": {"taskId": payload["task_id"]}}
