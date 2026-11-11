@@ -132,16 +132,30 @@ def merge_policy(base: dict, override: dict) -> dict:
     merged = dict(base)
     for key, value in override.items():
         if key == "routes_extra":
-            merged["routes"] = list(base["routes"]) + list(value)
+            continue
         elif isinstance(value, dict) and isinstance(base.get(key), dict):
             merged[key] = merge_policy(base[key], value)
         else:
             merged[key] = value
+    if "routes_extra" in override:
+        if not isinstance(override["routes_extra"], list):
+            raise RoutingError("routing.routes_extra must be a list of route objects")
+        merged["routes"] = list(merged["routes"]) + override["routes_extra"]
     return merged
 
 
 def load_policy(override: dict | None = None) -> dict:
     return merge_policy(json.loads(TIERS_FILE.read_text(encoding="utf-8")), override or {})
+
+
+def route_rule_list(policy: dict, key: str) -> set[str]:
+    """Validate route rule lists without interpreting a string as route characters."""
+    values = policy.get(key, [])
+    if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values):
+        raise RoutingError(f"routing.{key} must be a list of nonempty strings")
+    if key == "routes_exclude" and any(value.startswith("family:") and not value.removeprefix("family:").strip() for value in values):
+        raise RoutingError("routing.routes_exclude family selectors require a name: family:<name>")
+    return set(values)
 
 
 # ------------------------------------------------------------------------------------- work specs
@@ -345,6 +359,8 @@ class Router:
         self.machine = machine
         self.project = project
         self.policy = merge_policy(load_policy(machine.raw.get("routing")), policy_override or {})
+        for key in ("routes_exclude", "gate_only_routes", "pin_only_routes", "pin_only_efforts"):
+            route_rule_list(self.policy, key)
         self.emit = emit or (lambda kind, message: None)
         self.state_dir = machine.state_dir / "router"
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -654,10 +670,12 @@ class Router:
         return (taste_rank, cost_rank, score_rank, family_rank, route.id)
 
     def all_routes(self, families: Iterable[str], force_refresh: bool = False) -> list[Route]:
+        """Configured routes after exclusions; gate/pin restrictions apply during selection."""
         routes = static_routes(self.policy)
         if "free" in families:
             routes += self.catalog_routes(force_refresh)
-        return routes
+        excluded = route_rule_list(self.policy, "routes_exclude")
+        return [route for route in routes if route.id not in excluded and f"family:{route.family}" not in excluded]
 
     def select(self, spec_text: str, families: Iterable[str] | None = None, force_refresh: bool = False,
                free_last_resort: bool = True, gate: bool = False) -> Selection:
@@ -666,10 +684,12 @@ class Router:
         instead of waiting while every paid route is capped, paced or cooling down. Reviews pass
         False: they are the gate into main. Local routes are only reachable by a pin. A pin skips the weekly pace, never the ceilings.
         Routes at a `pin_only_efforts` effort (max), and the `pin_only_routes` a project sets aside, are reachable only by a pin; the efforts never for a
-        `gate` session (a review or re-evaluation), pinned or not."""
+        `gate` session (a review or re-evaluation), pinned or not. `gate_only_routes` are eligible
+        only for gates, even when pinned. `routes_exclude` removes routes before ranking or pins."""
         spec = resolve_work_spec(spec_text, self.policy)
-        pin_only_efforts = set(self.policy.get("pin_only_efforts", []))
-        pin_only_routes = set(self.policy.get("pin_only_routes", []))
+        pin_only_efforts = route_rule_list(self.policy, "pin_only_efforts")
+        pin_only_routes = route_rule_list(self.policy, "pin_only_routes")
+        gate_only_routes = route_rule_list(self.policy, "gate_only_routes")
         allowed = set(families or self.families)
         unknown = allowed - set(self.families)
         if unknown:
@@ -680,13 +700,22 @@ class Router:
         if spec.pinned_route:
             pinned = [route for route in routes if route.id == spec.pinned_route]
             if not pinned:
+                excluded = route_rule_list(self.policy, "routes_exclude")
+                if spec.pinned_route in excluded:
+                    raise RoutingError(f"pinned route '{spec.pinned_route}' is excluded by routing.routes_exclude")
+                route = self.find_route(spec.pinned_route)
+                if f"family:{route.family}" in excluded:
+                    raise RoutingError(f"pinned route '{spec.pinned_route}' is excluded by routing.routes_exclude")
                 raise RoutingError(f"pinned route '{spec.pinned_route}' is not a known route")
+            if not gate and pinned[0].id in gate_only_routes:
+                raise RoutingError(f"'{spec.pinned_route}' is reserved for reviews and re-evaluations by routing.gate_only_routes")
             if gate and pinned[0].effort in pin_only_efforts and pinned[0].family != "local":
                 raise RoutingError(f"reviews and re-evaluations never run at {pinned[0].effort} effort; '{spec.pinned_route}' cannot be pinned for one")
             ranked = [(pinned[0], False)]
         else:
             tier = self.policy["tiers"][spec.tier]
-            eligible = [route for route in family_frontiers(routes) if route.family in allowed and route.family != "local"
+            permitted = [route for route in routes if gate or route.id not in gate_only_routes]
+            eligible = [route for route in family_frontiers(permitted) if route.family in allowed and route.family != "local"
                         and route.effort not in pin_only_efforts and route.id not in pin_only_routes and (route.writes_code or not tier["writes_code"])]
             qualified = sorted((r for r in eligible if r.score >= tier["floor"]), key=lambda r: self.ordering_key(r, spec.taste))
             downgrades = sorted((r for r in eligible if tier["fallback_floor"] <= r.score < tier["floor"]), key=lambda r: -r.score)
@@ -716,6 +745,10 @@ class Router:
     # ------------------------------------------------------------------------------------- marks
 
     def find_route(self, route_id: str) -> Route:
+        """Look up configured/cached metadata, including excluded routes in historical records.
+
+        This does not authorize execution; selection enforces exclusions and gate restrictions.
+        """
         routes = static_routes(self.policy) + [Route(**entry) for entry in read_json(self.catalog_path, {"routes": []})["routes"]]
         match = next((route for route in routes if route.id == route_id), None)
         if match is None:

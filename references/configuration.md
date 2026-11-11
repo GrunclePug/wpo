@@ -25,7 +25,8 @@ The full defaults and accessors are in [wpo/machine.py](../wpo/machine.py).
   Portable defaults search `.agents`, `.codex`, then `.claude` under the home directory.
 - `reviewer_agent`, `user_rules`: optional reviewer definition and selected sections of global
   instructions copied into legacy briefs. No personal skill or named instruction section is
-  required by default. Configure your own headings and paths explicitly.
+  required by default. Configure your own headings and paths explicitly; ordered multi-file
+  `user_rules` entries can also carry whole files, as documented below.
 - `gpt_proxy`: proxy port, executable, config, token-file path, model-pins file, background tier,
   and optional context-window corrections. The existing adapter expects a loopback CLIProxyAPI
   speaking Anthropic messages with `gpt_tiers` pins; it is not a generic T3 provider adapter.
@@ -38,7 +39,65 @@ The full defaults and accessors are in [wpo/machine.py](../wpo/machine.py).
   autofix policy, context limits, or machine environment notes. Project JSON wins over these.
 - `routing`: model routes, tier floors, family preference, effort policy, quota ceilings and
   weekly pace. Machine routing overlays the bundled snapshot; project `routing` overlays that.
-  `routes` replaces the list; `routes_extra` appends at each layer.
+  `routes` replaces the list; `routes_extra` appends after that replacement at each layer,
+  independently of JSON key order. Route restriction lists are described below.
+
+### Route restrictions
+
+All four settings below are lists of nonempty strings under `routing`. Lists replace the
+previous layer, so project `routes_exclude: []` clears machine exclusions.
+
+- `routes_exclude`: remove exact route IDs or every route matching `family:<name>`. Applies to
+  static routes, dynamically discovered free routes, and explicit pins. Excluded routes never
+  influence the family Pareto frontier, and pinning one raises an error. This changes execution
+  selection, not stored catalog/history: `find_route` still resolves configured/cached metadata
+  for reports and failure marks; `all_routes` returns only non-excluded routes.
+- `gate_only_routes`: exact route IDs reserved for reviews and re-evaluations (`gate=True`).
+  Builders cannot use them automatically or by pinning. Gates may rank them automatically;
+  unavailable gate-only routes do not remove builder alternatives from its Pareto frontier.
+- `pin_only_routes`: exact route IDs available only through explicit pins, including for gates.
+  Combining this with `gate_only_routes` requires both a pin and a gate session.
+- `pin_only_efforts`: efforts available only through pins; non-local gate sessions may never
+  use these efforts, even when their route is gate-only and explicitly pinned.
+
+Restrictions apply together. Neither a pin nor a gate overrides an exclusion, a usage ceiling,
+or native provider availability. Family selectors are supported only in `routes_exclude`;
+the other route lists require exact IDs. For example:
+
+```json
+{
+  "routing": {
+    "routes_exclude": ["family:agy", "gpt-sol-low"],
+    "gate_only_routes": ["claude-opus-high"],
+    "pin_only_routes": [],
+    "pin_only_efforts": ["max"]
+  }
+}
+```
+
+### Carried user rules
+
+`user_rules` accepts an ordered list of file objects. Each `file` is an explicit path (with
+optional `~` expansion). Omit `sections` or set it to `null` to include the whole file; set
+`sections` to a list of exact `##` heading names to include those sections in the chosen order.
+Nested `###` content stays with its section. An empty `sections: []` disables that entry without
+reading its file. An empty top-level list disables all carried rules.
+
+```json
+{
+  "user_rules": [
+    {"file": "~/.agents/AGENTS.md", "sections": ["Correctness", "Shell and links"]},
+    {"file": "~/.agents/RTK.md"}
+  ]
+}
+```
+
+Entries and sections retain their order. Missing active files or headings and malformed values
+raise errors naming the configuration field. The legacy single-object form remains supported:
+`{"file": "...", "sections": ["Heading"]}` includes selected sections, while an empty,
+omitted, or `null` `sections` disables it. Whole-file inclusion requires the new list form.
+Existing single-object deployments keep their
+disabled-by-default behavior.
 
 Bundled model IDs, scores, and prices are example snapshots with dates, not promises of current
 availability. Put your actual deployed model catalog and preferences in machine `routing`.
