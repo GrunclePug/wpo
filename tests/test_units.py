@@ -797,6 +797,63 @@ class RoundLedgerTests(unittest.TestCase):
         self.assertEqual((found[-1][0], found[-1][1].strip(DECISION_ARGUMENT_TRIM)), ("escalate", "frontier"))
         self.assertEqual(DECISION.findall("no decision here"), [])
 
+    def test_reviews_leave_out_the_last_builders_model_family_only_when_independent(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo.runner import RoundLedger, WorkPackageRun
+        ledger = RoundLedger(Path(tempfile.mkdtemp()) / "attempts.json")
+        policy: dict = {}
+        logged: list[str] = []
+        runner = SimpleNamespace(ledger=ledger, context=SimpleNamespace(router=SimpleNamespace(policy=policy)), log=logged.append)
+        self.assertEqual(WorkPackageRun.independent_review_exclusion(runner), [])
+        agy_opus = {"id": "agy-opus", "family": "agy", "model_family": "claude"}
+        sol = {"id": "sol", "family": "gpt", "model_family": None}
+        for role, route, family in (("builder", agy_opus, "claude"), ("executor", sol, "gpt"), ("assembler", agy_opus, "claude"),
+                                    ("planner", sol, "claude"), ("reviewer", sol, "claude"), ("builder", sol, "gpt")):
+            WorkPackageRun.record_writer(runner, role, route)
+            self.assertEqual(RoundLedger(ledger.path).state["builder_model_family"], family, role)
+        self.assertEqual(WorkPackageRun.independent_review_exclusion(runner), [])
+        policy["independent_reviews"] = True
+        self.assertEqual(WorkPackageRun.independent_review_exclusion(runner), ["gpt"])
+        self.assertIn("gpt", logged[-1])
+        ledger.reset()
+        self.assertEqual(WorkPackageRun.independent_review_exclusion(runner), [])
+        self.assertIn("not recorded", logged[-1])
+        # A ledger written before the family was recorded: its last builder session's route tells.
+        runner.context.router.find_route = lambda route_id: routing.Route(route_id, "claude", "claude", "opus", "high", 54, True, "subscription")
+        ledger.record_builder({"route": "claude-opus-high", "harness": "claude", "session_id": "s", "context_tokens": 1, "head": "h", "spec": "code"})
+        self.assertEqual(WorkPackageRun.independent_review_exclusion(runner), ["claude"])
+
+    def test_staged_and_paused_sessions_record_who_built_the_wp(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo import runner as runner_module
+        from wpo.runner import RoundLedger, RunPaused, WorkPackageRun
+        from wpo.session import CompactionStop
+        directory = Path(tempfile.mkdtemp())
+        ledger = RoundLedger(directory / "attempts.json")
+        fake = SimpleNamespace(ledger=ledger, run_dir=directory, tree=directory, families=[], options=SimpleNamespace(idle_minutes=None),
+                               wp_id="WP-0001", env={}, context=None, log=lambda message: None, mode="standard", mode_recorder=lambda mode: None)
+        fake.record_writer = lambda role, route: WorkPackageRun.record_writer(fake, role, route)
+        sol = {"id": "sol", "family": "gpt", "model_family": None}
+        with mock.patch.object(runner_module, "run_session", return_value=SimpleNamespace(route=sol, fallback_note="")), \
+                mock.patch.object(runner_module, "inbox_of", return_value=None), \
+                mock.patch.object(runner_module, "pause_requested", side_effect=[None, None, None, "paused"]):
+            WorkPackageRun.session(fake, "code", "executor", "prompt", directory / "executor", "todo")
+            self.assertEqual(RoundLedger(ledger.path).state["builder_model_family"], "gpt")
+            ledger.state["builder_model_family"] = None
+            with self.assertRaises(RunPaused):
+                WorkPackageRun.session(fake, "code", "assembler", "prompt", directory / "assembler", "todo")
+        self.assertEqual(RoundLedger(ledger.path).state["builder_model_family"], "gpt")
+        # An assembler stopped at compaction may have finished the WP: it is still the latest writer.
+        fake.context = SimpleNamespace(router=SimpleNamespace(find_route=lambda route_id: routing.Route(
+            route_id, "agy", "agy", "opus", "high", 54, True, "free", model_family="claude")))
+        with mock.patch.object(runner_module, "run_session", side_effect=CompactionStop("agy-opus", directory / "log")), \
+                mock.patch.object(runner_module, "inbox_of", return_value=None), \
+                mock.patch.object(runner_module, "pause_requested", return_value=None), self.assertRaises(CompactionStop):
+            WorkPackageRun.session(fake, "code", "assembler", "prompt", directory / "assembler", "todo")
+        self.assertEqual(RoundLedger(ledger.path).state["builder_model_family"], "claude")
+
     def test_attempt_ledgers_migrate(self) -> None:
         from wpo.runner import RoundLedger
         path = Path(tempfile.mkdtemp()) / "attempts.json"

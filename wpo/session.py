@@ -603,7 +603,7 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
                 lead: bool = False, stop_on_compaction: bool = False, skills: Iterable[str] = (),
                 resume: ResumeTarget | None = None, inbox: Path | None = None, resume_only: bool = False,
                 handoff_message: Callable[[str], str] | None = None, recovery: Callable[[str], str] | None = None,
-                on_attempt: Callable[[], None] | None = None) -> SessionResult:
+                on_attempt: Callable[[], None] | None = None, exclude_model_families: Iterable[str] = ()) -> SessionResult:
     """Runs one session on the first route that completes it; `{{ROUTE}}` in the prompt becomes
     the route id. `skills` are loaded into the session's brief. With `resume`, that session is
     continued first when its route is still a candidate; a resume that does not complete falls
@@ -613,7 +613,8 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
     (HandoffTrigger). With `recovery`, a session that fails on its route is assumed to have stopped
     mid-write: `recovery(why)` reports what it left, and the next route's prompt ends with that
     report. The report is made only once a next route is chosen: its Verify run can take an hour,
-    wasted when no route is left. Raises NoRouteError when no route is left, CompactionStop when asked to. `on_attempt()` runs each
+    wasted when no route is left. `exclude_model_families` leaves out the routes whose models those
+    families made (an independent review). Raises NoRouteError when no route is left, CompactionStop when asked to. `on_attempt()` runs each
     time a chosen route is about to start a session."""
     if access in WRITES_LISTED_PATHS and not list(write_paths):
         raise ValueError(f"access '{access}' needs write paths")
@@ -633,7 +634,8 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
     # Why the last session failed, until the next route's prompt carries the recovery report.
     recovery_due: str | None = None
     if resume is not None:
-        selection = context.router.select(spec, families or None, free_last_resort=free_last_resort, gate=not free_last_resort)
+        selection = context.router.select(spec, families or None, free_last_resort=free_last_resort, gate=not free_last_resort,
+                                          exclude_model_families=exclude_model_families)
         route = next((candidate for candidate in selection.candidates if candidate["id"] == resume.route_id), None)
         if route is None:
             if resume_only:
@@ -656,7 +658,8 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
             if outcome is not None:
                 recovery_due = f"the continued session on {route['id']} failed ({detail})"
     while True:
-        selection = context.router.select(spec, families or None, free_last_resort=free_last_resort, gate=not free_last_resort)
+        selection = context.router.select(spec, families or None, free_last_resort=free_last_resort, gate=not free_last_resort,
+                                          exclude_model_families=exclude_model_families)
         route = next((candidate for candidate in selection.candidates if candidate["id"] not in tried), None)
         if route is None:
             skipped = "; ".join(f"{entry['id']}: {entry['reason']}" for entry in selection.skipped)

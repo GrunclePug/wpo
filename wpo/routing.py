@@ -371,6 +371,9 @@ class Route:
     cost_per_task: float | None = None
     index_tokens_m: float | None = None
     output_speed: float | None = None
+    # Who made the model, when that differs from the family whose quota the route spends (an agy
+    # route can run a Claude model). Independent reviews compare it; None means `family`.
+    model_family: str | None = None
 
     @property
     def index_hours(self) -> float | None:
@@ -401,9 +404,17 @@ def static_routes(policy: dict) -> list[Route]:
             cost_per_task=entry.get("cost_per_task"),
             index_tokens_m=entry.get("index_tokens_m"),
             output_speed=entry.get("output_speed"),
+            model_family=entry.get("model_family"),
         )
         for entry in policy["routes"]
     ]
+
+
+def model_family_of(route: Route | dict) -> str:
+    """Who made the route's model: its `model_family`, else its family."""
+    if isinstance(route, dict):
+        return route.get("model_family") or route["family"]
+    return route.model_family or route.family
 
 
 def frontier_measures(route: Route) -> tuple[float, float, float] | None:
@@ -832,14 +843,17 @@ class Router:
         return [route for route in routes if route.id not in excluded and f"family:{route.family}" not in excluded]
 
     def select(self, spec_text: str, families: Iterable[str] | None = None, force_refresh: bool = False,
-               free_last_resort: bool = True, gate: bool = False, oracle: AvailabilityOracle | None = None) -> Selection:
+               free_last_resort: bool = True, gate: bool = False, oracle: AvailabilityOracle | None = None,
+               exclude_model_families: Iterable[str] = ()) -> Selection:
         """Ranks the routes for a work spec. With `free_last_resort`, free routes at or above the
         policy's `free_last_resort.floor` come last for every tier, so work proceeds on a free model
         instead of waiting while every paid route is capped, paced or cooling down. Reviews pass
         False: they are the gate into main. Local routes are only reachable by a pin. A pin skips the weekly pace, never the ceilings.
         Routes at a `pin_only_efforts` effort (max), and the `pin_only_routes` a project sets aside, are reachable only by a pin; the efforts never for a
         `gate` session (a review or re-evaluation), pinned or not. `gate_only_routes` are eligible
-        only for gates, even when pinned. `routes_exclude` removes routes before ranking or pins."""
+        only for gates, even when pinned. `routes_exclude` removes routes before ranking or pins.
+        `exclude_model_families` removes the routes whose models those families made (an independent
+        review leaves out the builder's); a pin is an explicit choice and keeps its route."""
         spec = resolve_work_spec(spec_text, self.policy)
         pin_only_efforts = route_rule_list(self.policy, "pin_only_efforts")
         pin_only_routes = route_rule_list(self.policy, "pin_only_routes")
@@ -869,7 +883,8 @@ class Router:
             ranked = [(pinned[0], False)]
         else:
             tier = self.policy["tiers"][spec.tier]
-            permitted = [route for route in routes if gate or route.id not in gate_only_routes]
+            excluded_makers = set(exclude_model_families)
+            permitted = [route for route in routes if (gate or route.id not in gate_only_routes) and model_family_of(route) not in excluded_makers]
             listed = self.tier_routes(spec.tier, spec.mode)
 
             def usable(route: Route) -> bool:

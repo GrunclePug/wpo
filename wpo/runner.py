@@ -33,8 +33,8 @@ from .inbox import clear_pause, inbox_of, pause_requested
 from .platform import kill_tree, pid_alive
 from .project import TASKS_RELATIVE_PATH, git
 from .review_brief import ReviewBrief, build_review_brief
-from .routing import RoutingError, record_wp_mode, resolve_work_spec, spec_mode, with_mode, wp_mode
-from .session import NoRouteError, ResumeFailed, ResumeTarget, SessionResult, run_session, session_facts
+from .routing import Route, RoutingError, model_family_of, record_wp_mode, resolve_work_spec, spec_mode, with_mode, wp_mode
+from .session import CompactionStop, NoRouteError, ResumeFailed, ResumeTarget, SessionResult, run_session, session_facts
 from .session_brief import builder_skills, included_files, reviewer_skills
 from .session_commands import HANDOFF_FILE, SESSION_VERIFIED_TREE_FILE
 from .whats_new import NOTHING_TO_TRY, TRY_IT_SECTION, try_it_problem
@@ -51,6 +51,10 @@ REEVALUATION_SECTION = "Re-evaluation"
 RESUMABLE_FAILURES = ("verification failed", "review requested changes", "builder stopped short", "session interrupted")
 NO_ROUTE_FILE = "no-route.json"
 VERIFIED_TREE_FILE = "verified-tree.txt"
+
+
+# Sessions whose work an independent review judges.
+WRITER_ROLES = ("builder", "executor", "assembler")
 
 
 class RoundLedger:
@@ -79,7 +83,7 @@ class RoundLedger:
     @staticmethod
     def fresh() -> dict:
         return {"rounds": 0, "failures": 0, "evaluations": 0, "feedback": "", "guidance": "", "history": [], "escalated_to": None, "open": False,
-                "last_builder": None, "interruptions": 0, "handoff": None, "handoffs": 0, "writing": None}
+                "last_builder": None, "interruptions": 0, "handoff": None, "handoffs": 0, "writing": None, "builder_model_family": None}
 
     @property
     def last_builder(self) -> dict | None:
@@ -778,10 +782,24 @@ class WorkPackageRun:
             if self.counting_round:
                 self.ledger.uncount()
             raise RunStopped(f"{self.wp_id}: no route for the {role} ({spec})") from error
+        except CompactionStop as stopped:
+            # A staged session stopped at compaction may still have built the WP (an assembler
+            # whose verify passed): it counts as the latest writer.
+            self.record_writer(role, self.context.router.find_route(stopped.route_id))
+            raise
         self.log(f"{role} session ran on {result.route['id']}{result.fallback_note}")
+        self.record_writer(role, result.route)
         if pause_requested(self.run_dir) is not None:
             raise RunPaused(result)
         return result
+
+    def record_writer(self, role: str, route: dict | Route) -> None:
+        """Remembers who made the model of the latest session that built the WP (a builder, or a
+        staged executor or assembler): an independent review leaves that family out. Planners,
+        reviewers, re-evaluations and mechanical repairs build nothing of the WP's design."""
+        if role in WRITER_ROLES:
+            self.ledger.state["builder_model_family"] = model_family_of(route)
+            self.ledger.save()
 
     def mode_recorder(self, mode: str):
         return lambda: record_wp_mode(self.context.project.runs_dir, self.wp_id, mode)
@@ -1135,7 +1153,7 @@ class WorkPackageRun:
         review_number = findings.next_review_number(self.run_dir)
         prompt = review_prompt(self.context, self.wp(), self.tree, review_brief_section(self.context, brief, brief_relative), review_number, self.run_dir)
         result = self.session(self.reviewer_spec, "reviewer", prompt, self.run_dir / f"attempt-{round_number}-review", "review",
-                              skills=reviewer_skills(self.context))
+                              skills=reviewer_skills(self.context), exclude_model_families=self.independent_review_exclusion())
         body = review_text(result.result_text, result.log_path, review_number)
         wpfile.append_to_section(self.wp(), "Review", [f"### Review {review_number}, round {round_number} ({result.route['id']} for {self.reviewer_spec}, {datetime.now():%Y-%m-%d %H:%M})", body])
         verdict = last_verdict(body)
@@ -1163,6 +1181,25 @@ class WorkPackageRun:
         self.log(f"review {review_number} requested changes: {identifiers}")
         self.emit("wp-changes-requested", f"{self.wp_id} review {review_number} requested changes (round {round_number}; open: {identifiers})")
         return findings.builder_feedback(still_open, body)
+
+    def independent_review_exclusion(self) -> list[str]:
+        """With `routing.independent_reviews`, the model family that last built the WP, which its
+        review may not run on; the review waits for another family's route rather than fall back. A
+        ledger written before the family was recorded falls back to its last builder session's route;
+        with neither, the review runs unrestricted and says so."""
+        if not self.context.router.policy.get("independent_reviews"):
+            return []
+        family = self.ledger.state.get("builder_model_family")
+        if not family and (last := self.ledger.last_builder):
+            try:
+                family = model_family_of(self.context.router.find_route(last["route"]))
+            except RoutingError:
+                family = None
+        if not family:
+            self.log("independent review: the WP's builder is not recorded, so no family is left out")
+            return []
+        self.log(f"independent review: routes of {family} models are left out (the builder's)")
+        return [family]
 
     def finish(self, progress: str, event: str) -> None:
         """Marks the WP done and records the tree that was verified, so integration knows whether
