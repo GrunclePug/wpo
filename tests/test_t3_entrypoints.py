@@ -107,6 +107,60 @@ class T3BackendTests(unittest.TestCase):
         self.assertEqual(plan["arguments"]["isolation"], "worktree")
         self.assertNotIn("worktree add", plan["arguments"]["task"])
 
+    def test_large_session_context_is_read_from_a_lossless_utf8_file(self) -> None:
+        prompt = "Complete instructions: 🧟 café\r\n" * 6000
+        request = self.submit(payload={"wp": "WP-0001", "prompt": prompt, "title": "large context",
+                                       "native_role": "implementation", "target": self.bridge.target(ROUTE)})
+        plan = self.bridge.tool_plan(request)
+        self.assertGreater(len(prompt), 120_000)
+        self.assertLess(len(plan["arguments"]["task"]), 120_000)
+        context_file = self.bridge.request_path(request["id"]).with_suffix(".prompt.md")
+        self.assertEqual(context_file.read_bytes(), prompt.encode("utf-8"))
+        self.assertIn(context_file.resolve().as_posix(), plan["arguments"]["task"])
+        self.assertIn("entire file", plan["arguments"]["task"])
+        self.assertIn("stop", plan["arguments"]["task"])
+        self.assertIn("t3 heartbeat --request " + request["id"], plan["arguments"]["task"])
+        self.assertEqual(plan["arguments"]["target"], request["payload"]["target"])
+        self.assertEqual(plan["arguments"]["clientRequestId"], request["id"])
+        self.assertEqual(plan["arguments"]["isolation"], "shared")
+
+    def test_session_context_files_survive_replanning_and_keep_requests_separate(self) -> None:
+        self.bridge.directory = self.root / "run state with spaces" / "t3"
+        target = {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "high"}}
+        first = self.submit(key="first", payload={"wp": "WP-0001", "prompt": "First task", "title": "first",
+                                                  "native_role": "implementation", "target": target})
+        second = self.submit(key="second", payload={"wp": "WP-0001", "prompt": "Independent review", "title": "second",
+                                                    "native_role": "review", "target": target})
+        first_plan = self.bridge.tool_plan(first)
+        self.bridge.tool_plan(second)
+        self.assertEqual(self.bridge.tool_plan(first), first_plan)
+        for request in (first, second):
+            context_file = self.bridge.request_path(request["id"]).with_suffix(".prompt.md")
+            self.assertEqual(context_file.read_text(encoding="utf-8"), request["payload"]["prompt"])
+            self.assertIn(context_file.resolve().as_posix(), self.bridge.tool_plan(request)["arguments"]["task"])
+        self.assertEqual(len(self.bridge.pending("coordinator")), 2)
+
+    def test_session_plan_fails_if_context_cannot_be_published(self) -> None:
+        request = self.submit()
+        with mock.patch("wpo.t3.replace_file", side_effect=PermissionError("context unavailable")), \
+                self.assertRaisesRegex(PermissionError, "context unavailable"):
+            self.bridge.tool_plan(request)
+
+    def test_session_context_publication_replaces_links_without_writing_their_targets(self) -> None:
+        request = self.submit()
+        outside = self.root / "outside-context.md"
+        outside.write_text("Original contents", encoding="utf-8")
+        context_file = self.bridge.request_path(request["id"]).with_suffix(".prompt.md")
+        try:
+            context_file.symlink_to(outside)
+        except OSError:
+            self.skipTest("This account cannot create a file symlink")
+        plan = self.bridge.tool_plan(request)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "Original contents")
+        self.assertFalse(context_file.is_symlink())
+        self.assertEqual(context_file.read_text(encoding="utf-8"), request["payload"]["prompt"])
+        self.assertIn(context_file.resolve().as_posix(), plan["arguments"]["task"])
+
     def test_wake_is_debounced_but_later_requests_get_their_own_wake(self) -> None:
         response = SimpleNamespace(returncode=0, stderr="", stdout="{}")
         with mock.patch("wpo.t3.subprocess.run", return_value=response) as send, mock.patch("wpo.t3.time.time", return_value=100):

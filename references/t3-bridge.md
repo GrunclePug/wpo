@@ -42,6 +42,10 @@ only; running/stalled entries are not new launch requests.
   use `isolation: shared` inside the WP coordinator's assigned checkout. Execute the returned target
   model/options; report unavailable settings instead of substituting. The coordinator must not
   perform the task itself. Do not use `t3_thread_send` to start a review or re-check.
+  Session plans save the complete UTF-8 context beside the durable request as `<request-id>.prompt.md`
+  and send a short instruction to read it, avoiding native task prompt-size limits. The child must
+  read the entire file before acting, in chunks if its reader truncates output, and stop if the file
+  cannot be read. The original request payload and prompt log retain the full context for recovery.
 - **Message request:** call the provided `t3_thread_send` plan in steer mode for the existing active
   session. Record success only after native delivery succeeds.
 - **Cancel request:** call the provided `task_cancel` plan. Do not interrupt a delegated child using
