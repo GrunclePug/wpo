@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -484,6 +485,41 @@ class TierRouteTests(unittest.TestCase):
         routing.set_project_mode(project.runs, "gone")
         self.assertEqual(run(), (0, "gone (modes: standard, hard, not configured: routes as standard)\n"))
 
+    def test_route_status_shows_how_reviews_rank_where_they_differ(self) -> None:
+        import re
+        router = self.router({**self.ROUTING, "gate_only_routes": ["agy-gemini-flash-high"]})
+        def state(router, windows, family, paced=True):
+            return routing.now_utc(), None, None
+
+        catalog = {"refreshed_at": time.time(), "routes": [], "errors": [], "unrated": []}
+        with mock.patch.object(routing.Router, "catalog_routes", return_value=[]), mock.patch.object(routing.Router, "load_catalog", return_value=catalog), \
+             mock.patch.object(routing.Router, "usage_windows", return_value=self.windows(10, 50)), \
+             mock.patch.object(routing.Router, "subscription_state", state):
+            text = router.status_text()
+        rows = {match.group(1): match for line in text.splitlines() if (match := re.match(r"  (\S.*?)\s{2,}(\S.*)$", line))}
+        self.assertTrue(rows["review as a review"].group(2).startswith("agy-gemini-flash-high"), "reviews rank the gate-only route")
+        self.assertNotIn("code-hard@hard as a review", rows, "hard code-hard ranks the same for reviews: no extra line")
+        self.assertEqual(len({match.start(2) for match in rows.values()}), 1, "every row's choices start in one column")
+
+    def test_route_candidates_gate_ranks_as_a_review(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo import cli
+        from wpo.context import Context
+        from wpo.machine import MachineConfig
+        calls = []
+
+        def select(spec, families=None, force_refresh=False, **keywords):
+            calls.append(keywords)
+            return routing.Selection(spec=spec, tier="review")
+
+        context = SimpleNamespace(router=SimpleNamespace(select=select), project=None, machine=None)
+        with mock.patch.object(MachineConfig, "load", return_value=machine_in(Path(tempfile.mkdtemp()))), \
+             mock.patch.object(Context, "load", return_value=context), mock.patch("wpo.dashboard.autostart"), mock.patch("sys.stdout"):
+            cli.main(["route", "candidates", "--spec", "review", "--gate"])
+            cli.main(["route", "candidates", "--spec", "review"])
+        self.assertEqual(calls, [{"free_last_resort": False, "gate": True}, {"free_last_resort": True, "gate": False}])
+
     def test_unknown_listed_routes_are_reported(self) -> None:
         router = self.router({**self.ROUTING, "tier_routes": {"code": {"routes": [["claude-opus-low", "gpt-typo", "free-listed"]]}}})
         with mock.patch.object(routing.Router, "load_catalog", return_value={"routes": [{"id": "free-listed"}]}):
@@ -599,6 +635,108 @@ class TierRouteTests(unittest.TestCase):
         self.assertEqual(routing.with_mode("code-hard", "standard"), "code-hard")
         for spec in ("none", "pin:claude-opus-high", "code@hard"):
             self.assertEqual(routing.with_mode(spec, "hard"), spec)
+
+
+class QuotaGroupTests(unittest.TestCase):
+    """Quota groups wait for their buckets to reset once a bucket passes its ceiling."""
+
+    def router(self, machine_routing: dict, usage: dict | None = None) -> routing.Router:
+        directory = Path(tempfile.mkdtemp())
+        machine = machine_in(directory)
+        machine.raw["routing"] = machine_routing
+        if usage is not None:
+            cache = directory / "usage.json"
+            cache.write_text(json.dumps(usage), encoding="utf-8")
+            machine.raw["usage"] = {**machine.raw["usage"], "cache": str(cache), "max_age_seconds": 10**9}
+        return routing.Router(machine)
+
+    def agy_usage(self, used: dict[str, float], resets_in_hours: float = 2.0) -> dict:
+        resets = (routing.now_utc() + timedelta(hours=resets_in_hours)).timestamp()
+        windows = [{"family": "agy", "label": label, "used_percent": percent, "resets_at": resets,
+                    "window_seconds": 18000 if label.endswith("5h") else 7 * 86400} for label, percent in used.items()]
+        return {"fetched_at": time.time(), "families": [{"family": "agy", "plan": None, "windows": windows, "notes": [], "error": None,
+                                                       "fetched_at": time.time()}]}
+
+    def test_a_quota_group_waits_until_its_buckets_reset(self) -> None:
+        quota = {"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h", "gemini-weekly"]}}, "ceilings": {"five_hour": 70, "weekly": 85}}
+        flash = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "agy-gemini-flash-high")
+        cases = [
+            ("under both ceilings", {"gemini-5h": 69.9, "gemini-weekly": 84.0}, True),
+            ("5-hour bucket at its ceiling", {"gemini-5h": 70.0, "gemini-weekly": 10.0}, False),
+            ("weekly bucket past its ceiling", {"gemini-5h": 0.0, "gemini-weekly": 90.0}, False),
+            ("another group's bucket", {"3p-5h": 100.0}, True),
+        ]
+        for name, used, available in cases:
+            router = self.router({"quota_groups": quota}, usage=self.agy_usage(used))
+            availability = router.oracle().route(flash)
+            self.assertEqual(availability.available, available, name)
+            if not available:
+                self.assertGreater(availability.available_at, routing.now_utc(), name)
+                self.assertIn("agy gemini-", availability.reason, name)
+        unknown = self.router({"quota_groups": quota})
+        self.assertTrue(unknown.oracle().route(flash).available, "unknown usage blocks nothing")
+        spent = self.agy_usage({"gemini-5h": 100.0})
+        argon = dataclasses.replace(flash, id="agy-argon", provider="agy-argon")
+        self.assertTrue(self.router({"quota_groups": quota}, usage=spent).oracle().route(argon).available, "a provider without a group")
+
+    def test_any_family_can_hold_a_quota_group(self) -> None:
+        quota = {"groups": {"team-key": {"family": "gpt", "buckets": ["5h"]}}, "ceilings": {"five_hour": 50, "weekly": 90}}
+        resets = (routing.now_utc() + timedelta(hours=1)).timestamp()
+        usage = {"fetched_at": time.time(), "families": [{"family": "gpt", "error": None,
+                                                          "windows": [{"label": "5h", "used_percent": 60, "resets_at": resets, "window_seconds": 18000}]}]}
+        sol = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "gpt-sol-high")
+        router = self.router({"quota_groups": quota}, usage=usage)
+        with mock.patch.object(routing.AvailabilityOracle, "family", return_value=routing.Availability(True)):
+            self.assertTrue(router.oracle().route(sol).available, "routes outside the group are not held")
+            availability = router.oracle().route(dataclasses.replace(sol, provider="team-key"))
+        self.assertFalse(availability.available)
+        self.assertIn("gpt 5h 60% >= 50%", availability.reason)
+
+    def test_malformed_quota_groups_fail_naming_the_setting(self) -> None:
+        for settings, message in (({"groups": {"agy-gemini": ["gemini-5h"]}, "ceilings": {"five_hour": 70, "weekly": 85}}, r"groups\.agy-gemini"),
+                                  ({"groups": {"agy-gemini": {"family": "agy", "buckets": []}}, "ceilings": {"five_hour": 70, "weekly": 85}}, r"groups\.agy-gemini"),
+                                  ({"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h"]}}}, "ceilings"),
+                                  ({"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h"]}}, "ceilings": {"five_hour": 70}}, "ceilings"),
+                                  ({"group": {}}, "quota_groups must be")):
+            with self.subTest(settings=settings), self.assertRaisesRegex(routing.RoutingError, message):
+                self.router({"quota_groups": settings})
+        self.router({"quota_groups": {"$comment": "x", "groups": {"agy-gemini": {"$why": "x", "family": "agy", "buckets": ["gemini-5h"]}},
+                                      "ceilings": {"five_hour": 70, "weekly": 85}}})  # $-keys are comments
+
+    def windows(self, buckets: dict[str, tuple[float, float]]) -> dict:
+        """Buckets as {label: (used percent, hours until reset)}."""
+        now = routing.now_utc()
+        rows = [{"family": "agy", "label": label, "used_percent": used, "resets_at": (now + timedelta(hours=hours)).timestamp(),
+                 "window_seconds": 18000 if label.endswith("5h") else 7 * 86400} for label, (used, hours) in buckets.items()]
+        return {"fetched_at": time.time(), "families": [{"family": "agy", "plan": None, "windows": rows, "notes": [], "error": None,
+                                                       "fetched_at": time.time()}]}
+
+    def test_a_reset_bucket_unblocks_and_the_latest_reset_wins(self) -> None:
+        quota = {"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h", "gemini-weekly"]}}, "ceilings": {"five_hour": 70, "weekly": 85}}
+        flash = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "agy-gemini-flash-high")
+        reset = self.router({"quota_groups": quota}, usage=self.windows({"gemini-5h": (95.0, -0.1), "gemini-weekly": (10.0, 50)}))
+        self.assertTrue(reset.oracle().route(flash).available, "a reading from before its reset blocks nothing")
+        both = self.router({"quota_groups": quota}, usage=self.windows({"gemini-5h": (95.0, 2), "gemini-weekly": (90.0, 50)}))
+        availability = both.oracle().route(flash)
+        self.assertFalse(availability.available)
+        self.assertGreater(availability.available_at, routing.now_utc() + timedelta(hours=49), "waits for the later reset")
+
+    def test_t3_routes_are_held_once_their_native_target_checks_out(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo import t3
+        quota = {"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h", "gemini-weekly"]}}, "ceilings": {"five_hour": 70, "weekly": 85}}
+        router = self.router({"quota_groups": quota}, usage=self.windows({"gemini-5h": (95.0, 2)}))
+        router.machine.raw["execution_mode"] = "t3"
+        router.project = SimpleNamespace(runs_dir=Path(tempfile.mkdtemp()))
+        flash = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "agy-gemini-flash-high")
+        with mock.patch.object(t3.Bridge, "target", return_value={}) as target:
+            oracle = router.oracle()
+            availability = oracle.route(flash)
+            oracle.route(flash)
+        self.assertFalse(availability.available)
+        self.assertIn("agy gemini-5h", availability.reason)
+        self.assertEqual(target.call_count, 1, "one oracle checks a route's native target once")
 
 
 class EventTests(unittest.TestCase):

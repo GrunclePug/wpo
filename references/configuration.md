@@ -75,6 +75,52 @@ the other route lists require exact IDs. For example:
 }
 ```
 
+### Quota groups
+
+`routing.quota_groups` holds a provider's routes back before the provider itself refuses them.
+`groups` maps a quota group (a route's `provider`, such as `agy-gemini`) to the usage `family`
+whose windows hold its buckets and the `buckets` (window labels) it spends, as the usage adapter reports
+them; `ceilings` gives `five_hour` and `weekly` limits in percent used. Once any bucket of a group
+is at or past its ceiling, that group's routes wait until the bucket resets (a window of five
+hours or less counts as five-hour). Unknown usage blocks nothing: a refused session then cools
+down what the router's failure handling already cools (for agy, the whole provider). Malformed
+settings fail with an error naming the setting.
+
+```json
+{
+  "routing": {
+    "quota_groups": {
+      "groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h", "gemini-weekly"]}},
+      "ceilings": {"five_hour": 70, "weekly": 85}
+    }
+  }
+}
+```
+
+The usage adapter (machine `usage.script`, not bundled) writes the cache at `usage.cache`; wpo
+reads it as JSON and runs the script when the cache is older than `usage.max_age_seconds`:
+
+```json
+{
+  "fetched_at": 1762800000.0,
+  "families": [
+    {"family": "agy", "error": null, "windows": [
+      {"label": "gemini-5h", "used_percent": 42.0, "resets_at": 1762810000.0, "window_seconds": 18000}
+    ]}
+  ]
+}
+```
+
+`fetched_at` and `resets_at` are epoch seconds; a family with an `error` counts as unknown. The
+subscription families (`claude`, `gpt`) are read the same way for ceilings, pace and headroom;
+any other family's windows serve only quota groups.
+
+### Inspecting routes
+
+`wpo route candidates --spec <tier>` ranks a tier as a builder sees it; `--gate` ranks it as a
+review or re-evaluation does (gate-only routes included, no free last resort). `wpo route status`
+lists each tier's first choices, plus an `as a review` line wherever reviews rank differently.
+
 ### Listed tiers and routing modes
 
 `routing.tier_routes` gives a tier an explicit route list instead of its score floors. Each entry
