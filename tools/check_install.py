@@ -25,7 +25,7 @@ def main() -> None:
         raise RuntimeError("Run this check against an installed wheel, outside the source import path")
     for name in ("SKILL.md", "dashboard/index.html", "dashboard/dashboard.js", "dashboard/dashboard.css",
                  "models/tiers.json", "models/scores.json", "templates/config.example.json",
-                 "templates/WP-TEMPLATE.md", "references/t3-bridge.md", "bin/wpo.py"):
+                 "templates/WP-TEMPLATE.md", "references/t3-bridge.md", "references/scheduling.md", "bin/wpo.py"):
         if not (wpo.SKILL_ROOT / name).is_file():
             raise RuntimeError(f"Missing installed resource: {name}")
     with tempfile.TemporaryDirectory(prefix="wpo-installed-") as temporary:

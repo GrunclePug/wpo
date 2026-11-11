@@ -147,23 +147,49 @@ def agent_skills(agent_file: Path) -> list[str]:
 
 
 def carried_user_rules(context: Context) -> str:
-    """Sections of the user's global instructions that hold for every session, CLAUDE.md or not."""
+    """Carry ordered instruction files or exact sections, preserving the legacy disabled form."""
     settings = context.machine.raw["user_rules"]
-    sections = settings["sections"]
-    if not sections:
-        return ""
-    source = Path(settings["file"]).expanduser()
-    if not source.is_file():
-        raise BriefError(f"user rules file {source} does not exist (machine config user_rules.file)")
-    lines = source.read_text(encoding="utf-8").splitlines()
+    if isinstance(settings, dict):
+        entries = [settings]
+        legacy = True
+    elif isinstance(settings, list):
+        entries = settings
+        legacy = False
+    else:
+        raise BriefError("machine config user_rules must be an object or a list of file objects")
     carried = []
-    for heading in sections:
-        try:
-            start = lines.index(f"## {heading}")
-        except ValueError:
-            raise BriefError(f"{source} has no '## {heading}' section (machine config user_rules.sections)") from None
-        end = next((index for index in range(start + 1, len(lines)) if lines[index].startswith("## ")), len(lines))
-        carried.append("\n".join(lines[start:end]).strip())
+    for index, entry in enumerate(entries):
+        location = "user_rules" if legacy else f"user_rules[{index}]"
+        if not isinstance(entry, dict):
+            raise BriefError(f"machine config {location} must be an object with file and optional sections")
+        unknown = entry.keys() - {"file", "sections"}
+        if unknown and not legacy:
+            raise BriefError(f"machine config {location} has unknown keys: {', '.join(sorted(unknown))}")
+        sections = entry.get("sections", [] if legacy else None)
+        if legacy and sections is None:
+            sections = []
+        if sections is not None and (not isinstance(sections, list) or any(not isinstance(heading, str) or not heading.strip() for heading in sections)):
+            raise BriefError(f"machine config {location}.sections must be a list of nonempty headings or null")
+        filename = entry.get("file")
+        if not (legacy and sections == []) and (not isinstance(filename, str) or not filename.strip()):
+            raise BriefError(f"machine config {location}.file must be a nonempty path string")
+        if sections == []:
+            continue
+        source = Path(filename).expanduser()
+        if not source.is_file():
+            raise BriefError(f"user rules file {source} does not exist (machine config {location}.file)")
+        text = source.read_text(encoding="utf-8").strip()
+        if sections is None:
+            carried.append(text)
+            continue
+        lines = text.splitlines()
+        for heading in sections:
+            try:
+                start = lines.index(f"## {heading}")
+            except ValueError:
+                raise BriefError(f"{source} has no '## {heading}' section (machine config {location}.sections)") from None
+            end = next((index for index in range(start + 1, len(lines)) if lines[index].startswith("## ")), len(lines))
+            carried.append("\n".join(lines[start:end]).strip())
     return "\n\n".join(carried)
 
 

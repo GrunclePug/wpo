@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .platform import FileLock, NamedMutex
+from .platform import FileLock, NamedMutex, replace_file
 
 if TYPE_CHECKING:
     from .context import Context
@@ -29,14 +29,21 @@ class T3Error(RuntimeError):
 
 
 def read_json(path: Path, default=None):
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else default
+    # Windows can briefly deny an open while a completion callback replaces the file.
+    for attempt in range(50):
+        try:
+            return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else default
+        except PermissionError:
+            if attempt == 49:
+                raise
+            time.sleep(0.01)
 
 
 def write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     staging.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    os.replace(staging, path)
+    replace_file(staging, path)
 
 
 class Bridge:

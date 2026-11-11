@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import wpfile
+from .boot import ensure_boot
 from .events import Journal
 from .machine import MachineConfig
 from .project import Project, git
@@ -27,6 +28,7 @@ class Context:
         machine = machine or MachineConfig.load()
         project = Project.locate(start, machine.raw.get("project_defaults"), machine.execution_mode)
         journal = Journal(project.runs_dir)
+        ensure_boot(project.runs_dir, journal)
         router = Router(machine, project.config["routing"], lambda kind, message: journal.emit(kind, message), project=project)
         context = cls(project, machine, router, journal)
         if machine.execution_mode == "t3":

@@ -131,6 +131,36 @@ class T3BackendTests(unittest.TestCase):
         timer.join()
         native.assert_not_called()
 
+    def test_callback_read_retries_a_transient_sharing_violation(self) -> None:
+        path = self.root / "callback.json"
+        path.write_text('{"state":"done"}', encoding="utf-8")
+        with mock.patch.object(Path, "read_text", side_effect=[PermissionError("sharing violation"), '{"state":"done"}']), \
+                mock.patch("wpo.t3.time.sleep"):
+            self.assertEqual(read_json(path), {"state": "done"})
+
+    def test_callback_read_preserves_persistent_permission_errors(self) -> None:
+        path = self.root / "callback.json"
+        path.touch()
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("access denied")) as reader, \
+                mock.patch("wpo.t3.time.sleep"), self.assertRaises(PermissionError):
+            read_json(path)
+        self.assertGreater(reader.call_count, 1)
+        self.assertLessEqual(reader.call_count, 50)
+
+    def test_callback_write_retries_a_transient_sharing_violation(self) -> None:
+        path = self.root / "callback.json"
+        replace = Path.replace
+        calls = []
+        def interrupted(source, destination):
+            calls.append(source)
+            if len(calls) == 1:
+                raise PermissionError("sharing violation")
+            return replace(source, destination)
+        with mock.patch.object(Path, "replace", interrupted), mock.patch("wpo.platform.time.sleep"):
+            write_json(path, {"state": "done"})
+        self.assertEqual(read_json(path), {"state": "done"})
+        self.assertEqual(len(calls), 2)
+
     def test_started_callback_cannot_overwrite_fast_workspace_completion(self) -> None:
         request = self.submit("workspace", "workspace", {"wp": "WP-0001"})
         self.bridge.update(request["id"], state="done", result={"path": "native-checkout"})

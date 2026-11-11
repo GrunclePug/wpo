@@ -52,6 +52,7 @@ ATTENTION_KINDS = frozenset({
     "audit-failed",
 })
 INFO_KINDS = frozenset({
+    "boot-changed",
     "wp-done",
     "wp-merged",
     "wp-changes-requested",

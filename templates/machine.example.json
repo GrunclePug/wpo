@@ -21,9 +21,9 @@
     "dirs": ["~/.agents/skills", "~/.codex/skills", "~/.claude/skills"],
     "paths": {}
   },
-  "user_rules": {"file": "~/.config/wp-orchestration/AGENTS.md", "sections": []},
+  "user_rules": [],
   "project_defaults": {"builder_skills": []},
-  "routing": {"routes_extra": []},
+  "routing": {"routes_extra": [], "routes_exclude": [], "gate_only_routes": []},
   "usage": {
     "script": "~/.config/wp-orchestration/usage_budget.py",
     "cache": "~/.local/state/wp-orchestration/usage-budget-cache.json",

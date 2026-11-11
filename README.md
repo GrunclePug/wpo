@@ -14,7 +14,9 @@ live T3 worktree lifecycle still needs acceptance in a real project. See the
 
 ## Install
 
-Requirements: Python 3.11+, Git, and [uv](https://docs.astral.sh/uv/).
+Requirements: Windows or Linux, Python 3.11+, Git, and [uv](https://docs.astral.sh/uv/).
+Other operating systems cannot currently establish the boot fence required by
+commands that load project runtime state.
 T3 execution also requires a running T3 Code installation and an available
 native provider account. WPO does not supply provider authentication.
 
@@ -61,6 +63,9 @@ usage adapters, and dashboard ports are configurable. Model scores/prices in
 `models/` are dated example snapshots, not current availability guarantees.
 
 See [configuration](references/configuration.md) for precedence and all settings.
+Machine routing can exclude individual routes or whole families and reserve
+routes for reviews. Ordered `user_rules` entries can include selected sections
+or whole instruction files from the shared source.
 
 ## Use with T3 Code
 
@@ -105,6 +110,14 @@ Important boundaries:
 WP files, configuration, ledgers, events, holds, inboxes, and old session logs
 keep their existing formats. Native identities use additive sidecars.
 
+WPO records the host and OS boot identity before inspecting persisted process
+records. After a host change or reboot, it archives and invalidates known local
+PID records and interrupts stale worker state. Holds, pauses, history, and native
+T3 task identities remain intact; no process is stopped by this cleanup. The
+first adoption records a baseline and preserves legacy PIDs whose origin cannot
+be verified. Keep one active host per runs directory. This fence currently
+requires Windows or Linux and does not detect PID reuse within the same boot.
+
 On the first authorized run of an old WP, the backend can import its committed,
 staged, unstaged, and untracked work into the clean T3 checkout. It preserves
 the original checkout and stops on conflicts, unsafe linked paths, or partial
@@ -114,6 +127,10 @@ work by itself. WPO retains T3-owned checkouts after integration; T3 owns cleanu
 For the older execution workflow, explicitly set `execution_mode: standalone`
 and read [the standalone guide](references/standalone.md). Its optional model
 clients, proxy, usage reader, and account state are separate dependencies.
+Weekly audit installation supports standalone Windows tasks and Linux systemd
+user timers. T3 projects use native scheduling in the existing coordinator
+thread. Inspect [scheduling](references/scheduling.md) before installing; a Linux
+persistent timer can immediately run a missed audit.
 
 ## Development and verification
 

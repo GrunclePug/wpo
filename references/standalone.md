@@ -72,9 +72,10 @@ puts it on PATH). Run it from the main checkout or any worktree.
    resolve the similarity warnings, and may run that command.
 8. **Weekly planning audit.** `wpo audit` lints every open WP into `<runs>/audits/<date>.md`, then a
    read-only review session (`audit.spec`, code-hard, never free or local) appends the judgment findings,
-   and `audit-done` is journaled. `wpo audit --install-schedule` registers it as a Windows task (Monday
-   09:00 by default, `audit.schedule`); `--remove-schedule` removes it; `--show-only` prints the schtasks
-   command. `--mechanical-only` writes only the lint part and journals nothing.
+   and `audit-done` is journaled. `wpo audit --install-schedule` registers a Windows task or Linux
+   systemd user timer (Monday 09:00 by default, `audit.schedule`); `--remove-schedule` removes owned
+   state; `--show-only` prints the platform plan without writes. See [scheduling.md](scheduling.md)
+   for ownership, rollback and T3's native alternative. `--mechanical-only` journals nothing.
 
 Report to the user briefly: what merged, what is blocked on them, what they can try in main
 (`wpo whats-new [--since DATE | --last N]` prints each merged WP's `## Try it` section and its

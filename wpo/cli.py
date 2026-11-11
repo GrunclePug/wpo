@@ -16,12 +16,16 @@ from . import ENTRY_POINT, SKILL_ROOT
 
 def entrypoint() -> int:
     """Run the CLI with actionable errors for an unavailable T3 backend."""
+    from .boot import BootError
     from .t3 import T3Error
 
     try:
         return main()
     except T3Error as error:
         print(f"T3 backend: {error}", file=sys.stderr)
+        return 4
+    except BootError as error:
+        print(f"Boot safety: {error}", file=sys.stderr)
         return 4
 
 
@@ -184,9 +188,10 @@ def build_parser() -> argparse.ArgumentParser:
     audit = commands.add_parser("audit", help="lint every open WP into <runs>/audits/<date>.md, then a review session for the judgment parts")
     audit_mode = audit.add_mutually_exclusive_group()
     audit_mode.add_argument("--mechanical-only", action="store_true", help="only the lint report: no review session, no event")
-    audit_mode.add_argument("--install-schedule", action="store_true", help="register the weekly Windows task (audit.schedule) for this project")
-    audit_mode.add_argument("--remove-schedule", action="store_true", help="remove the weekly Windows task")
-    audit.add_argument("--show-only", action="store_true", help="with --install-schedule or --remove-schedule: print the schtasks command, change nothing")
+    audit_mode.add_argument("--install-schedule", action="store_true", help="standalone: register the weekly Windows task or Linux user timer; T3: show native scheduling guidance")
+    audit_mode.add_argument("--remove-schedule", action="store_true", help="standalone: remove this project's owned OS schedule; T3: show native removal guidance")
+    audit.add_argument("--show-only", action="store_true", help="with a schedule action: print the actual platform plan without writes or service commands")
+    audit.add_argument("--from-os-schedule", action="store_true", help=argparse.SUPPRESS)
 
     show = commands.add_parser("show", help="render session logs as readable HTML conversations")
     show.add_argument("log", nargs="?", type=Path, help="one session or verification log")
@@ -338,6 +343,29 @@ def main(argv: list[str] | None = None) -> int:
     from .machine import MachineConfig
     machine = MachineConfig.load()
 
+    if arguments.command == "audit" and arguments.from_os_schedule and machine.execution_mode != "standalone":
+        print("audit: this OS schedule requires execution_mode=standalone; replace it with native T3 scheduling", file=sys.stderr)
+        return 2
+
+    if arguments.command == "audit" and (arguments.install_schedule or arguments.remove_schedule or arguments.show_only):
+        # Schedule planning must not instantiate router/run state or autostart a dashboard.
+        from types import SimpleNamespace
+
+        from .audit import AuditError, change_schedule
+        from .project import Project
+        if arguments.show_only and not (arguments.install_schedule or arguments.remove_schedule):
+            print("--show-only goes with --install-schedule or --remove-schedule", file=sys.stderr)
+            return 2
+        if arguments.session:
+            print("schedule administration cannot run inside a delegated session", file=sys.stderr)
+            return 2
+        project = Project.locate(arguments.project, machine.raw.get("project_defaults"), machine.execution_mode)
+        try:
+            return change_schedule(SimpleNamespace(project=project, machine=machine), arguments.install_schedule, arguments.show_only)
+        except (AuditError, OSError) as error:
+            print(f"audit: {error}", file=sys.stderr)
+            return 2
+
     from .context import Context
     context = Context.load(arguments.project, machine)
     if arguments.session:
@@ -424,13 +452,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if any(finding.severity == "error" for finding in findings) else 0
 
     if arguments.command == "audit":
-        from .audit import AuditError, change_schedule, run_audit
+        from .audit import AuditError, run_audit
         try:
-            if arguments.install_schedule or arguments.remove_schedule:
-                return change_schedule(context, arguments.install_schedule, arguments.show_only)
-            if arguments.show_only:
-                print("--show-only goes with --install-schedule or --remove-schedule", file=sys.stderr)
-                return 2
             return run_audit(context, arguments.mechanical_only)
         except AuditError as error:
             print(f"audit: {error}", file=sys.stderr)
