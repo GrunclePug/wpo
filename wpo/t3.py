@@ -614,6 +614,7 @@ def run_attempt(context: Context, route: dict, prompt: str, log_path: Path, sett
 def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, settings, resume_session=None):
     from .inbox import clear_live, pending_messages, write_live
     from .routing import SessionOutcome
+    from .session_brief import loads_instructions_natively
 
     bridge = Bridge(context)
     bridge.ready()
@@ -627,7 +628,8 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
     target = bridge.target(route)
     role = settings.fields.get("role", settings.access)
     identity = {**settings.extra_env, "WPO_ROLE": role, "WPO_ROUTE": route["id"], "WPO_TREE": str(settings.cwd)}
-    prompt_text = settings.brief.system_text() + "\n\n" + prompt.replace("{{ROUTE}}", route["id"])
+    native = loads_instructions_natively(context, route["family"])
+    prompt_text = settings.brief.system_text(native=native) + "\n\n" + prompt.replace("{{ROUTE}}", route["id"])
     identity_key = hashlib.sha256(str(log_path).encode()).hexdigest()[:32]
     identity_path = bridge.directory / "sessions" / f"{identity_key}.json"
     write_json(identity_path, {"version": 1, "env": identity, "project": str(context.project.root)})

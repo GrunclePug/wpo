@@ -1255,6 +1255,79 @@ class SessionBriefTests(unittest.TestCase):
             self.assertEqual(wpfile.parse(path).skills, [])
 
 
+class NativeInstructionTests(unittest.TestCase):
+    """A session whose harness loads instruction files itself gets a brief without them."""
+
+    def setUp(self) -> None:
+        from types import SimpleNamespace
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name)
+        (root / "code" / "rust" / "proj").mkdir(parents=True)
+        (root / "code" / ".worktrees" / "proj" / "wt").mkdir(parents=True)
+        (root / "other").mkdir()
+        for path, text in (("global.md", "## Safety\nGLOBAL RULE\n"), ("session.md", "SESSION RULE\n"), ("code/CLAUDE.md", "CODE BASELINE\n"),
+                           ("code/rust/CLAUDE.md", "RUST BASELINE\n"), ("code/rust/proj/CLAUDE.md", "PROJECT RULES\n"), ("other/SKILL.md", "EXTRA SKILL\n")):
+            (root / path).write_text(text, encoding="utf-8")
+        self.tree = root / "code" / ".worktrees" / "proj" / "wt"
+        try:
+            (root / "code" / ".worktrees" / "proj" / "CLAUDE.md").symlink_to(root / "code" / "rust" / "CLAUDE.md")
+            (self.tree / "CLAUDE.md").symlink_to(root / "code" / "rust" / "proj" / "CLAUDE.md")
+        except OSError as error:
+            self.skipTest(f"symlink unavailable: {error}")
+        self.native = {"families": ["claude"], "names": ["CLAUDE.md"], "files": [str(root / "global.md")]}
+        raw = {"skills": {"dirs": [], "paths": {"code": str(root / "code" / "CLAUDE.md"), "rust": str(root / "code" / "rust" / "CLAUDE.md"),
+                                                "extra": str(root / "other" / "SKILL.md")}},
+               "user_rules": [{"file": str(root / "global.md"), "sections": ["Safety"]}, {"file": str(root / "session.md")}],
+               "t3": {"native_instructions": {"families": [], "names": [], "files": []}}}
+        self.context = SimpleNamespace(machine=SimpleNamespace(raw=raw), project=SimpleNamespace(
+            root=root / "code" / "rust" / "proj", config={"instructions_file": "CLAUDE.md"}))
+
+    def brief(self):
+        from wpo.session_brief import build_brief
+        return build_brief(self.context, self.tree, ["code", "rust", "extra"])
+
+    def test_native_sessions_leave_out_what_they_load(self) -> None:
+        from wpo.session_brief import loads_instructions_natively
+        self.context.machine.raw["t3"]["native_instructions"] = self.native
+        brief = self.brief()
+        full, native = brief.system_text(), brief.system_text(native=True)
+        for text in ("PROJECT RULES", "GLOBAL RULE", "CODE BASELINE", "RUST BASELINE", "SESSION RULE", "EXTRA SKILL", "## Working rules"):
+            self.assertIn(text, full)
+        for text in ("PROJECT RULES", "GLOBAL RULE", "CODE BASELINE", "RUST BASELINE"):
+            self.assertNotIn(text, native)
+        for text in ("SESSION RULE", "EXTRA SKILL", "## Working rules"):
+            self.assertIn(text, native)
+        self.assertTrue(loads_instructions_natively(self.context, "claude"))
+        self.assertFalse(loads_instructions_natively(self.context, "agy"))
+
+    def test_without_native_families_every_session_gets_the_whole_brief(self) -> None:
+        brief = self.brief()
+        self.assertIsNone(brief.native_text)
+        self.assertEqual(brief.system_text(native=True), brief.system_text())
+
+    def test_a_checkout_without_the_project_file_still_gets_it(self) -> None:
+        (self.tree / "CLAUDE.md").unlink()
+        self.context.machine.raw["t3"]["native_instructions"] = self.native
+        native = self.brief().system_text(native=True)
+        self.assertIn("PROJECT RULES", native)
+        self.assertNotIn("RUST BASELINE", native)
+
+    def test_a_checkout_copy_older_than_main_keeps_mains_instructions(self) -> None:
+        (self.tree / "CLAUDE.md").unlink()
+        (self.tree / "CLAUDE.md").write_text("OLD PROJECT RULES\n", encoding="utf-8")
+        self.context.machine.raw["t3"]["native_instructions"] = self.native
+        self.assertIn("PROJECT RULES\n", self.brief().system_text(native=True).replace("OLD PROJECT RULES", ""))
+        (self.tree / "CLAUDE.md").write_text("PROJECT RULES\n", encoding="utf-8")
+        self.assertNotIn("PROJECT RULES", self.brief().system_text(native=True))
+
+    def test_malformed_settings_name_the_key(self) -> None:
+        from wpo.session_brief import BriefError
+        self.context.machine.raw["t3"]["native_instructions"] = {**self.native, "names": "CLAUDE.md"}
+        with self.assertRaisesRegex(BriefError, "native_instructions.names"):
+            self.brief()
+
+
 class RoundRoutingTests(unittest.TestCase):
     def test_mechanical_only_when_every_failure_is_a_lint_check(self) -> None:
         from wpo.commands import CommandFailure

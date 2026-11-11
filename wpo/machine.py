@@ -33,6 +33,10 @@ DEFAULTS: dict = {
         "wake_debounce_seconds": 5,
         "callback_interval_seconds": 0.5,
         "coordinator_idle_minutes": 30,
+        # Route families whose native sessions load instruction files themselves: files named
+        # `names` in their checkout and every directory above it, and `files`. Their briefs leave
+        # those out (session_brief.native_instruction_files).
+        "native_instructions": {"families": [], "names": [], "files": []},
     },
     # The interpreter that runs the tooling (needs psutil); detached jobs and workers use it too.
     "python": sys.executable,

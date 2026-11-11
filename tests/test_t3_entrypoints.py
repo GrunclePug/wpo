@@ -275,6 +275,20 @@ class T3BackendTests(unittest.TestCase):
         self.assertEqual(session.session_facts(log)[0], records[0]["session_id"])
         self.assertFalse(records[-1]["usage_available"])
 
+    def test_families_that_load_instructions_natively_get_the_native_brief(self) -> None:
+        brief = SessionBrief(None, "", "full rules", native_text="native rules")
+        settings = session.SessionSettings("builder", ["src/**"], self.root, brief, {}, False, False, 30, {"role": "builder"})
+        prompts = []
+        def complete(_bridge, request, callback=None):
+            prompts.append(request["payload"]["prompt"])
+            return {**request, "state": "done", "task_id": f"native-{len(prompts)}", "thread_id": "child", "result": {"text": "Done", "outcome": "ok"}}
+        with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", complete):
+            run_attempt(self.context, ROUTE, "Task", self.root / "full.log", settings)
+            self.machine.raw["t3"]["native_instructions"] = {"families": ["gpt"], "names": ["CLAUDE.md"], "files": []}
+            run_attempt(self.context, ROUTE, "Task", self.root / "native.log", settings)
+        self.assertTrue(prompts[0].startswith("full rules") and "native rules" not in prompts[0])
+        self.assertTrue(prompts[1].startswith("native rules") and "full rules" not in prompts[1])
+
     def test_cancellation_is_native_and_message_receipt_is_confirmed_before_delivery(self) -> None:
         request = self.submit()
         self.bridge.update(request["id"], state="running", task_id="native-task")
