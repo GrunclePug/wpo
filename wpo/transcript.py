@@ -39,6 +39,18 @@ pre { white-space: pre-wrap; word-break: break-word; margin: 4px 0; font: 12px/1
 details > summary { cursor: pointer; color: #3b4f8a; }
 .text { white-space: pre-wrap; }
 table { border-collapse: collapse; } td, th { padding: 2px 10px; border-bottom: 1px solid #e3e6ec; text-align: left; font-size: 13px; }
+html[data-theme='dark'] { color-scheme: dark; }
+html[data-theme='dark'] body { background: #202020; color: #ededed; }
+html[data-theme='dark'] .meta { color: #b9b9b9; }
+html[data-theme='dark'] .turn { background: #292929; border-color: #505050; }
+html[data-theme='dark'] .tool, html[data-theme='dark'] .system { background: #303030; }
+html[data-theme='dark'] .error { background: #442525; }
+html[data-theme='dark'] .old { background: #482828; }
+html[data-theme='dark'] .new { background: #25402c; }
+html[data-theme='dark'] a, html[data-theme='dark'] summary, html[data-theme='dark'] .tool b { color: #a8c8ff; }
+nav { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+select { font: inherit; }
+h1, .text { overflow-wrap: anywhere; }
 """
 
 
@@ -182,13 +194,51 @@ def render_claude_log(log_path: Path) -> str:
     return "\n".join(parts)
 
 
-def page(title: str, body: str) -> str:
-    return f"<!doctype html><html><head><meta charset='utf-8'><title>{escape(title)}</title><style>{STYLE}</style></head><body>{body}</body></html>"
+def page(title: str, body: str, dashboard: bool = False) -> str:
+    theme = '<script src="/theme.js"></script>' if dashboard else ""
+    return (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+            f"<title>{escape(title)}</title>{theme}<style>{STYLE}</style></head><body>{body}</body></html>")
 
 
-def render_session(log_path: Path) -> str:
+def native_request_id(log_path: Path) -> str | None:
+    """Identify a native log from its startup record, including archived generations."""
+    with log_path.open(encoding="utf-8", errors="replace") as handle:
+        line = handle.readline(65536)
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(event, dict) or event.get("backend") != "t3":
+        return None
+    native = event.get("t3")
+    request_id = native.get("request_id") if isinstance(native, dict) else None
+    return request_id if isinstance(request_id, str) and re.fullmatch(r"[0-9a-f]{32}", request_id) else None
+
+
+def render_session(log_path: Path, *, native: dict | None = None, native_error: str | None = None,
+                   dashboard: bool = False) -> str:
     """One session log (or a text log) as a page, with the prompt and system prompt it was given."""
     sections = [f"<h1>{escape(log_path.name)}</h1><p class='meta'>{escape(log_path)}</p>"]
+    if dashboard:
+        sections.insert(0, '<nav aria-label="Transcript controls"><a href="/">Back to dashboard</a>'
+                        '<a href="">Refresh conversation</a><label>Theme <select id="theme-choice">'
+                        '<option value="system">System</option><option value="light">Light</option>'
+                        '<option value="dark">Dark</option></select></label></nav>')
+    if native is not None or native_error is not None:
+        sections.append("<h2>T3 conversation snapshot</h2>"
+                        "<p class='meta'>Latest messages, read on opening this page. Refresh to read newer messages. "
+                        "Tool activity remains in T3.</p>")
+        if native_error is not None:
+            sections.append(f"<p class='turn error'>{escape(native_error)}</p>")
+        else:
+            for message in native["messages"]:
+                role = message["role"]
+                sections.append(f"<div class='turn {role}'><b>{role}</b>"
+                                f"<div class='text'>{escape(clipped(message['text'], RESULT_LIMIT))}</div></div>")
+            if not native["messages"]:
+                sections.append("<p>No conversation messages have been recorded yet.</p>")
+        sections.append("<h2>Local WPO log</h2><p class='meta'>Native sessions record startup and final results locally; "
+                        "the conversation above comes from T3.</p>")
     for suffix, label in ((".system.md", "system prompt (appended)"), (".prompt.md", "prompt")):
         companion = log_path.with_name(log_path.name + suffix)
         if companion.exists():
@@ -202,7 +252,7 @@ def render_session(log_path: Path) -> str:
     inbox_record = log_path.with_name(log_path.name + ".inbox.log")
     if inbox_record.exists():
         sections.append("<h2>Messages delivered</h2>" + pre(inbox_record.read_text(encoding="utf-8")))
-    return page(log_path.name, "\n".join(sections))
+    return page(log_path.name, "\n".join(sections), dashboard=dashboard)
 
 
 def run_files(run_dir: Path) -> list[Path]:

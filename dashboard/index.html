@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
+  <script src="/theme.js"></script>
   <!-- The server replaces the placeholder with its action token; actions send it back (dashboard_server.py). -->
   <meta name="wpo-action-token" content="__WPO_ACTION_TOKEN__">
   <title>wpo dashboard</title>
@@ -24,6 +25,13 @@
         <p class="usage-placeholder">Reading usage…</p>
       </section>
     </details>
+    <label class="theme-choice">Theme
+      <select id="theme-choice">
+        <option value="system">System</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+    </label>
     <div class="connection" id="connection" role="status" aria-live="polite">
       <span class="connection-dot" aria-hidden="true"></span>
       <span class="connection-text">Connecting…</span>

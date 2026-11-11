@@ -48,6 +48,7 @@ STATIC_FILES = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
+    "/theme.js": ("theme.js", "text/javascript; charset=utf-8"),
 }
 PUMP_SECONDS = 2.5
 HEARTBEAT_SECONDS = 15
@@ -447,7 +448,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         hub = self.server.hub
         with hub.data_lock:
             path = hub.data.run_file(relative)
-        self.send_body(HTTPStatus.OK, "text/html; charset=utf-8", render_session(path).encode("utf-8"))
+        from .t3 import Bridge, T3Error
+        from .transcript import native_request_id
+
+        native, native_error = None, None
+        request_id = native_request_id(path)
+        if request_id:
+            try:
+                native = Bridge(hub.data.context).thread_snapshot(request_id)
+            except T3Error as error:
+                native_error = str(error)
+        body = render_session(path, native=native, native_error=native_error, dashboard=True)
+        self.send_body(HTTPStatus.OK, "text/html; charset=utf-8", body.encode("utf-8"))
 
     def send_raw(self, relative: str, tail_only: bool) -> None:
         """A run file as text; `?tail` sends only its last megabyte. The file is read whole and

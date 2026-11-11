@@ -918,7 +918,7 @@ function detailNow(detail, row) {
   const parts = [];
   const session = row && row.session;
   if (session) {
-    const links = session.log ? ` · <a href="/view/${runPath(session.log)}" target="_blank" rel="noopener">view session</a> · <a href="/raw/${runPath(session.log)}?tail" target="_blank" rel="noopener">raw tail</a>` : "";
+    const links = session.log ? ` · <a href="/view/${runPath(session.log)}">view session</a> · <a href="/raw/${runPath(session.log)}?tail" target="_blank" rel="noopener">raw tail</a>` : "";
     const context = session.context_tokens ? ` · context ${session.context_tokens.toLocaleString()}${session.handoff_tokens ? ` of ${session.handoff_tokens.toLocaleString()} (handoff point)` : ""}` : "";
     parts.push(`<p class="notice">${session.live ? "Running" : row.active ? "Lane is running it" : "Last session"}: <strong>${esc(session.role)}</strong> on <span class="mono">${esc(session.route)}</span>${session.started ? `, started ${timeTag(session.started)} ago` : ""}${context}${links}</p>`);
   }
@@ -995,7 +995,7 @@ function detailLogs(detail) {
   if (!detail.logs.length) return '<section><h3>Logs</h3><p class="dim">No run directory yet.</p></section>';
   const rows = detail.logs.slice(0, 80).map((log) => {
     const what = log.session ? `${esc(log.role)} · <span class="mono">${esc(log.route)}</span>` : '<span class="dim">record</span>';
-    const view = log.name.endsWith(".log") ? `<a href="/view/${runPath(log.path)}" target="_blank" rel="noopener">view</a>` : "";
+    const view = log.name.endsWith(".log") ? `<a href="/view/${runPath(log.path)}">view</a>` : "";
     const tail = log.size > 1024 * 1024 ? `<a href="/raw/${runPath(log.path)}?tail" target="_blank" rel="noopener">tail</a>` : "";
     return `<tr><td class="name">${esc(log.name)}</td><td>${what}</td><td class="num">${bytes(log.size)}</td><td class="num">${timeTag(log.modified)}</td><td class="links">${view}<a href="/raw/${runPath(log.path)}" target="_blank" rel="noopener">raw</a>${tail}</td></tr>`;
   }).join("");

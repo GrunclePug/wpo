@@ -88,7 +88,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             content = "window.fixture = " + json.dumps(fixture()) + ";\n"
             content += (Path(__file__).with_name("dashboard_fixture.js")).read_text(encoding="utf-8")
             mime = "text/javascript"
-        elif path.removeprefix("/baseline") in ("/", "/dashboard.css", "/dashboard.js"):
+        elif path.removeprefix("/baseline") in ("/", "/dashboard.css", "/dashboard.js", "/theme.js"):
             baseline = path.startswith("/baseline/")
             route = path.removeprefix("/baseline")
             asset = "index.html" if route == "/" else route[1:]
@@ -137,6 +137,7 @@ def check_browser(url: str, executable: str | None, evidence: Path) -> None:
                     results.append({"baseline": [width, height], "metrics": metrics})
                 page.goto(url)
                 page.wait_for_function("typeof ui !== 'undefined' && ui.snapshot !== null")
+                assert page.locator(".identity h1").evaluate("e => e.clientHeight <= parseFloat(getComputedStyle(e).lineHeight) * 3"), "Header controls squeeze the project title"
                 result = page.evaluate("([width, height]) => runDashboardChecks(width, height)", [width, height])
                 result["metrics"] = page.evaluate("({page: document.documentElement.scrollWidth, width: innerWidth, needs: document.querySelector('#needs-you').getBoundingClientRect().height, tables: [...document.querySelectorAll('.grid')].map(t => t.scrollWidth)})")
                 results.append(result)
@@ -168,6 +169,28 @@ def check_browser(url: str, executable: str | None, evidence: Path) -> None:
             page.goto(url)
             page.wait_for_function("typeof ui !== 'undefined' && ui.snapshot !== null")
             results.append(page.evaluate("runDashboardChecks(480, 800)"))
+            page.emulate_media(color_scheme="light")
+            page.locator("#theme-choice").select_option("dark")
+            assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == "dark"
+            page.reload()
+            page.wait_for_function("typeof ui !== 'undefined' && ui.snapshot !== null")
+            assert page.locator("#theme-choice").input_value() == "dark", "Saved theme was lost on reload"
+            assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == "dark"
+            sibling = context.new_page()
+            sibling.goto(url)
+            assert sibling.locator("#theme-choice").input_value() == "dark", "Saved theme was lost in a new tab"
+            page.locator("#theme-choice").select_option("light")
+            sibling.wait_for_function("document.documentElement.dataset.theme === 'light'")
+            sibling.close()
+            page.locator("#theme-choice").select_option("system")
+            assert page.evaluate("getComputedStyle(document.documentElement).colorScheme") == "light"
+            page.emulate_media(color_scheme="dark")
+            page.wait_for_function("document.documentElement.dataset.theme === 'dark'")
+            page.evaluate("localStorage.setItem('wpo.theme', 'invalid-choice')")
+            page.reload()
+            assert page.locator("#theme-choice").input_value() == "system", "Invalid saved theme was not ignored"
+            page.screenshot(path=str(evidence / "saved-theme-dark.png"), animations="disabled")
+            results.append({"theme": "saved choice, reload, new tab, cross-tab changes, system changes, invalid storage: passed"})
             page.screenshot(path=str(evidence / "dark-480.png"))
             assert not errors, errors
         finally:
