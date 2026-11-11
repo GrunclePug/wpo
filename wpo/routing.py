@@ -964,8 +964,10 @@ class Router:
         key, until = self.cooldown_for(route, outcome, detail)
         with FileLock(self.state_dir / "route-health.lock"):
             health = self.load_health()
+            # `since` is compared with sessions' launch times, which come from time.time(): the same
+            # clock, or a cap recorded just after a launch can read as older than it (Windows).
             health["cooldowns"][key] = {"until": until.timestamp(), "reason": f"{outcome}: {detail[:300]}", "route": route_id,
-                                        "outcome": outcome, "since": now_utc().timestamp()}
+                                        "outcome": outcome, "since": time.time()}
             health["cooldowns"] = {k: v for k, v in health["cooldowns"].items() if from_timestamp(v["until"]) > now_utc()}
             write_atomically(self.health_path, health)
         if route.cost_class == "free" and outcome == "api_error" and MODEL_GONE_TEXT.search(detail):

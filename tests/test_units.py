@@ -1418,6 +1418,18 @@ class RoundRoutingTests(unittest.TestCase):
             # A cap recorded before the session started did not end it.
             self.assertIsNone(router.family_cut_off("claude", time.time() + 1))
 
+    def test_a_cap_recorded_after_a_launch_ends_it_whatever_the_clocks(self) -> None:
+        # Sessions take their launch time from time.time(); on Windows datetime.now() can lag it
+        # by a clock tick, and a cap stamped from it then read as older than the launch.
+        router = routing.Router(machine_in(Path(tempfile.mkdtemp())))
+        launched = time.time()
+        lagging = routing.from_timestamp(launched - 0.016)
+        with mock.patch.object(routing, "now_utc", return_value=lagging), \
+             mock.patch.object(routing.Router, "usage_windows", return_value={"claude": []}), \
+             mock.patch.object(routing.Router, "subscription_blocked_until", return_value=(lagging + timedelta(hours=1), None)):
+            router.mark("claude-opus-high", "rate_limited", "You've hit your limit")
+            self.assertIn("another claude session hit its cap", router.family_cut_off("claude", launched))
+
     def test_a_session_whose_provider_is_cut_off_is_killed(self) -> None:
         from wpo import session
         directory = Path(tempfile.mkdtemp())
