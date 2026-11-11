@@ -155,6 +155,31 @@ not be `standard` or contain `@`.
 }
 ```
 
+### Independent reviews
+
+With `routing.independent_reviews: true`, a WP's review never runs on a model from the family
+that last built it. A route's `model_family` names who made its model (an agy route can run a
+Claude model: `"family": "agy", "model_family": "claude"`); without it, the route's `family`
+is used. The runner records the model family of each builder session, and the review's
+selection leaves out every route of that family, before ranking and before the family Pareto
+frontier. When no route of another family is available, the review waits for one rather than
+falling back to the builder's family. A pinned reviewer (`reviewer: pin:<route>`) is an explicit
+choice and is exempt. Re-evaluations are not affected. A WP whose builder ran before the setting
+existed is judged by its last recorded builder session; with none recorded, its review runs
+unrestricted and the runner log says so. The default is `false`.
+
+```json
+{
+  "routing": {
+    "independent_reviews": true,
+    "routes_extra": [
+      {"id": "agy-opus-high", "family": "agy", "model_family": "claude", "harness": "agy",
+       "model": "claude-opus-5-5", "effort": "high", "provider": "agy-thirdparty", "score": 54, "writes_code": true}
+    ]
+  }
+}
+```
+
 ### Carried user rules
 
 `user_rules` accepts an ordered list of file objects. Each `file` is an explicit path (with

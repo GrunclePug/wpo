@@ -136,6 +136,8 @@ subscription session (claude, gpt) with no first model turn after `first_output_
 hangs, cools its whole family down, not just its route: the family's service is stalling.
 When every paid route is capped, paced or cooling down, builders still run on free routes at or
 above `free_last_resort.floor` (last in every tier's order); reviews and re-evaluations never do.
+With `routing.independent_reviews`, a review never runs on a model from the family that last built
+the WP (a route's `model_family`, else its family) and waits for another family's route instead.
 The local model is never ranked among routes: only a pin reaches it. A **pool lane**
 (`"lanes": {"local": {"pool": true, "builder_override": "pin:local-deepseek-max"}}`) keeps it busy
 around the clock on runnable WPs from any unheld lane, except a WP that is the last unmerged

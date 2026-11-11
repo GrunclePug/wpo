@@ -122,6 +122,30 @@ class RouteRuleTests(unittest.TestCase):
             with self.assertRaisesRegex(routing.RoutingError, "reserved"):
                 self.ids(f"pin:{free.id}")
 
+    def test_excluded_model_families_leave_reviews_but_not_pins(self) -> None:
+        self.router.policy["routes"] = [route_entry("opus"), route_entry("sol", 59, family="gpt"),
+                                        route_entry("agy-opus", 58, family="agy", model_family="claude"), route_entry("flash", 57, family="agy")]
+        self.assertCountEqual(self.ids(gate=True, exclude_model_families=["claude"]), ["sol", "flash"])
+        self.assertCountEqual(self.ids(gate=True, exclude_model_families=["gpt"]), ["opus", "agy-opus", "flash"])
+        self.assertEqual(self.ids("pin:agy-opus", gate=True, exclude_model_families=["claude"]), ["agy-opus"])
+
+    def test_excluded_model_family_dominator_does_not_hide_its_family_peer(self) -> None:
+        measured = {"cost_per_task": 1, "index_tokens_m": 1, "output_speed": 100}
+        self.router.policy["routes"] = [route_entry("agy-opus", 70, family="agy", model_family="claude", **measured),
+                                        route_entry("flash", 60, family="agy", **measured)]
+        self.assertEqual(self.ids(gate=True), ["agy-opus"])
+        self.assertEqual(self.ids(gate=True, exclude_model_families=["claude"]), ["flash"])
+
+    def test_excluded_model_families_leave_listed_tiers_too(self) -> None:
+        self.router.policy["routes"] = [route_entry("opus"), route_entry("sol", 59, family="gpt"),
+                                        route_entry("agy-opus", 58, family="agy", model_family="claude")]
+        self.router.policy["tier_routes"] = {"code": {"routes": [["agy-opus"], ["sol"], ["opus"]], "free_last_resort": False}}
+        oracle = SimpleNamespace(route=lambda _: routing.Availability(True), headroom=lambda family: 50.0)
+        with mock.patch.object(routing.Router, "oracle", return_value=oracle):
+            self.assertEqual(self.ids(gate=True), ["agy-opus", "sol", "opus"])
+            self.assertEqual(self.ids(gate=True, exclude_model_families=["gpt"]), ["agy-opus", "opus"])
+            self.assertEqual(self.ids(gate=True, exclude_model_families=["claude"]), ["sol"])
+
     def test_route_rule_shapes_fail_with_named_setting(self) -> None:
         for key in ("routes_exclude", "gate_only_routes", "pin_only_routes", "pin_only_efforts"):
             for value in ("builder", None, {}, [1], [""]):
