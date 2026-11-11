@@ -211,7 +211,7 @@ DEFAULTS: dict = {
     # `wpo audit` (audit.py): lint over every open WP into `<runs>/audits/<date>.md`, then a read-only
     # review session on `spec` (never a free or local route) for the judgment parts, which reads
     # `context_files` (the decisions log, the instructions file; paths in the main checkout) first.
-    # `schedule`: when `wpo audit --install-schedule` registers the weekly Windows task (day MON..SUN,
+    # `schedule`: explicit standalone OS scheduling (Windows task/Linux user timer; day MON..SUN,
     # local time HH:MM).
     "audit": {"spec": "code-hard", "context_files": [], "schedule": {"day": "MON", "time": "09:00"}},
     # How verify and hook commands are run.

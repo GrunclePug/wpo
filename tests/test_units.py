@@ -2772,10 +2772,10 @@ class LintIntegrationTests(unittest.TestCase):
     def test_schedule_registers_a_weekly_task_for_this_project(self) -> None:
         from wpo import audit
         arguments = audit.schedule_arguments(self.context)
-        self.assertEqual(arguments[:11], ["schtasks", "/Create", "/TN", "wpo-audit-scratch", "/SC", "WEEKLY", "/D", "MON", "/ST", "09:00", "/TR"])
+        self.assertEqual(arguments[:11], ["schtasks", "/Create", "/TN", audit.task_name(self.context), "/SC", "WEEKLY", "/D", "MON", "/ST", "09:00", "/TR"])
         self.assertIn(f"--project {self.context.project.root}", arguments[11].replace('"', ""))
-        self.assertTrue(arguments[11].endswith(" audit"))
-        self.assertEqual(audit.remove_arguments(self.context), ["schtasks", "/Delete", "/TN", "wpo-audit-scratch", "/F"])
+        self.assertTrue(arguments[11].endswith(" audit --from-os-schedule"))
+        self.assertEqual(audit.remove_arguments(self.context), ["schtasks", "/Delete", "/TN", audit.task_name(self.context), "/F"])
         self.context.project.config["audit"]["schedule"] = {"day": "MONDAY", "time": "09:00"}
         with self.assertRaises(audit.AuditError):
             audit.schedule_arguments(self.context)
