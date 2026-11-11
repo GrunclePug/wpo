@@ -52,5 +52,5 @@
     "max_output_tokens": 32768,
     "mutex": "Global\\WpoLocalModel"
   },
-  "dashboard": {"autostart": true, "port": 8470, "project_ports": {}}
+  "dashboard": {"autostart": true, "host": "127.0.0.1", "allowed_hosts": [], "port": 8470, "project_ports": {}}
 }

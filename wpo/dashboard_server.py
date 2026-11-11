@@ -6,7 +6,7 @@ One assembly pass serves every open page: a pump thread rebuilds the snapshot ev
 server costs no CPU. Pages receive a snapshot only when it changed, and journal events as they
 are appended.
 
-It binds to 127.0.0.1 only and answers only requests addressed to that host and port (a web page
+It binds to loopback by default and answers only requests addressed to configured hosts and port (a web page
 elsewhere cannot reach it through a rebound DNS name). Nothing a GET serves changes any state.
 
 The user's actions (user_actions.py: unblock, approve, deny, message) are POSTs to `/api/action/*`.
@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import SKILL_ROOT, user_actions, wpfile
 from .context import Context
-from .dashboard import code_version, log, process_created, read_state, state_path, url_for, write_state
+from .dashboard import code_version, log, network_for, process_created, read_state, state_path, url_for, write_state
 from .dashboard_data import DashboardData, DashboardDataError
 from .machine import MachineConfig
 from .orchestrator import MainCommitError
@@ -196,16 +196,17 @@ class Hub:
         """Rewrites the state file when it no longer names this server (a racing launch wrote it)."""
         state = read_state(self.project) or {}
         if state.get("pid") != os.getpid() or state.get("phase") != "serving":
-            write_state(self.project, serving_state(self.url, self.code, state.get("launched_at")))
+            write_state(self.project, serving_state(self.url, self.code, state.get("launched_at"), network_for(self.data.context.machine)))
 
     def events_after(self, after_sequence: int) -> tuple[int, list[dict]]:
         events = [event for sequence, batch in self.batches if sequence > after_sequence for event in batch]
         return self.batch_sequence, events
 
 
-def serving_state(url: str, code: str, launched_at: float | None) -> dict:
+def serving_state(url: str, code: str, launched_at: float | None, network: dict | None = None) -> dict:
     return {"phase": "serving", "pid": os.getpid(), "created": process_created(os.getpid()) or 0, "url": url,
-            "code": code, "launched_at": launched_at or time.time(), "serving_since": time.time()}
+            "code": code, "launched_at": launched_at or time.time(), "serving_since": time.time(),
+            "network": network or {"host": "127.0.0.1", "allowed_hosts": []}}
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -216,8 +217,12 @@ class DashboardServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], hub: Hub) -> None:
         self.hub = hub
+        machine = hub.data.context.machine
+        hosts = {"127.0.0.1", "localhost", *machine.dashboard_allowed_hosts}
+        if machine.dashboard_host != "0.0.0.0":
+            hosts.add(machine.dashboard_host)
         super().__init__(address, DashboardHandler)
-        self.allowed_hosts = {f"127.0.0.1:{self.server_port}", f"localhost:{self.server_port}"}
+        self.allowed_hosts = {f"{host}:{self.server_port}" for host in hosts}
         self.allowed_origins = {f"http://{host}" for host in self.allowed_hosts}
 
     def server_bind(self) -> None:
@@ -242,7 +247,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.headers.get("Host") not in self.server.allowed_hosts:
-            self.send_text(HTTPStatus.FORBIDDEN, "this dashboard answers only requests to 127.0.0.1 or localhost")
+            self.send_text(HTTPStatus.FORBIDDEN, "this dashboard answers only requests to its configured host addresses")
             return
         parts = urlsplit(self.path)
         route = parts.path
@@ -345,8 +350,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         """Why this POST is not run: another host, another origin, no or a wrong token, an unknown action."""
         server = self.server
         if self.headers.get("Host") not in server.allowed_hosts:
-            return HTTPStatus.FORBIDDEN, "this dashboard answers only requests to 127.0.0.1 or localhost"
-        if self.headers.get("Origin") not in server.allowed_origins:
+            return HTTPStatus.FORBIDDEN, "this dashboard answers only requests to its configured host addresses"
+        if self.headers.get("Origin") != f"http://{self.headers.get('Host')}":
             return HTTPStatus.FORBIDDEN, "actions are taken only from this dashboard's own page (Origin)"
         token = self.headers.get(TOKEN_HEADER, "")
         if not hmac.compare_digest(token.encode("utf-8"), server.hub.action_token.encode("utf-8")):
@@ -533,13 +538,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-def bind(hub: Hub, port: int) -> DashboardServer | OSError:
+def bind(hub: Hub, port: int, host: str = "127.0.0.1") -> DashboardServer | OSError:
     """Binds the port, retrying for a few seconds: a replaced server's socket can take a moment
     to close after its process ended."""
     deadline = time.monotonic() + BIND_RETRY_SECONDS
     while True:
         try:
-            return DashboardServer(("127.0.0.1", port), hub)
+            return DashboardServer((host, port), hub)
         except OSError as error:
             if time.monotonic() >= deadline:
                 return error
@@ -557,13 +562,13 @@ def serve(project: Project, machine: MachineConfig) -> int:
     code = code_version()
     try:
         hub = Hub(DashboardData(project.root, machine), project, url, code)
-        server = bind(hub, machine.dashboard_port(project.root))
+        server = bind(hub, machine.dashboard_port(project.root), machine.dashboard_host)
         if isinstance(server, OSError):
             write_state(project, {"phase": "failed", "pid": os.getpid(), "error": f"cannot bind {url}: {server}", "failed_at": time.time(),
                                   "launched_at": launched, "code": code, "url": url})
             log(project, f"cannot bind {url}: {server}")
             return 1
-        write_state(project, serving_state(url, code, launched))
+        write_state(project, serving_state(url, code, launched, network_for(machine)))
         log(project, f"serving {url} (pid {os.getpid()})")
         threading.Thread(target=hub.pump, name="dashboard-pump", daemon=True).start()
         server.serve_forever(poll_interval=1.0)

@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass
+from ipaddress import IPv4Address
 from pathlib import Path
 
 from . import ENTRY_POINT
@@ -81,10 +82,12 @@ DEFAULTS: dict = {
         "context_tokens": {},
     },
     # The progress dashboard (dashboard.py): every `wpo` command makes sure one server runs per
-    # project, bound to 127.0.0.1. `port` serves the first project; give each further project on
-    # this machine its own entry in `project_ports` (main checkout path -> port).
+    # project, bound to loopback unless LAN access is explicitly configured. Give each further
+    # project its own entry in `project_ports` (main checkout path -> port).
     "dashboard": {
         "autostart": True,
+        "host": "127.0.0.1",
+        "allowed_hosts": [],
         "port": 8470,
         "project_ports": {},
     },
@@ -205,6 +208,38 @@ class MachineConfig:
     @property
     def dashboard_autostart(self) -> bool:
         return bool(self.raw["dashboard"]["autostart"])
+
+    @property
+    def dashboard_host(self) -> str:
+        """The numeric IPv4 listen address; wildcard binding requires explicit page addresses."""
+        value = self.raw["dashboard"].get("host", "127.0.0.1")
+        try:
+            address = IPv4Address(value) if isinstance(value, str) else None
+        except ValueError:
+            address = None
+        if address is None or address.is_multicast or int(address) == 0xFFFFFFFF:
+            raise ValueError("dashboard.host must be an IPv4 listen address")
+        if address.is_unspecified and not self.dashboard_allowed_hosts:
+            raise ValueError("dashboard.allowed_hosts must list this computer's LAN addresses when dashboard.host is 0.0.0.0")
+        return str(address)
+
+    @property
+    def dashboard_allowed_hosts(self) -> list[str]:
+        """Explicit IPv4 page addresses, in addition to loopback and the concrete bind address."""
+        values = self.raw["dashboard"].get("allowed_hosts", [])
+        if not isinstance(values, list):
+            # JSON configuration errors use ValueError regardless of the incorrect JSON type.
+            raise ValueError("dashboard.allowed_hosts must be a list of IPv4 addresses")  # noqa: TRY004
+        addresses = set()
+        for value in values:
+            try:
+                address = IPv4Address(value) if isinstance(value, str) else None
+            except ValueError:
+                address = None
+            if address is None or address.is_unspecified or address.is_multicast or int(address) == 0xFFFFFFFF:
+                raise ValueError("dashboard.allowed_hosts must contain only concrete IPv4 addresses")
+            addresses.add(str(address))
+        return sorted(addresses)
 
     def dashboard_port(self, project_root: Path) -> int:
         """The dashboard's port for one project: its `project_ports` entry, else `port`."""

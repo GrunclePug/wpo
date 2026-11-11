@@ -119,7 +119,13 @@ def server_alive(state: dict | None) -> bool:
 
 
 def url_for(machine: MachineConfig, project: Project) -> str:
-    return f"http://127.0.0.1:{machine.dashboard_port(project.root)}/"
+    host = machine.dashboard_host
+    return f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{machine.dashboard_port(project.root)}/"
+
+
+def network_for(machine: MachineConfig) -> dict:
+    """The server settings whose changes require a restart, even when code is unchanged."""
+    return {"host": machine.dashboard_host, "allowed_hosts": machine.dashboard_allowed_hosts}
 
 
 def launch_pending(state: dict | None, now: float) -> str | None:
@@ -142,9 +148,11 @@ def ensure_running(project: Project, machine: MachineConfig, explicit: bool = Fa
         if (project.runs_dir / STOPPED_FILE).exists():
             return "stopped by the operator (`wpo dashboard` starts it)"
     version = code_version()
+    network = network_for(machine)
+    default_network = {"host": "127.0.0.1", "allowed_hosts": []}
     state = read_state(project)
     alive = server_alive(state)
-    if alive and state.get("code") == version:
+    if alive and state.get("code") == version and state.get("network", default_network) == network:
         return "running"
     if not explicit and not alive and (pending := launch_pending(state, time.time())):
         return pending
@@ -154,13 +162,13 @@ def ensure_running(project: Project, machine: MachineConfig, explicit: bool = Fa
     try:
         state = read_state(project)
         if server_alive(state):
-            if state.get("code") == version:
+            if state.get("code") == version and state.get("network", default_network) == network:
                 return "running"
             stop_recorded_server(project)
         pid = spawn_detached([*machine.wpo_command(), "--project", str(project.root), "dashboard", "--detach-server"], project.root,
                              env=server_environment(), log_path=project.runs_dir / LOG_FILE)
         write_state(project, {"phase": "launched", "pid": pid, "created": process_created(pid) or 0, "launched_at": time.time(),
-                              "code": version, "url": url_for(machine, project)})
+                              "code": version, "url": url_for(machine, project), "network": network})
         return "started"
     finally:
         mutex.release()
@@ -254,7 +262,11 @@ def start_and_report(project: Project, machine: MachineConfig) -> tuple[bool, st
     while time.monotonic() < deadline:
         state = read_state(project)
         if state and state.get("phase") == "serving" and server_alive(state):
-            return True, f"{state['url']}  ({'started' if outcome == 'started' else 'running'}, pid {state['pid']})"
+            report = f"{state['url']}  ({'started' if outcome == 'started' else 'running'}, pid {state['pid']})"
+            if machine.dashboard_host == "0.0.0.0":
+                urls = [f"http://{host}:{machine.dashboard_port(project.root)}/" for host in machine.dashboard_allowed_hosts]
+                report += "\nLAN: " + ", ".join(urls)
+            return True, report
         if state and state.get("phase") == "failed":
             return False, f"the dashboard could not start: {state.get('error')} (log: {project.runs_dir / LOG_FILE})"
         time.sleep(0.2)

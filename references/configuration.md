@@ -35,7 +35,16 @@ The full defaults and accessors are in [wpo/machine.py](../wpo/machine.py).
   Supply the actual local model route in `routing.routes_extra`; no local model is assumed.
 - `keys`: token-file paths for optional OpenRouter and Artificial Analysis integrations.
   Configure file paths, not secret values. `OPENROUTER_API_KEY` is also supported.
-- `dashboard`: autostart, loopback port, and per-project ports. Both backends retain the dashboard.
+- `dashboard`: autostart, listen address, allowed page addresses, port, and per-project ports.
+  Both backends retain the dashboard. It listens on `127.0.0.1` by default. To open it from a
+  phone on the same network, set `host` to `0.0.0.0` and list the computer's LAN IPv4 address in
+  `allowed_hosts`, for example `{"host": "0.0.0.0", "allowed_hosts": ["192.168.1.20"]}`.
+  `wpo dashboard` then prints both the loopback and LAN URLs. Permit that port through the host
+  firewall only for the trusted local subnet. LAN clients have the dashboard's normal controls;
+  exact Host/Origin matching and the per-start action token still apply. Wildcard binding without
+  explicit allowed addresses is refused. Host/address changes replace the dashboard server on
+  the next WPO command; they do not restart lanes. Keep the configured addresses and firewall
+  scope current if the computer's LAN address changes.
 - `project_defaults`: personal project-wide defaults such as `builder_skills`, workers,
   autofix policy, context limits, or machine environment notes. Project JSON wins over these.
 - `routing`: model routes, tier floors, family preference, effort policy, quota ceilings and
