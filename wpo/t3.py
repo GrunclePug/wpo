@@ -245,8 +245,17 @@ class Bridge:
                 arguments["target"] = {"projectId": self.settings["project_id"]}
             return {"tool": "delegate_task", "arguments": arguments}
         if request["kind"] == "session":
-            task = payload["prompt"] + (f"\n\nRecord real progress between long steps with wpo --project \"{self.project.root.as_posix()}\" "
-                                        f"t3 heartbeat --request {request['id']}. Do not invent heartbeat activity when no work is progressing.")
+            context_path = self.request_path(request["id"]).with_suffix(".prompt.md")
+            # Replace a linked context file itself rather than following its target on a retry.
+            context_path = context_path.parent.resolve() / context_path.name
+            staging = context_path.with_name(f".{context_path.name}.{uuid.uuid4().hex}.tmp")
+            staging.write_text(payload["prompt"], encoding="utf-8", newline="\n")
+            replace_file(staging, context_path)
+            task = (f"Read the complete WPO session context from this UTF-8 file before doing any work: \"{context_path.as_posix()}\". "
+                    "Follow its instructions as the task for this session. Read the entire file; if output is truncated, "
+                    "continue reading in chunks until all of it has been read. If the file cannot be read, stop and report the error."
+                    f"\n\nRecord real progress between long steps with wpo --project \"{self.project.root.as_posix()}\" "
+                    f"t3 heartbeat --request {request['id']}. Do not invent heartbeat activity when no work is progressing.")
             arguments = {"task": task, "title": payload["title"], "isolation": "shared", "mode": "async",
                          "role": payload["native_role"], "target": payload["target"], "clientRequestId": request["id"]}
             return {"tool": "delegate_task", "arguments": arguments}
