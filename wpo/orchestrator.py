@@ -70,7 +70,10 @@ def writes_wp_files(context: Context, write_paths: list[str]) -> bool:
 def dispatch_session(context: Context, tier: str, prompt: str, access: str, write_paths: list[str], families: list[str], cwd: Path,
                      run_dir: Path, event_fields: dict[str, str]) -> SessionResult:
     """One ad-hoc session as `wpo dispatch` runs it: the project's prompt rules appended, the answer
-    saved as `result.md` in `run_dir`. Raises NoRouteError when nothing serves the tier."""
+    saved as `result.md` in `run_dir`, routed in the project's mode. Raises NoRouteError when nothing
+    serves the tier."""
+    from .routing import project_mode, with_mode
+    tier = with_mode(tier, project_mode(context.project.runs_dir))
     run_dir.mkdir(parents=True, exist_ok=True)
     drafting = [DRAFTING_RULE] if access == "docs" and writes_wp_files(context, write_paths) else []
     rules = "\n".join([*context.project.config["prompt_rules"], *drafting])

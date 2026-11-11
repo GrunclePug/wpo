@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     candidates.add_argument("--spec", required=True)
     candidates.add_argument("--families", action="append")
     candidates.add_argument("--refresh", action="store_true")
+    candidates.add_argument("--gate", action="store_true", help="rank as a review or re-evaluation: gate-only routes, no free fallback")
     route_commands.add_parser("status")
     refresh = route_commands.add_parser("refresh")
     refresh.add_argument("--force", action="store_true")
@@ -55,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     mark.add_argument("--route", required=True)
     mark.add_argument("--outcome", required=True)
     mark.add_argument("--detail", default="")
+    mode = route_commands.add_parser("mode", help="show or set the project's routing mode (WPs keep the mode they started in)")
+    mode.add_argument("mode", nargs="?", help="standard, or a mode the routing policy defines")
     clear = route_commands.add_parser("clear", help="drop cooldowns (a cap lifted early)")
     clear.add_argument("--prefix", default="", help="e.g. family:gpt; empty clears every cooldown")
 
@@ -488,11 +491,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if arguments.command == "route":
-        from .routing import RoutingError
+        from .routing import RoutingError, project_mode, routing_modes, set_project_mode
         router = context.router
         try:
             if arguments.route_command == "candidates":
-                print(json.dumps(asdict(router.select(arguments.spec, split_list(arguments.families) or None, arguments.refresh)), indent=2))
+                from .routing import with_mode
+                # As the project's next session would rank it; outside a project, as standard.
+                spec = with_mode(arguments.spec, project_mode(context.project.runs_dir)) if context.project else arguments.spec
+                print(json.dumps(asdict(router.select(spec, split_list(arguments.families) or None, arguments.refresh,
+                                                      free_last_resort=not arguments.gate, gate=arguments.gate)), indent=2))
             elif arguments.route_command == "status":
                 print(router.status_text())
             elif arguments.route_command == "refresh":
@@ -500,6 +507,21 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({key: catalog[key] for key in ("refreshed_at", "unrated", "errors")} | {"routes": len(catalog["routes"])}, indent=2))
             elif arguments.route_command == "mark":
                 print(json.dumps(router.mark(arguments.route, arguments.outcome, arguments.detail)))
+            elif arguments.route_command == "mode":
+                if context.project is None:
+                    raise RoutingError("a routing mode belongs to a project: run wpo route mode inside one, or pass --project")
+                runs_dir, modes = context.project.runs_dir, routing_modes(router.policy)
+                if arguments.mode is None:
+                    current = project_mode(runs_dir)
+                    unconfigured = "" if current in modes else ", not configured: routes as standard"
+                    print(f"{current} (modes: {', '.join(modes)}{unconfigured})")
+                    return 0
+                if arguments.mode not in modes:
+                    raise RoutingError(f"unknown routing mode '{arguments.mode}' (modes: {', '.join(modes)})")
+                previous = project_mode(runs_dir)
+                set_project_mode(runs_dir, arguments.mode)
+                context.journal.emit("routing-mode", f"routing mode {previous} -> {arguments.mode}; WPs that already ran keep theirs")
+                print(arguments.mode)
             else:
                 print(f"cleared: {', '.join(router.clear_cooldowns(arguments.prefix)) or 'nothing'}")
         except RoutingError as error:

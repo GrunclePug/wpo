@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -72,6 +73,16 @@ class T3BackendTests(unittest.TestCase):
         self.assertEqual(target["options"], {"effort": "high"})
         unavailable = Route("local-private", "local", "local", "private-model", "high", 42, True, "local")
         self.assertFalse(AvailabilityOracle(self.context.router).route(unavailable).available)
+
+    def test_antigravity_effort_is_its_thinking_level(self) -> None:
+        capabilities = json.loads(json.dumps(CAPABILITIES))
+        capabilities["providers"].append({"providerInstanceId": "antigravity", "canRunChildTask": True, "models": [
+            {"id": "gemini-3.8-flash", "options": [{"id": "thinking_level", "values": ["low", "medium", "high"]}]}]})
+        self.bridge.attach("coordinator", capabilities)
+        # The bundled agy routes name T3's model with the effort apart (agy's CLI takes the same as --model/--effort).
+        bundled = dataclasses.asdict(self.context.router.find_route("agy-gemini-flash-medium"))
+        target = self.bridge.target(bundled)
+        self.assertEqual(target, {"providerInstanceId": "antigravity", "model": "gemini-3.8-flash", "options": {"thinking_level": "medium"}})
 
     def test_attach_rejects_a_thread_from_another_actual_repository(self) -> None:
         with self.assertRaisesRegex(T3Error, "actual T3 project root"):

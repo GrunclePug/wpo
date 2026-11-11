@@ -33,7 +33,8 @@ Keep each WP's ownership and dependency boundary explicit. A suitable WP records
 The existing router selects a `builder` or `reviewer` tier; the T3 adapter resolves its model and
 effort against recorded live native capabilities. Unsupported targets are skipped with their
 reason. Refresh the capability record after provider/model changes; never silently substitute
-an unavailable explicit model.
+an unavailable explicit model. Tiers may list their routes explicitly, and a project may run in a
+routing mode (`wpo route mode`); see [configuration](references/configuration.md).
 
 The [standalone reference](REFERENCE.md) documents the existing CLI mechanics. Read its relevant
 section only when inspecting or maintaining that engine. [SPEC.md](SPEC.md) is historical design

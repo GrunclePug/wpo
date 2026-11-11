@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
+from typing import ClassVar
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -313,6 +315,428 @@ class RoutingTests(unittest.TestCase):
         texts = [{"type": "text", "part": {"messageID": "m1", "text": "thinking"}}, {"type": "text", "part": {"messageID": "m2", "text": "RESULT: "}},
                  {"type": "text", "part": {"messageID": "m2", "text": "review"}}]
         self.assertEqual(routing.classify("opencode", "\n".join(map(json.dumps, texts)), 0).result_text, "RESULT: review")
+
+
+class TierRouteTests(unittest.TestCase):
+    """Explicit per-tier route groups, quota headroom within a group, and routing modes."""
+
+    ROUTING: ClassVar[dict] = {
+        "routes_exclude": ["family:xai"],
+        "tiers": {"review": {"floor": 54, "fallback_floor": 51, "writes_code": True, "use_for": "Reviews"}},
+        "tier_routes": {
+            "code-hard": {"routes": [["claude-opus-medium", "gpt-sol-high"]], "fallback": [["claude-opus-low", "gpt-sol-medium"]]},
+            "review": {"routes": [["agy-gemini-flash-high"], ["gpt-sol-xhigh"], ["claude-opus-high"]]},
+        },
+        "modes": {"hard": {"tier_routes": {"code-hard": {"routes": [["claude-opus-high", "gpt-sol-xhigh"]], "free_last_resort": False}}}},
+    }
+
+    def router(self, routing_override: dict | None = None) -> routing.Router:
+        machine = machine_in(Path(tempfile.mkdtemp()))
+        machine.raw["routing"] = routing_override or self.ROUTING
+        return routing.Router(machine)
+
+    @staticmethod
+    def windows(claude: float, gpt: float) -> dict:
+        resets = (routing.now_utc() + timedelta(hours=2)).timestamp()
+        return {family: [{"label": "5h", "used_percent": used, "resets_at": resets, "window_seconds": 18000}]
+                for family, used in (("claude", claude), ("gpt", gpt))}
+
+    def ranked(self, spec: str, claude: float = 10, gpt: float = 10, gate: bool = False, cheaper: str | None = None,
+               free: list | None = None) -> list[tuple[str, bool]]:
+        router = self.router()
+        def state(router, windows, family, paced=True):
+            return routing.now_utc(), None, cheaper if family == "claude" else None
+
+        with mock.patch.object(routing.Router, "catalog_routes", return_value=free or []), \
+             mock.patch.object(routing.Router, "usage_windows", return_value=self.windows(claude, gpt)), \
+             mock.patch.object(routing.Router, "subscription_state", state):
+            selection = router.select(spec, gate=gate, free_last_resort=not gate)
+        return [(candidate["id"], candidate["downgrade"]) for candidate in selection.candidates]
+
+    def test_the_family_with_more_headroom_goes_first_within_a_group(self) -> None:
+        ranked = self.ranked("code-hard", claude=20, gpt=60)
+        self.assertEqual(ranked[:4], [("claude-opus-medium", False), ("gpt-sol-high", False), ("claude-opus-low", True), ("gpt-sol-medium", True)])
+        self.assertEqual({route for route, _ in ranked[4:]}, {"agy-gemini-flash-high", "agy-gemini-flash-medium"}, "then the free last resort")
+        self.assertEqual([route for route, _ in self.ranked("code-hard", claude=60, gpt=20)][:2], ["gpt-sol-high", "claude-opus-medium"])
+        # Headroom counts to each family's own ceiling: Claude's 5-hour one is 85, GPT's 92.
+        self.assertEqual(self.ranked("code-hard", claude=10, gpt=15)[0], ("gpt-sol-high", False))
+
+    def test_taste_puts_claude_first_whatever_the_headroom(self) -> None:
+        self.assertEqual(self.ranked("code-hard+taste", claude=80, gpt=0)[0], ("claude-opus-medium", False))
+
+    def test_groups_keep_their_order_and_only_listed_routes_run(self) -> None:
+        self.assertEqual(self.ranked("review", claude=0, gpt=80, gate=True),
+                         [("agy-gemini-flash-high", False), ("gpt-sol-xhigh", False), ("claude-opus-high", False)])
+
+    def test_a_family_over_its_pace_serves_only_the_fallback(self) -> None:
+        ranked = self.ranked("code-hard", claude=0, gpt=50, cheaper="weekly over pace")
+        self.assertEqual(ranked[:3], [("gpt-sol-high", False), ("claude-opus-low", True), ("gpt-sol-medium", True)])
+
+    def test_a_tier_without_a_list_still_ranks_by_floors(self) -> None:
+        self.assertIn(("claude-opus-low", False), self.ranked("code"))
+
+    def test_hard_mode_replaces_only_its_tiers_and_can_refuse_free_routes(self) -> None:
+        free = [routing.Route(id="free-big", family="free", harness="opencode", model="m", effort=None, score=60, writes_code=True,
+                              cost_class="free")]
+        self.assertEqual(self.ranked("code-hard@hard", claude=10, gpt=50, free=free), [("claude-opus-high", False), ("gpt-sol-xhigh", False)])
+        self.assertIn(("free-big", True), self.ranked("code-hard", free=free), "standard keeps the free last resort")
+        self.assertEqual(self.ranked("review@hard", gate=True)[0], ("agy-gemini-flash-high", False), "no hard entry: the standard list")
+
+    def test_a_mode_no_longer_configured_routes_as_standard(self) -> None:
+        # A WP keeps the mode it first ran in; the configuration may drop that mode later.
+        self.assertEqual(self.ranked("code-hard@turbo"), self.ranked("code-hard"))
+        self.assertEqual(routing.resolve_work_spec("code-hard@turbo", self.router().policy).mode, "standard")
+
+    def test_a_later_layer_replaces_a_tiers_entry_whole(self) -> None:
+        machine = machine_in(Path(tempfile.mkdtemp()))
+        machine.raw["routing"] = self.ROUTING
+        router = routing.Router(machine, {"tier_routes": {"code-hard": {"routes": [["gpt-sol-high"]]}},
+                                          "modes": {"hard": {"tier_routes": {"code-hard": {"routes": [["gpt-sol-xhigh"]]}}}}})
+        self.assertEqual(router.tier_routes("code-hard"), {"routes": [["gpt-sol-high"]]}, "the machine's fallback does not survive")
+        self.assertEqual(router.tier_routes("code-hard", "hard"), {"routes": [["gpt-sol-xhigh"]]})
+        self.assertEqual(router.tier_routes("review"), self.ROUTING["tier_routes"]["review"], "other tiers keep the machine's entry")
+        self.assertEqual(routing.Router(machine, {"tier_routes": {"code-hard": {}}}).tier_routes("code-hard"), {})
+
+    def test_malformed_tier_lists_and_modes_fail_naming_the_setting(self) -> None:
+        for override, message in (({"tier_routes": {"code-hard": {"routes": ["claude-opus-low"]}}}, r"tier_routes\.code-hard\.routes"),
+                                  ({"tier_routes": {"code-hard": {"routes": [[]]}}}, r"tier_routes\.code-hard\.routes"),
+                                  ({"tier_routes": {"code-hard": {"route": [["claude-opus-low"]]}}}, r"tier_routes\.code-hard must be"),
+                                  ({"tier_routes": {"code-hard": {"free_last_resort": "no"}}}, "free_last_resort"),
+                                  ({"tier_routes": {"nonsense": {}}}, "unknown tier"),
+                                  ({"modes": {"a@b": {}}}, "cannot name a mode"),
+                                  ({"modes": {"standard": {}}}, "cannot name a mode"),
+                                  ({"modes": {"hard": {"routes": []}}}, r"modes\.hard must be"),
+                                  ({"modes": {"hard": {"tier_routes": {"code-hard": {"fallback": "x"}}}}}, r"modes\.hard\.tier_routes\.code-hard\.fallback")):
+            with self.subTest(override=override), self.assertRaisesRegex(routing.RoutingError, message):
+                self.router({**self.ROUTING, **override})
+        noted = self.router({**self.ROUTING, "tier_routes": {"$comment": "x", "code": {"$why": "x", "routes": [["claude-opus-low"]]}},
+                             "modes": {"$comment": "x", "hard": {"$why": "x", "tier_routes": {}}}})
+        self.assertEqual(routing.routing_modes(noted.policy), ["standard", "hard"], "$-keys are comments")
+        with mock.patch.object(routing.Router, "load_catalog", return_value={"routes": []}):
+            self.assertEqual(noted.unknown_listed_routes(), [])
+
+    def test_the_supervisor_asks_for_the_wps_mode(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo.supervisor import Supervisor
+        runs = Path(tempfile.mkdtemp())
+        supervisor = object.__new__(Supervisor)
+        supervisor.project = SimpleNamespace(runs_dir=runs)
+        supervisor.explicit_builder, supervisor.lane_builder, supervisor.escalation = None, None, lambda wp_id: None
+        building = SimpleNamespace(id="WP-0001", status="todo", builder="code-hard", reviewer="review")
+        reviewing = SimpleNamespace(id="WP-0002", status="review", builder="code", reviewer="review")
+        routing.set_project_mode(runs, "hard")
+        routing.record_wp_mode(runs, "WP-0002", "standard")
+        self.assertEqual(supervisor.session_spec(building), "code-hard@hard")
+        self.assertEqual(supervisor.session_spec(reviewing), "review", "a WP keeps the mode it started in")
+        routing.record_wp_mode(runs, "WP-0003", "hard")
+        self.assertEqual(supervisor.session_spec(SimpleNamespace(id="WP-0003", status="review", reviewer="pin:claude-opus-high")),
+                         "pin:claude-opus-high", "pins carry no mode")
+
+    def test_route_commands_outside_a_project(self) -> None:
+        import contextlib
+        import io
+        from types import SimpleNamespace
+
+        from wpo import cli
+        from wpo.context import Context
+        from wpo.machine import MachineConfig
+        specs = []
+        context = SimpleNamespace(router=SimpleNamespace(select=lambda spec, *arguments, **keywords: specs.append(spec) or routing.Selection(spec=spec, tier=None),
+                                                         policy=self.router().policy), project=None, machine=None)
+        with mock.patch.object(MachineConfig, "load", return_value=machine_in(Path(tempfile.mkdtemp()))), \
+                mock.patch.object(Context, "load", return_value=context), mock.patch("wpo.dashboard.autostart"), mock.patch("sys.stdout"), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(cli.main(["route", "candidates", "--spec", "code-hard"]), 0)
+            self.assertEqual(cli.main(["route", "mode"]), 2)
+        self.assertEqual(specs, ["code-hard"], "no project, no mode")
+        self.assertIn("belongs to a project", errors.getvalue())
+
+    def test_route_mode_shows_sets_and_rejects_modes(self) -> None:
+        import contextlib
+        import io
+
+        from wpo import cli
+        project = DashboardProject()
+        machine = machine_in(project.base)
+        machine.raw["routing"] = self.ROUTING
+        machine.raw["dashboard"] = {**machine.raw["dashboard"], "autostart": False}
+
+        def run(*arguments: str) -> tuple[int, str]:
+            output, errors = io.StringIO(), io.StringIO()
+            with mock.patch("wpo.machine.MachineConfig.load", return_value=machine), contextlib.redirect_stdout(output), \
+                    contextlib.redirect_stderr(errors), mock.patch("sys.stdout.reconfigure", create=True):
+                code = cli.main(["--project", str(project.root), "route", "mode", *arguments])
+            return code, output.getvalue() + errors.getvalue()
+
+        self.assertEqual(run(), (0, "standard (modes: standard, hard)\n"))
+        routing.set_project_mode(project.runs, "hard")
+        with mock.patch("wpo.machine.MachineConfig.load", return_value=machine), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch("sys.stdout.reconfigure", create=True), \
+                mock.patch.object(routing.Router, "select", return_value=routing.Selection(spec="", tier=None)) as select:
+            self.assertEqual(cli.main(["--project", str(project.root), "route", "candidates", "--spec", "code-hard"]), 0)
+        self.assertEqual(select.call_args.args[0], "code-hard@hard", "candidates rank as the project's next session would")
+        routing.set_project_mode(project.runs, "standard")
+        self.assertEqual(run("hard"), (0, "hard\n"))
+        self.assertEqual(routing.project_mode(project.runs), "hard")
+        code, text = run("turbo")
+        self.assertEqual(code, 2)
+        self.assertIn("unknown routing mode 'turbo'", text)
+        routing.set_project_mode(project.runs, "gone")
+        self.assertEqual(run(), (0, "gone (modes: standard, hard, not configured: routes as standard)\n"))
+
+    def test_route_status_shows_how_reviews_rank_where_they_differ(self) -> None:
+        import re
+        router = self.router({**self.ROUTING, "gate_only_routes": ["agy-gemini-flash-high"]})
+        def state(router, windows, family, paced=True):
+            return routing.now_utc(), None, None
+
+        catalog = {"refreshed_at": time.time(), "routes": [], "errors": [], "unrated": []}
+        with mock.patch.object(routing.Router, "catalog_routes", return_value=[]), mock.patch.object(routing.Router, "load_catalog", return_value=catalog), \
+             mock.patch.object(routing.Router, "usage_windows", return_value=self.windows(10, 50)), \
+             mock.patch.object(routing.Router, "subscription_state", state):
+            text = router.status_text()
+        rows = {match.group(1): match for line in text.splitlines() if (match := re.match(r"  (\S.*?)\s{2,}(\S.*)$", line))}
+        self.assertTrue(rows["review as a review"].group(2).startswith("agy-gemini-flash-high"), "reviews rank the gate-only route")
+        self.assertNotIn("code-hard@hard as a review", rows, "hard code-hard ranks the same for reviews: no extra line")
+        self.assertEqual(len({match.start(2) for match in rows.values()}), 1, "every row's choices start in one column")
+
+    def test_route_candidates_gate_ranks_as_a_review(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo import cli
+        from wpo.context import Context
+        from wpo.machine import MachineConfig
+        calls = []
+
+        def select(spec, families=None, force_refresh=False, **keywords):
+            calls.append(keywords)
+            return routing.Selection(spec=spec, tier="review")
+
+        context = SimpleNamespace(router=SimpleNamespace(select=select), project=None, machine=None)
+        with mock.patch.object(MachineConfig, "load", return_value=machine_in(Path(tempfile.mkdtemp()))), \
+             mock.patch.object(Context, "load", return_value=context), mock.patch("wpo.dashboard.autostart"), mock.patch("sys.stdout"):
+            cli.main(["route", "candidates", "--spec", "review", "--gate"])
+            cli.main(["route", "candidates", "--spec", "review"])
+        self.assertEqual(calls, [{"free_last_resort": False, "gate": True}, {"free_last_resort": True, "gate": False}])
+
+    def test_unknown_listed_routes_are_reported(self) -> None:
+        router = self.router({**self.ROUTING, "tier_routes": {"code": {"routes": [["claude-opus-low", "gpt-typo", "free-listed"]]}}})
+        with mock.patch.object(routing.Router, "load_catalog", return_value={"routes": [{"id": "free-listed"}]}):
+            self.assertEqual(router.unknown_listed_routes(), ["gpt-typo"], "catalog routes are known")
+
+    def test_a_wp_keeps_the_mode_it_first_ran_in(self) -> None:
+        runs = Path(tempfile.mkdtemp())
+        self.assertEqual(routing.project_mode(runs), "standard")
+        routing.set_project_mode(runs, "hard")
+        self.assertEqual(routing.wp_mode(runs, "WP-0001"), "hard", "an unstarted WP follows the project")
+        self.assertFalse((runs / "WP-0001" / routing.MODE_FILE).exists(), "and records nothing")
+        routing.record_wp_mode(runs, "WP-0001", "hard")
+        routing.set_project_mode(runs, "standard")
+        self.assertEqual(routing.wp_mode(runs, "WP-0001"), "hard", "a started WP keeps its mode")
+        routing.record_wp_mode(runs, "WP-0001", "standard")
+        self.assertEqual(routing.wp_mode(runs, "WP-0001"), "hard", "and a second record changes nothing")
+        self.assertEqual(routing.wp_mode(runs, "WP-0002"), "standard")
+
+    def runner_for(self, runs: Path):
+        from types import SimpleNamespace
+
+        from wpo import runner
+        run = object.__new__(runner.WorkPackageRun)
+        run.context = SimpleNamespace(project=SimpleNamespace(runs_dir=runs))
+        run.wp_id, run.run_dir, run.tree, run.families, run.env, run.counting_round = "WP-0001", runs / "WP-0001", runs, (), {}, False
+        run.run_dir.mkdir(exist_ok=True)
+        run.options = SimpleNamespace(idle_minutes=1)
+        run.ledger = SimpleNamespace(writing=None, state={}, save=lambda: None)
+        run.wp, run.log = (lambda: SimpleNamespace(owns=["src/**"], skills=[])), (lambda message: None)
+        return run
+
+    def test_the_runner_routes_every_role_in_the_mode_and_records_it_once_a_route_is_chosen(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo import runner
+        from wpo.session import NoRouteError
+        runs = Path(tempfile.mkdtemp())
+        run = self.runner_for(runs)
+        specs = []
+
+        def session(context, spec, *arguments, on_attempt=None, **keywords):
+            specs.append(spec)
+            if len(specs) == 1:
+                raise NoRouteError("no route", None, [])  # no route was chosen, so nothing started
+            on_attempt()
+            routing.set_project_mode(runs, "standard")  # a switch while the session runs
+            return SimpleNamespace(route={"id": "r", "family": "claude"}, fallback_note="")
+
+        routing.set_project_mode(runs, "hard")
+        with mock.patch.object(runner, "run_session", session), mock.patch.object(runner, "pause_requested", return_value=None), \
+             mock.patch.object(runner, "inbox_of", return_value=None), mock.patch.object(runner.wpfile, "set_status"):
+            with self.assertRaises(runner.RunStopped):
+                run.session("code-hard", "planner", "p", run.run_dir / "plan", "todo", access="docs", write_paths=["x"])
+            self.assertFalse((run.run_dir / routing.MODE_FILE).exists(), "no route chosen: nothing recorded")
+            run.session("code-simple", "executor", "p", run.run_dir / "task", "todo")
+            self.assertEqual(routing.wp_mode(runs, "WP-0001"), "hard", "recorded when the route was chosen, kept after the switch")
+            run.session("code", "reviewer", "p", run.run_dir / "review", "review")
+        self.assertEqual(specs, ["code-hard@hard", "code-simple@hard", "code@hard"], "staged and later roles route in the WP's mode")
+
+    def test_a_spec_that_names_its_mode_records_that_mode(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo import runner
+        runs = Path(tempfile.mkdtemp())
+        run = self.runner_for(runs)
+        def session(context, spec, *arguments, on_attempt=None, **keywords):
+            on_attempt()
+            return SimpleNamespace(route={"id": "r", "family": "claude"}, fallback_note="")
+        with mock.patch.object(runner, "run_session", session), mock.patch.object(runner, "pause_requested", return_value=None), \
+             mock.patch.object(runner, "inbox_of", return_value=None):
+            run.session("code-hard@hard", "builder", "p", run.run_dir / "build", "todo")
+        self.assertEqual(routing.wp_mode(runs, "WP-0001"), "hard")
+
+    def test_repairs_route_in_the_wp_mode(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo import runner
+        runs = Path(tempfile.mkdtemp())
+        run = self.runner_for(runs)
+        run.config = {"repair_spec": "code-simple"}
+        run.emit = lambda *arguments: None
+        specs = []
+        def session(context, spec, *arguments, on_attempt=None, **keywords):
+            specs.append(spec)
+            on_attempt()
+            return SimpleNamespace(route={"id": "r", "family": "claude"}, fallback_note="")
+        routing.set_project_mode(runs, "hard")
+        with mock.patch.object(runner, "run_session", session), mock.patch.object(runner, "repair_prompt", return_value="p"), \
+             mock.patch.object(runner, "builder_skills", return_value=[]):
+            self.assertTrue(run.repair(1, [SimpleNamespace(command="cargo fmt")]))
+        self.assertEqual(specs, ["code-simple@hard"])
+        self.assertEqual(routing.wp_mode(runs, "WP-0001"), "hard")
+
+    def test_a_window_past_its_reset_counts_as_unused(self) -> None:
+        router = self.router()
+        past = (routing.now_utc() - timedelta(seconds=1)).timestamp()
+        windows = {"gpt": [{"label": "5h", "used_percent": 100, "resets_at": past, "window_seconds": 18000}],
+                   "claude": self.windows(70, 0)["claude"]}
+        with mock.patch.object(routing.Router, "usage_windows", return_value=windows):
+            oracle = router.oracle()
+            self.assertEqual(oracle.headroom("gpt"), 92)
+            self.assertEqual(oracle.headroom("claude"), 15)
+
+    def test_an_empty_entry_lists_nothing_rather_than_falling_back_to_floors(self) -> None:
+        router = self.router({**self.ROUTING, "tier_routes": {"code-hard": {}}})
+        with mock.patch.object(routing.Router, "catalog_routes", return_value=[]), \
+             mock.patch.object(routing.Router, "usage_windows", return_value=self.windows(0, 0)):
+            ranked = [candidate["id"] for candidate in router.select("code-hard").candidates]
+        self.assertFalse([route for route in ranked if not route.startswith("agy-")], "only the free last resort")
+
+    def test_with_mode_marks_tiers_only(self) -> None:
+        self.assertEqual(routing.with_mode("code-hard", "hard"), "code-hard@hard")
+        self.assertEqual(routing.with_mode("code-hard", "standard"), "code-hard")
+        for spec in ("none", "pin:claude-opus-high", "code@hard"):
+            self.assertEqual(routing.with_mode(spec, "hard"), spec)
+
+
+class QuotaGroupTests(unittest.TestCase):
+    """Quota groups wait for their buckets to reset once a bucket passes its ceiling."""
+
+    def router(self, machine_routing: dict, usage: dict | None = None) -> routing.Router:
+        directory = Path(tempfile.mkdtemp())
+        machine = machine_in(directory)
+        machine.raw["routing"] = machine_routing
+        if usage is not None:
+            cache = directory / "usage.json"
+            cache.write_text(json.dumps(usage), encoding="utf-8")
+            machine.raw["usage"] = {**machine.raw["usage"], "cache": str(cache), "max_age_seconds": 10**9}
+        return routing.Router(machine)
+
+    def agy_usage(self, used: dict[str, float], resets_in_hours: float = 2.0) -> dict:
+        resets = (routing.now_utc() + timedelta(hours=resets_in_hours)).timestamp()
+        windows = [{"family": "agy", "label": label, "used_percent": percent, "resets_at": resets,
+                    "window_seconds": 18000 if label.endswith("5h") else 7 * 86400} for label, percent in used.items()]
+        return {"fetched_at": time.time(), "families": [{"family": "agy", "plan": None, "windows": windows, "notes": [], "error": None,
+                                                       "fetched_at": time.time()}]}
+
+    def test_a_quota_group_waits_until_its_buckets_reset(self) -> None:
+        quota = {"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h", "gemini-weekly"]}}, "ceilings": {"five_hour": 70, "weekly": 85}}
+        flash = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "agy-gemini-flash-high")
+        cases = [
+            ("under both ceilings", {"gemini-5h": 69.9, "gemini-weekly": 84.0}, True),
+            ("5-hour bucket at its ceiling", {"gemini-5h": 70.0, "gemini-weekly": 10.0}, False),
+            ("weekly bucket past its ceiling", {"gemini-5h": 0.0, "gemini-weekly": 90.0}, False),
+            ("another group's bucket", {"3p-5h": 100.0}, True),
+        ]
+        for name, used, available in cases:
+            router = self.router({"quota_groups": quota}, usage=self.agy_usage(used))
+            availability = router.oracle().route(flash)
+            self.assertEqual(availability.available, available, name)
+            if not available:
+                self.assertGreater(availability.available_at, routing.now_utc(), name)
+                self.assertIn("agy gemini-", availability.reason, name)
+        unknown = self.router({"quota_groups": quota})
+        self.assertTrue(unknown.oracle().route(flash).available, "unknown usage blocks nothing")
+        spent = self.agy_usage({"gemini-5h": 100.0})
+        argon = dataclasses.replace(flash, id="agy-argon", provider="agy-argon")
+        self.assertTrue(self.router({"quota_groups": quota}, usage=spent).oracle().route(argon).available, "a provider without a group")
+
+    def test_any_family_can_hold_a_quota_group(self) -> None:
+        quota = {"groups": {"team-key": {"family": "gpt", "buckets": ["5h"]}}, "ceilings": {"five_hour": 50, "weekly": 90}}
+        resets = (routing.now_utc() + timedelta(hours=1)).timestamp()
+        usage = {"fetched_at": time.time(), "families": [{"family": "gpt", "error": None,
+                                                          "windows": [{"label": "5h", "used_percent": 60, "resets_at": resets, "window_seconds": 18000}]}]}
+        sol = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "gpt-sol-high")
+        router = self.router({"quota_groups": quota}, usage=usage)
+        with mock.patch.object(routing.AvailabilityOracle, "family", return_value=routing.Availability(True)):
+            self.assertTrue(router.oracle().route(sol).available, "routes outside the group are not held")
+            availability = router.oracle().route(dataclasses.replace(sol, provider="team-key"))
+        self.assertFalse(availability.available)
+        self.assertIn("gpt 5h 60% >= 50%", availability.reason)
+
+    def test_malformed_quota_groups_fail_naming_the_setting(self) -> None:
+        for settings, message in (({"groups": {"agy-gemini": ["gemini-5h"]}, "ceilings": {"five_hour": 70, "weekly": 85}}, r"groups\.agy-gemini"),
+                                  ({"groups": {"agy-gemini": {"family": "agy", "buckets": []}}, "ceilings": {"five_hour": 70, "weekly": 85}}, r"groups\.agy-gemini"),
+                                  ({"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h"]}}}, "ceilings"),
+                                  ({"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h"]}}, "ceilings": {"five_hour": 70}}, "ceilings"),
+                                  ({"group": {}}, "quota_groups must be")):
+            with self.subTest(settings=settings), self.assertRaisesRegex(routing.RoutingError, message):
+                self.router({"quota_groups": settings})
+        self.router({"quota_groups": {"$comment": "x", "groups": {"agy-gemini": {"$why": "x", "family": "agy", "buckets": ["gemini-5h"]}},
+                                      "ceilings": {"five_hour": 70, "weekly": 85}}})  # $-keys are comments
+
+    def windows(self, buckets: dict[str, tuple[float, float]]) -> dict:
+        """Buckets as {label: (used percent, hours until reset)}."""
+        now = routing.now_utc()
+        rows = [{"family": "agy", "label": label, "used_percent": used, "resets_at": (now + timedelta(hours=hours)).timestamp(),
+                 "window_seconds": 18000 if label.endswith("5h") else 7 * 86400} for label, (used, hours) in buckets.items()]
+        return {"fetched_at": time.time(), "families": [{"family": "agy", "plan": None, "windows": rows, "notes": [], "error": None,
+                                                       "fetched_at": time.time()}]}
+
+    def test_a_reset_bucket_unblocks_and_the_latest_reset_wins(self) -> None:
+        quota = {"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h", "gemini-weekly"]}}, "ceilings": {"five_hour": 70, "weekly": 85}}
+        flash = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "agy-gemini-flash-high")
+        reset = self.router({"quota_groups": quota}, usage=self.windows({"gemini-5h": (95.0, -0.1), "gemini-weekly": (10.0, 50)}))
+        self.assertTrue(reset.oracle().route(flash).available, "a reading from before its reset blocks nothing")
+        both = self.router({"quota_groups": quota}, usage=self.windows({"gemini-5h": (95.0, 2), "gemini-weekly": (90.0, 50)}))
+        availability = both.oracle().route(flash)
+        self.assertFalse(availability.available)
+        self.assertGreater(availability.available_at, routing.now_utc() + timedelta(hours=49), "waits for the later reset")
+
+    def test_t3_routes_are_held_once_their_native_target_checks_out(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo import t3
+        quota = {"groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h", "gemini-weekly"]}}, "ceilings": {"five_hour": 70, "weekly": 85}}
+        router = self.router({"quota_groups": quota}, usage=self.windows({"gemini-5h": (95.0, 2)}))
+        router.machine.raw["execution_mode"] = "t3"
+        router.project = SimpleNamespace(runs_dir=Path(tempfile.mkdtemp()))
+        flash = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "agy-gemini-flash-high")
+        with mock.patch.object(t3.Bridge, "target", return_value={}) as target:
+            oracle = router.oracle()
+            availability = oracle.route(flash)
+            oracle.route(flash)
+        self.assertFalse(availability.available)
+        self.assertIn("agy gemini-5h", availability.reason)
+        self.assertEqual(target.call_count, 1, "one oracle checks a route's native target once")
 
 
 class EventTests(unittest.TestCase):
@@ -979,11 +1403,9 @@ class RoundRoutingTests(unittest.TestCase):
         self.assertEqual([elapsed_text(seconds) for seconds in (-3, 40, 720, 10800, 11100, 90000, 172800)],
                          ["0 s", "40 s", "12 min", "3 h", "3 h 5 min", "1 d 1 h", "2 d"])
 
-    @mock.patch.object(routing, "now_utc", return_value=datetime(2026, 1, 1, tzinfo=timezone.utc))
-    def test_a_cap_ends_every_session_of_the_family(self, _clock: mock.Mock) -> None:
+    def test_a_cap_ends_every_session_of_the_family(self) -> None:
         router = routing.Router(machine_in(Path(tempfile.mkdtemp())))
-        # time.time() and datetime.now() have different resolutions on Windows Python 3.11.
-        started = routing.now_utc().timestamp()
+        started = time.time()
         resets = (routing.now_utc() + timedelta(hours=2)).timestamp()
         with mock.patch.object(routing.Router, "usage_windows", return_value={"gpt": [{"label": "5h", "used_percent": 100, "resets_at": resets}]}):
             self.assertIn("5h usage window is at 100%", router.family_cut_off("gpt", started))
@@ -994,7 +1416,19 @@ class RoundRoutingTests(unittest.TestCase):
             router.mark("claude-opus-high", "rate_limited", "You've hit your limit")
             self.assertIn("another claude session hit its cap", router.family_cut_off("claude", started))
             # A cap recorded before the session started did not end it.
-            self.assertIsNone(router.family_cut_off("claude", started + 1))
+            self.assertIsNone(router.family_cut_off("claude", time.time() + 1))
+
+    def test_a_cap_recorded_after_a_launch_ends_it_whatever_the_clocks(self) -> None:
+        # Sessions take their launch time from time.time(); on Windows datetime.now() can lag it
+        # by a clock tick, and a cap stamped from it then read as older than the launch.
+        router = routing.Router(machine_in(Path(tempfile.mkdtemp())))
+        launched = time.time()
+        lagging = routing.from_timestamp(launched - 0.016)
+        with mock.patch.object(routing, "now_utc", return_value=lagging), \
+             mock.patch.object(routing.Router, "usage_windows", return_value={"claude": []}), \
+             mock.patch.object(routing.Router, "subscription_blocked_until", return_value=(lagging + timedelta(hours=1), None)):
+            router.mark("claude-opus-high", "rate_limited", "You've hit your limit")
+            self.assertIn("another claude session hit its cap", router.family_cut_off("claude", launched))
 
     def test_a_session_whose_provider_is_cut_off_is_killed(self) -> None:
         from wpo import session
@@ -2730,6 +3164,21 @@ class LintIntegrationTests(unittest.TestCase):
             dispatch_session(self.context, "research", "research it", "read", [], [], self.scratch.root, self.scratch.base / "d2", {})
         self.assertIn(DRAFTING_RULE, prompts[0])
         self.assertNotIn(DRAFTING_RULE, prompts[1])
+
+    def test_ad_hoc_sessions_route_in_the_projects_mode(self) -> None:
+        from wpo import routing
+        from wpo.orchestrator import dispatch_session
+        specs: list[str] = []
+
+        def session(context, spec, *arguments, **keywords):
+            specs.append(spec)
+            return SimpleNamespaceResult("done")
+
+        routing.set_project_mode(self.context.project.runs_dir, "hard")
+        with mock.patch("wpo.orchestrator.run_session", side_effect=session):
+            for spec in ("code-hard", "code-hard@standard", "pin:claude-opus-high"):
+                dispatch_session(self.context, spec, "task", "read", [], [], self.scratch.root, self.scratch.base / spec.replace(":", "-"), {})
+        self.assertEqual(specs, ["code-hard@hard", "code-hard@standard", "pin:claude-opus-high"], "an explicit mode or pin stays")
 
     def test_audit_writes_a_dated_report_runs_the_review_and_journals_audit_done(self) -> None:
         import contextlib

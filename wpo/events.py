@@ -71,6 +71,8 @@ INFO_KINDS = frozenset({
     "session-hang",
     "session-compacted",
     "tier-downgrade",
+    # `wpo route mode` switched the project's routing mode.
+    "routing-mode",
     "catalog-refreshed",
     "catalog-unrated",
     "catalog-refresh-failed",

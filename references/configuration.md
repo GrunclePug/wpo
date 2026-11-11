@@ -75,6 +75,86 @@ the other route lists require exact IDs. For example:
 }
 ```
 
+### Quota groups
+
+`routing.quota_groups` holds a provider's routes back before the provider itself refuses them.
+`groups` maps a quota group (a route's `provider`, such as `agy-gemini`) to the usage `family`
+whose windows hold its buckets and the `buckets` (window labels) it spends, as the usage adapter reports
+them; `ceilings` gives `five_hour` and `weekly` limits in percent used. Once any bucket of a group
+is at or past its ceiling, that group's routes wait until the bucket resets (a window of five
+hours or less counts as five-hour). Unknown usage blocks nothing: a refused session then cools
+down what the router's failure handling already cools (for agy, the whole provider). Malformed
+settings fail with an error naming the setting.
+
+```json
+{
+  "routing": {
+    "quota_groups": {
+      "groups": {"agy-gemini": {"family": "agy", "buckets": ["gemini-5h", "gemini-weekly"]}},
+      "ceilings": {"five_hour": 70, "weekly": 85}
+    }
+  }
+}
+```
+
+The usage adapter (machine `usage.script`, not bundled) writes the cache at `usage.cache`; wpo
+reads it as JSON and runs the script when the cache is older than `usage.max_age_seconds`:
+
+```json
+{
+  "fetched_at": 1762800000.0,
+  "families": [
+    {"family": "agy", "error": null, "windows": [
+      {"label": "gemini-5h", "used_percent": 42.0, "resets_at": 1762810000.0, "window_seconds": 18000}
+    ]}
+  ]
+}
+```
+
+`fetched_at` and `resets_at` are epoch seconds; a family with an `error` counts as unknown. The
+subscription families (`claude`, `gpt`) are read the same way for ceilings, pace and headroom;
+any other family's windows serve only quota groups.
+
+### Inspecting routes
+
+`wpo route candidates --spec <tier>` ranks a tier as a builder sees it; `--gate` ranks it as a
+review or re-evaluation does (gate-only routes included, no free last resort). `wpo route status`
+lists each tier's first choices, plus an `as a review` line wherever reviews rank differently.
+
+### Listed tiers and routing modes
+
+`routing.tier_routes` gives a tier an explicit route list instead of its score floors. Each entry
+holds `routes`, ordered groups of exact route IDs; optional `fallback` groups, served as the tier's
+downgrades (and all a family over its weekly pace may serve); and `free_last_resort` (default
+`true`). Groups are tried in order. Within a group the subscription family with the most quota
+headroom goes first (percentage points left before its tightest window stops it), routes that
+spend no subscription before it, and Claude first for a `+taste` spec. Listed routes skip the
+family Pareto frontier but keep every restriction above; IDs that name no route are skipped and
+reported by `wpo route status`. An empty entry lists nothing. Tiers without an entry keep floors.
+A listed tier still needs its `tiers` entry, for `writes_code`; its floors are read only where the
+tier is not listed. A later layer (machine over bundled, project over machine) replaces a tier's
+entry whole rather than merging into it. Malformed entries fail with an error naming the setting.
+
+`routing.modes` maps a mode name to its own `tier_routes`, which replace the standard entries
+tier by tier. `wpo route mode [standard|<mode>]` shows or sets a project's mode; each WP records
+the mode in which its first route was chosen and keeps it for every later session, repairs and
+delegated workers included. Specs then carry it as a suffix, such as `code-hard@hard`. Ad-hoc
+sessions (`wpo dispatch`, placements, audits) and `wpo route candidates` use the project's mode
+unless their spec names one. A mode the
+configuration no longer defines routes as `standard` (`wpo route mode` says so); a mode name may
+not be `standard` or contain `@`.
+
+```json
+{
+  "routing": {
+    "tier_routes": {
+      "code-hard": {"routes": [["claude-opus-medium", "gpt-sol-high"]], "fallback": [["claude-opus-low", "gpt-sol-medium"]]}
+    },
+    "modes": {"hard": {"tier_routes": {"code-hard": {"routes": [["claude-opus-high", "gpt-sol-xhigh"]], "free_last_resort": false}}}}
+  }
+}
+```
+
 ### Carried user rules
 
 `user_rules` accepts an ordered list of file objects. Each `file` is an explicit path (with
