@@ -24,6 +24,10 @@ if TYPE_CHECKING:
     from .context import Context
 
 
+# The model option that carries a route's effort, by the name each T3 provider gives it.
+EFFORT_OPTIONS = ("effort", "reasoningEffort", "thinking_level")
+
+
 class T3Error(RuntimeError):
     """The native coordinator is unavailable or a native operation failed."""
 
@@ -106,7 +110,9 @@ class Bridge:
             raise T3Error(f"T3 model {requested!r} is absent from recorded capabilities for {provider_id}; refresh with orchestrator_capabilities(search=...) or configure t3.models")
         options = dict(self.settings.get("options", {}).get(provider_id, {}))
         if effort := route.get("effort"):
-            field = next((o for o in model.get("options", []) if o["id"] in ("effort", "reasoningEffort")), None)
+            # Providers name the effort option differently: Claude `effort`, Codex `reasoningEffort`,
+            # Antigravity `thinking_level`.
+            field = next((o for o in model.get("options", []) if o["id"] in EFFORT_OPTIONS), None)
             if not field or effort not in field["values"]:
                 raise T3Error(f"T3 model {requested} does not advertise effort {effort!r}")
             options[field["id"]] = effort
