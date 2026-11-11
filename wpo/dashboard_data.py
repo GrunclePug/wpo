@@ -101,7 +101,7 @@ class StampedCache:
     the next pass, since a writer is mid-write."""
 
     def __init__(self) -> None:
-        self._entries: dict[Path, tuple[Stamp, object]] = {}
+        self._entries: dict[Path, tuple[Stamp | None, object]] = {}
 
     def get(self, path: Path, compute: Callable[[Path], T], missing: T) -> T:
         stamp = file_stamp(path)
@@ -114,6 +114,9 @@ class StampedCache:
         try:
             value = compute(path)
         except (ValueError, UnicodeDecodeError, KeyError, TypeError):
+            if entry is not None:
+                # A repaired same-size file can reuse an earlier Windows timestamp.
+                self._entries[path] = (None, entry[1])
             return entry[1] if entry is not None else missing  # type: ignore[return-value]
         except FileNotFoundError:
             self._entries.pop(path, None)

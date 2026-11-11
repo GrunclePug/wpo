@@ -157,14 +157,17 @@ def kill_tree(pid: int, spared: Iterable[int] = ()) -> None:
         root = psutil.Process(pid)
     except psutil.NoSuchProcess:
         return
-    spared_pids: set[int] = set()
-    for spared_pid in spared:
+    spared_pids = set(spared)
+    processes = []
+    for process in root.children(recursive=True):
         try:
-            spared_process = psutil.Process(spared_pid)
-            spared_pids |= {spared_pid, *(child.pid for child in spared_process.children(recursive=True))}
+            # A spared launcher can spawn children between subtree enumerations.
+            # Check each target's ancestry before any parent is terminated.
+            if process.pid not in spared_pids and not any(parent.pid in spared_pids for parent in process.parents()):
+                processes.append(process)
         except psutil.NoSuchProcess:
             continue
-    processes = [process for process in root.children(recursive=True) if process.pid not in spared_pids] + [root]
+    processes.append(root)
     for process in processes:
         try:
             process.kill()

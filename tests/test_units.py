@@ -1466,6 +1466,21 @@ class UsageTests(unittest.TestCase):
 
 
 class KillTreeTests(unittest.TestCase):
+    def test_spared_subtree_can_grow_before_targets_are_enumerated(self) -> None:
+        from wpo.platform import kill_tree
+
+        root, spared, child = (mock.Mock(pid=pid) for pid in (1, 2, 3))
+        spared.children.return_value = []  # The child starts after the earlier subtree snapshot.
+        root.children.return_value = [spared, child]
+        spared.parents.return_value = [root]
+        child.parents.return_value = [spared, root]
+        with mock.patch("wpo.platform.psutil.Process", side_effect={1: root, 2: spared}.__getitem__), \
+                mock.patch("wpo.platform.psutil.wait_procs"):
+            kill_tree(1, spared=[2])
+        root.kill.assert_called_once()
+        spared.kill.assert_not_called()
+        child.kill.assert_not_called()
+
     def test_a_spared_descendant_survives_its_parent_being_killed(self) -> None:
         import subprocess
         import psutil
@@ -1763,6 +1778,19 @@ class DashboardDataTests(unittest.TestCase):
         self.assertEqual(cache.get(path, read_json_file, None), {"rounds": 3})
         path.unlink()
         self.assertIsNone(cache.get(path, read_json_file, None))
+
+    def test_torn_ledger_retries_when_repair_reuses_the_previous_file_stamp(self) -> None:
+        from wpo.dashboard_data import StampedCache, read_json_file
+
+        path = Path(tempfile.mkdtemp()) / "attempts.json"
+        cache = StampedCache()
+        with mock.patch("wpo.dashboard_data.file_stamp", side_effect=[(1, 13), (2, 18), (1, 13)]):
+            path.write_text('{"rounds": 2}', encoding="utf-8")
+            self.assertEqual(cache.get(path, read_json_file, None), {"rounds": 2})
+            path.write_text('{"rounds": 3, "fail', encoding="utf-8")
+            self.assertEqual(cache.get(path, read_json_file, None), {"rounds": 2})
+            path.write_text('{"rounds": 3}', encoding="utf-8")
+            self.assertEqual(cache.get(path, read_json_file, None), {"rounds": 3})
 
     def test_session_logs_and_the_journal_are_followed_by_whole_lines(self) -> None:
         from wpo.dashboard_data import SessionLogTracker
