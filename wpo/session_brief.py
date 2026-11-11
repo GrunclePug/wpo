@@ -4,7 +4,8 @@ rules, working rules, and the skills its role loads.
 Claude-CLI sessions start with CLAUDE.md discovery, the skill listing and auto-memory switched off
 (they cost every turn of every session), so the brief carries exactly what the role needs instead,
 as an appended system prompt. OpenCode sessions read the project's AGENTS.md themselves; they get
-the rest of the brief at the top of their prompt.
+the rest of the brief at the top of their prompt. Native T3 sessions of the families in
+`t3.native_instructions` load instruction files themselves; their brief leaves those out.
 
     brief = build_brief(context, tree, ["coding"])
     brief.system_text()   # Claude-CLI harnesses
@@ -94,9 +95,15 @@ class SessionBrief:
     instructions_name: str | None
     instructions: str
     guidance: str
+    # The whole brief for a session that loads instruction files itself (t3.native_instructions),
+    # without those files; None when none are configured.
+    native_text: str | None = None
 
-    def system_text(self) -> str:
-        """For harnesses whose own CLAUDE.md discovery is off: the project's instructions and the rest."""
+    def system_text(self, native: bool = False) -> str:
+        """For harnesses whose own CLAUDE.md discovery is off: the project's instructions and the rest.
+        With `native`, for one that discovers instruction files itself: only what it does not load."""
+        if native and self.native_text is not None:
+            return self.native_text
         header = f"{file_header(self.instructions_name)}\n{self.instructions.strip()}" if self.instructions_name else ""
         return "\n\n".join(part for part in (header, self.guidance) if part)
 
@@ -146,8 +153,9 @@ def agent_skills(agent_file: Path) -> list[str]:
     return names
 
 
-def carried_user_rules(context: Context) -> str:
-    """Carry ordered instruction files or exact sections, preserving the legacy disabled form."""
+def carried_user_rules(context: Context, skip: frozenset[Path] = frozenset()) -> str:
+    """Carry ordered instruction files or exact sections, preserving the legacy disabled form. Files
+    in `skip` (resolved paths a session loads itself) are validated but not carried."""
     settings = context.machine.raw["user_rules"]
     if isinstance(settings, dict):
         entries = [settings]
@@ -178,6 +186,8 @@ def carried_user_rules(context: Context) -> str:
         source = Path(filename).expanduser()
         if not source.is_file():
             raise BriefError(f"user rules file {source} does not exist (machine config {location}.file)")
+        if source.resolve() in skip:
+            continue
         text = source.read_text(encoding="utf-8").strip()
         if sections is None:
             carried.append(text)
@@ -212,8 +222,46 @@ def build_brief(context: Context, tree: Path, skills: Iterable[str]) -> SessionB
         instructions = instructions_path.read_text(encoding="utf-8")
     directory = (f"## Working directory\nYour working directory is {tree.as_posix()}: every command already runs there. Never start a "
                  f"command with `cd {tree.as_posix()} &&`; pass other directories as paths.")
-    parts = [WORKING_RULES, directory, carried_user_rules(context), *(skill.text() for skill in loaded), skills_location_note(context)]
-    return SessionBrief(instructions_name, instructions, "\n\n".join(part for part in parts if part))
+
+    def guidance(skip: frozenset[Path]) -> str:
+        parts = [WORKING_RULES, directory, carried_user_rules(context, skip),
+                 *(skill.text() for skill in loaded if skill.path.resolve() not in skip), skills_location_note(context)]
+        return "\n\n".join(part for part in parts if part)
+
+    brief = SessionBrief(instructions_name, instructions, guidance(frozenset()))
+    native = native_instruction_files(context, tree)
+    if not native:
+        return brief
+    # The session reads its checkout's instructions file itself. The brief carries the main checkout's
+    # unless that is the same file or text: a worktree's own copy can predate a fix on main.
+    checkout_file = tree / instructions_name if instructions_name else None
+    loads_instructions = (checkout_file is not None and checkout_file.is_file() and checkout_file.resolve() in native
+                          and (checkout_file.resolve() == instructions_path.resolve() or checkout_file.read_text(encoding="utf-8") == instructions))
+    header = f"{file_header(instructions_name)}\n{instructions.strip()}" if instructions_name and not loads_instructions else ""
+    return SessionBrief(instructions_name, instructions, brief.guidance, "\n\n".join(part for part in (header, guidance(native)) if part))
+
+
+def native_instruction_files(context: Context, tree: Path) -> frozenset[Path]:
+    """The instruction files a session in `tree` loads itself when its route family is one of
+    `t3.native_instructions.families`, resolved: each file named in `names` in `tree` or a
+    directory above it (as Claude Code finds CLAUDE.md), and the fixed `files` (a user's global
+    file). Empty when no family is configured."""
+    settings = context.machine.raw.get("t3", {}).get("native_instructions") or {}
+    if not settings.get("families"):
+        return frozenset()
+    for key in ("families", "names", "files"):
+        value = settings.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+            raise BriefError(f"machine config t3.native_instructions.{key} must be a list of nonempty strings")
+    found = {Path(file).expanduser().resolve() for file in settings.get("files", []) if Path(file).expanduser().is_file()}
+    for directory in (tree, *tree.parents):
+        found.update((directory / name).resolve() for name in settings.get("names", []) if (directory / name).is_file())
+    return frozenset(found)
+
+
+def loads_instructions_natively(context: Context, family: str) -> bool:
+    """Whether native sessions of a route family load instruction files themselves."""
+    return family in (context.machine.raw.get("t3", {}).get("native_instructions") or {}).get("families", [])
 
 
 def builder_skills(context: Context, wp_skills: Iterable[str]) -> list[str]:

@@ -16,6 +16,7 @@ The full defaults and accessors are in [wpo/machine.py](../wpo/machine.py).
 - `t3`: supported CLI path, optional T3 data directory, provider/model aliases and options, wake
   debounce, callback interval and optional coordinator-idle timeout. Repository attachment lives
   in its ignored run state. See [t3-bridge.md](t3-bridge.md) for attachment, callbacks and recovery.
+  `t3.native_instructions` says which native sessions load instruction files themselves, below.
 - `python`, `claude`, `agy`, `opencode`, `shim_dir`: executable and installation locations.
   Commands resolve on PATH; paths may use `~`. `python` defaults to the running interpreter.
 - `state_dir`, `usage`: local router state and an optional external usage-budget adapter, cache,
@@ -176,6 +177,26 @@ unrestricted and the runner log says so. The default is `false`.
       {"id": "agy-opus-high", "family": "agy", "model_family": "claude", "harness": "agy",
        "model": "claude-opus-5-5", "effort": "high", "provider": "agy-thirdparty", "score": 54, "writes_code": true}
     ]
+  }
+}
+```
+
+### Native instruction files
+
+A native T3 session may load instruction files on its own: Claude Code reads the user's global
+`CLAUDE.md` and every `CLAUDE.md` from its checkout up, and Codex can be configured to read them
+too. Its brief would then carry the same rules twice. `t3.native_instructions` names the route
+`families` whose sessions do this, the file `names` they discover in their checkout and every
+directory above it, and fixed `files` they always load. For a session on one of those families,
+the brief leaves out the project's instructions file when the checkout has it, and any carried
+`user_rules` entry or skill whose file is one of those (compared after resolving links). Other
+families, and every harness outside T3, keep the whole brief. Each family's discovery must
+really reach those directories; check what a native child session reports before listing it.
+
+```json
+{
+  "t3": {
+    "native_instructions": {"families": ["claude", "gpt"], "names": ["CLAUDE.md"], "files": ["~/.claude/CLAUDE.md"]}
   }
 }
 ```
