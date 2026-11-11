@@ -1956,6 +1956,80 @@ class DashboardServerTests(unittest.TestCase):
         self.assertEqual(self.get("/api/state", host="attacker.example")[0], 403)
 
 
+class DashboardRefusalTransportTests(unittest.TestCase):
+    def handler(self, length: int, payload: bytes):
+        import io
+        from email.message import Message
+        from wpo.dashboard_server import DashboardHandler
+
+        handler = object.__new__(DashboardHandler)
+        handler.headers = Message()
+        handler.headers["Content-Length"] = str(length)
+        handler.rfile = io.BytesIO(payload)
+        handler.connection = mock.Mock()
+        handler.connection.gettimeout.return_value = 60
+        handler.action_refusal = mock.Mock(return_value=(403, "refused"))
+        handler.send_action_result = mock.Mock()
+        handler.run_action = mock.Mock()
+        return handler
+
+    def test_small_refused_body_is_discarded_without_parsing_or_action(self) -> None:
+        handler = self.handler(9, b"{not-json")
+        handler.do_POST()
+        self.assertEqual(handler.rfile.tell(), 9)
+        handler.send_action_result.assert_called_once_with(403, "refused")
+        handler.run_action.assert_not_called()
+
+    def test_oversized_or_chunked_refused_body_is_not_drained(self) -> None:
+        from wpo.dashboard_server import MAX_ACTION_BYTES
+
+        for length, chunked in ((MAX_ACTION_BYTES + 1, False), (9, True)):
+            handler = self.handler(length, b"{not-json")
+            if chunked:
+                handler.headers["Transfer-Encoding"] = "chunked"
+            handler.do_POST()
+            self.assertEqual(handler.rfile.tell(), 0)
+            handler.send_action_result.assert_called_once_with(403, "refused")
+            handler.run_action.assert_not_called()
+
+    def test_refused_body_timeout_still_returns_refusal(self) -> None:
+        handler = self.handler(9, b"")
+        handler.rfile = mock.Mock()
+        handler.rfile.read1.side_effect = TimeoutError
+        handler.do_POST()
+        handler.send_action_result.assert_called_once_with(403, "refused")
+        timeouts = handler.connection.settimeout.call_args_list
+        self.assertTrue(0 < timeouts[0].args[0] <= 1)
+        self.assertEqual(timeouts[-1], mock.call(60))
+        handler.run_action.assert_not_called()
+
+    def test_slow_drip_cannot_extend_the_refusal_drain_deadline(self) -> None:
+        handler = self.handler(9, b"")
+        handler.rfile = mock.Mock()
+        handler.rfile.read1.return_value = b"x"
+        with mock.patch("wpo.dashboard_server.time.monotonic", side_effect=[100, 100, 100.4, 101.1]):
+            handler.do_POST()
+        self.assertEqual(handler.rfile.read1.call_count, 2)
+        handler.send_action_result.assert_called_once_with(403, "refused")
+        self.assertEqual(handler.connection.settimeout.call_args_list[-1], mock.call(60))
+        handler.run_action.assert_not_called()
+
+    def test_refused_method_discards_body_and_closes_connection(self) -> None:
+        import io
+
+        handler = self.handler(9, b"{not-json")
+        handler.path = "/api/action/message"
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        handler.wfile = io.BytesIO()
+        handler.refuse_method()
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(handler.rfile.tell(), 9)
+        handler.send_response.assert_called_once_with(405)
+        handler.run_action.assert_not_called()
+
+
 class DashboardActionTests(unittest.TestCase):
     """The page's actions: POST only, from this server's own page (token, origin, host), each routed
     to the user_actions function `wpo` itself would use."""

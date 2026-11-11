@@ -272,11 +272,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         """The user's actions. Refused unless addressed to this host, sent by this server's page
         (its origin and its token) and JSON; then run one at a time."""
-        # A refused request's body is never read; the connection must not be reused after it.
+        # Refused bodies are never parsed or executed, and the connection is not reused.
         self.close_connection = True
         try:
             refusal = self.action_refusal()
             if refusal is not None:
+                self.discard_refused_body()
                 self.send_action_result(*refusal)
                 return
             name = urlsplit(self.path).path.removeprefix(ACTION_PREFIX)
@@ -301,8 +302,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------------------------ actions
 
+    def discard_refused_body(self) -> None:
+        """Discard a small framed body so closing the socket preserves the error response."""
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return
+        if not 0 < length <= MAX_ACTION_BYTES or self.headers.get("Transfer-Encoding"):
+            return
+        previous_timeout = self.connection.gettimeout()
+        deadline = time.monotonic() + 1
+        remaining = length
+        try:
+            while remaining:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    break
+                self.connection.settimeout(timeout)
+                chunk = self.rfile.read1(remaining)
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except (OSError, TimeoutError):
+            pass
+        finally:
+            self.connection.settimeout(previous_timeout)
+
     def refuse_method(self) -> None:
         """Actions are POSTs; nothing else changes state, and a GET never runs one."""
+        self.close_connection = True
+        self.discard_refused_body()
         self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
         body = b"actions are POST requests from the dashboard page"
         self.send_header("Allow", "POST" if urlsplit(self.path).path.startswith(ACTION_PREFIX) else "GET")
@@ -327,16 +356,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return None
 
     def read_action_body(self) -> dict:
-        if self.headers.get_content_type() != "application/json":
-            raise ActionRequestError("an action's body is JSON (Content-Type: application/json)")
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             raise ActionRequestError("an action needs a Content-Length") from None
         if not 0 < length <= MAX_ACTION_BYTES:
             raise ActionRequestError(f"an action's body is 1 to {MAX_ACTION_BYTES} bytes, not {length}")
+        payload = self.rfile.read(length)
+        if self.headers.get_content_type() != "application/json":
+            raise ActionRequestError("an action's body is JSON (Content-Type: application/json)")
         try:
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as error:
             raise ActionRequestError(f"the body is not JSON: {error}") from None
         if not isinstance(body, dict):
