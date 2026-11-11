@@ -38,6 +38,7 @@ from .integrate import EXIT_MEANINGS, EXIT_MERGED
 from .platform import NamedMutex, spawn_detached
 from .scope import owned_packages, reached_packages
 from .project import git
+from .routing import with_mode, wp_mode
 from .runner import EXIT_NO_ROUTE, LEDGER_FILE, NO_ROUTE_FILE, RoundLedger, session_env
 from .session import describe_next
 
@@ -184,9 +185,10 @@ class Supervisor:
 
     def session_spec(self, wp: wpfile.WorkPackage) -> str:
         """The spec the WP's next session needs; mirrors the runner's builder_spec."""
+        mode = wp_mode(self.project.runs_dir, wp.id)
         if wp.status == "review":
-            return wp.reviewer
-        return self.explicit_builder or self.escalation(wp.id) or self.lane_builder or wp.builder
+            return with_mode(wp.reviewer, mode)
+        return with_mode(self.explicit_builder or self.escalation(wp.id) or self.lane_builder or wp.builder, mode)
 
     # ---------------------------------------------------------------------------------- worktrees
 

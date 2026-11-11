@@ -25,6 +25,7 @@ from pathlib import Path
 from . import wpfile
 from .context import Context
 from .platform import pid_alive, replace_file, spawn_detached
+from .routing import with_mode, wp_mode
 from .runner import session_env
 from .session import NoRouteError, run_session
 from .harness import SHELL_CHAINING, command_prefixes
@@ -106,6 +107,7 @@ class Delegation:
         if task is not None and not task.strip():
             raise DelegateError("the task text is empty")
         tier = tier or self.wp.delegate_tier(self.context.project.config["delegate_default"]) or self.context.project.config["delegate_default"]
+        tier = with_mode(tier, wp_mode(self.context.project.runs_dir, self.wp_id))  # workers route in their WP's mode
         self.context.router.select(tier, self.context.project.config["worker_families"])  # validates the tier now, not in the detached worker
         task_dir.mkdir(parents=True, exist_ok=True)
         if source is not None:

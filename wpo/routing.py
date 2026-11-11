@@ -71,6 +71,10 @@ COOLDOWNS = {
 }
 OUTCOMES = ("rate_limited", "api_error", "hang", "session_error")
 SUBSCRIPTION_FAMILIES = ("claude", "gpt")
+# Routing modes (`wpo route mode`): see project_mode.
+STANDARD_MODE = "standard"
+MODE_SEPARATOR = "@"
+MODE_FILE = "routing-mode.json"
 RATE_LIMIT_TEXT = re.compile(r"\b429\b|rate.?limit|usage limit|hit your limit|limit reached|too many requests|quota|resource.?exhausted"
                              r"|credits balance is too low", re.IGNORECASE)
 # agy's quota error states when the group refills: "Resets in 165h26m59s."
@@ -128,11 +132,14 @@ def paced_weekly_ceiling(window: dict, hard_ceiling: float, pace: dict, now: dat
 
 
 def merge_policy(base: dict, override: dict) -> dict:
-    """Deep-merges a project's routing overrides; `routes` replaces, `routes_extra` appends."""
+    """Deep-merges a project's routing overrides; `routes` replaces, `routes_extra` appends, and a
+    tier's `tier_routes` entry (also within a mode) replaces the earlier layer's entry whole."""
     merged = dict(base)
     for key, value in override.items():
         if key == "routes_extra":
             continue
+        elif key == "tier_routes" and isinstance(value, dict) and isinstance(base.get(key), dict):
+            merged[key] = {**base[key], **value}
         elif isinstance(value, dict) and isinstance(base.get(key), dict):
             merged[key] = merge_policy(base[key], value)
         else:
@@ -158,25 +165,69 @@ def route_rule_list(policy: dict, key: str) -> set[str]:
     return set(values)
 
 
+def notes_removed(value: object) -> object:
+    """An object without its `$`-prefixed keys, which configurations use for comments."""
+    return {key: item for key, item in value.items() if not key.startswith("$")} if isinstance(value, dict) else value
+
+
+def validate_listed_tiers(policy: dict) -> None:
+    """Rejects `tier_routes` and `modes` a router could not follow, naming the setting."""
+    def check(entries: object, where: str) -> None:
+        if not isinstance(entries, dict):
+            raise RoutingError(f"{where} must map tiers to entries")
+        for tier, entry in notes_removed(entries).items():
+            entry = notes_removed(entry)
+            if tier not in policy["tiers"]:
+                raise RoutingError(f"{where}.{tier}: unknown tier (tiers: {', '.join(policy['tiers'])})")
+            if not isinstance(entry, dict) or entry.keys() - {"routes", "fallback", "free_last_resort"}:
+                raise RoutingError(f"{where}.{tier} must be an object with routes, fallback and free_last_resort only")
+            for key in ("routes", "fallback"):
+                groups = entry.get(key, [])
+                if not isinstance(groups, list) or any(not isinstance(group, list) or not group or any(not isinstance(route_id, str) or not route_id.strip()
+                                                                                                      for route_id in group) for group in groups):
+                    raise RoutingError(f"{where}.{tier}.{key} must be a list of groups, each a nonempty list of route ids")
+            if not isinstance(entry.get("free_last_resort", True), bool):
+                raise RoutingError(f"{where}.{tier}.free_last_resort must be true or false")
+
+    check(policy.get("tier_routes", {}), "routing.tier_routes")
+    modes = policy.get("modes", {})
+    if not isinstance(modes, dict):
+        raise RoutingError("routing.modes must map mode names to modes")
+    for name, mode in notes_removed(modes).items():
+        mode = notes_removed(mode)
+        if not name.strip() or MODE_SEPARATOR in name or name == STANDARD_MODE:
+            raise RoutingError(f"routing.modes: '{name}' cannot name a mode")
+        if not isinstance(mode, dict) or mode.keys() - {"tier_routes"}:
+            raise RoutingError(f"routing.modes.{name} must be an object with tier_routes only")
+        check(mode.get("tier_routes", {}), f"routing.modes.{name}.tier_routes")
+
+
 # ------------------------------------------------------------------------------------- work specs
 
 
 @dataclass(frozen=True)
 class WorkSpec:
-    """What a session asks for: a tier (optionally taste-critical) or one pinned route."""
+    """What a session asks for: a tier (optionally taste-critical) or one pinned route, and the
+    routing mode its tier lists come from."""
 
     tier: str | None
     taste: bool
     pinned_route: str | None
     source: str
+    mode: str = STANDARD_MODE
 
 
 def resolve_work_spec(spec: str, policy: dict) -> WorkSpec:
     """Accepts a tier ('code-hard'), a taste tier ('frontier+taste'), a legacy routing key, or
-    'pin:<route id>'."""
+    'pin:<route id>'; a tier may end in '@<mode>' (with_mode)."""
     text = spec.strip()
     if text.startswith("pin:"):
         return WorkSpec(tier=None, taste=False, pinned_route=text.removeprefix("pin:"), source=text)
+    text, _, mode = text.partition(MODE_SEPARATOR)
+    if mode:
+        # A WP keeps the mode it first ran in; once the configuration drops that mode, it routes as standard.
+        mode = mode if mode in policy.get("modes", {}) else STANDARD_MODE
+        return dataclasses.replace(resolve_work_spec(text, policy), source=spec.strip(), mode=mode)
     if text in policy.get("legacy_keys", {}):
         return dataclasses.replace(resolve_work_spec(policy["legacy_keys"][text], policy), source=text)
     taste_suffix = policy["taste_suffix"]
@@ -185,6 +236,52 @@ def resolve_work_spec(spec: str, policy: dict) -> WorkSpec:
     if tier not in policy["tiers"]:
         raise RoutingError(f"unknown tier or routing key '{spec}' (tiers: {', '.join(policy['tiers'])}; or a legacy key, or pin:<route>)")
     return WorkSpec(tier=tier, taste=taste, pinned_route=None, source=text)
+
+
+# --------------------------------------------------------------------------------- routing modes
+# A project runs in one routing mode at a time (`wpo route mode`): `standard`, or a mode the
+# policy's `modes` defines, whose `tier_routes` replace the standard ones tier by tier. A WP keeps
+# the mode it first ran in, so switching affects only WPs that start afterwards.
+
+
+def routing_modes(policy: dict) -> list[str]:
+    return [STANDARD_MODE, *notes_removed(policy.get("modes", {}))]
+
+
+def project_mode(runs_dir: Path) -> str:
+    return str(read_json(runs_dir / MODE_FILE, {}).get("mode", STANDARD_MODE))
+
+
+def set_project_mode(runs_dir: Path, mode: str) -> None:
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    with FileLock(runs_dir / (MODE_FILE + ".lock")):
+        write_atomically(runs_dir / MODE_FILE, {"mode": mode, "set_at": now_utc().isoformat(timespec="seconds")})
+
+
+def wp_mode(runs_dir: Path, wp_id: str) -> str:
+    """The mode a WP runs in: the one recorded when its first session ran, else the project's."""
+    recorded = read_json(runs_dir / wp_id / MODE_FILE, {}).get("mode")
+    return str(recorded) if recorded else project_mode(runs_dir)
+
+
+def record_wp_mode(runs_dir: Path, wp_id: str, mode: str) -> None:
+    """Records the mode a WP's first session ran in; a recorded mode stays."""
+    path = runs_dir / wp_id / MODE_FILE
+    if not read_json(path, {}).get("mode"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(path, {"mode": mode, "recorded_at": now_utc().isoformat(timespec="seconds")})
+
+
+def spec_mode(spec: str) -> str | None:
+    """The mode a spec already carries (`code-hard@hard`), or None."""
+    return None if spec.startswith("pin:") else (spec.partition(MODE_SEPARATOR)[2] or None)
+
+
+def with_mode(spec: str, mode: str) -> str:
+    """The spec routed in `mode`: tiers carry it as a suffix; pins, 'none' and standard stay as they are."""
+    if mode == STANDARD_MODE or spec == "none" or spec.startswith("pin:") or MODE_SEPARATOR in spec:
+        return spec
+    return f"{spec}{MODE_SEPARATOR}{mode}"
 
 
 # ---------------------------------------------------------------------------------------- scores
@@ -361,6 +458,7 @@ class Router:
         self.policy = merge_policy(load_policy(machine.raw.get("routing")), policy_override or {})
         for key in ("routes_exclude", "gate_only_routes", "pin_only_routes", "pin_only_efforts"):
             route_rule_list(self.policy, key)
+        validate_listed_tiers(self.policy)
         self.emit = emit or (lambda kind, message: None)
         self.state_dir = machine.state_dir / "router"
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -669,6 +767,40 @@ class Router:
             score_rank = route.cost_per_task if route.cost_per_task is not None else route.score
         return (taste_rank, cost_rank, score_rank, family_rank, route.id)
 
+    def tier_routes(self, tier: str, mode: str = STANDARD_MODE) -> dict | None:
+        """The tier's explicit route list in `mode` (`tier_routes`, or the mode's own), or None when
+        the tier ranks by floors. An entry: `routes`, groups of route ids tried in order; `fallback`,
+        groups served as downgrades (also all a family over its weekly pace may serve); and
+        `free_last_resort` (default true)."""
+        entry = self.policy.get("tier_routes", {}).get(tier)
+        if mode != STANDARD_MODE:
+            entry = self.policy.get("modes", {}).get(mode, {}).get("tier_routes", {}).get(tier, entry)
+        return entry
+
+    def listed_ranking(self, listed: dict, eligible: list[Route], oracle: AvailabilityOracle, taste: bool) -> list[tuple[Route, bool]]:
+        """Each group in order; within a group the family with the most quota headroom first (free
+        and agy routes, which spend no subscription, before it), Claude first for `+taste`, the
+        listed order on ties. Ids that are not eligible here (another family, excluded) are skipped."""
+        by_id = {route.id: route for route in eligible}
+        ranked: list[tuple[Route, bool]] = []
+        for key, downgrade in (("routes", False), ("fallback", True)):
+            for group in listed.get(key, []):
+                members = [by_id[route_id] for route_id in group if route_id in by_id]
+                members.sort(key=lambda route: (0 if taste and route.family == "claude" else 1, -oracle.headroom(route.family)))
+                ranked += [(route, downgrade) for route in members]
+        return ranked
+
+    def unknown_listed_routes(self) -> list[str]:
+        """Route ids that `tier_routes` or a mode's name but no route has (a typo, or an excluded route)."""
+        known = {route.id for route in static_routes(self.policy)}
+        if self.policy["free_routes"].get("enabled", True):
+            known |= {entry["id"] for entry in self.load_catalog().get("routes", [])}
+        entries = [*notes_removed(self.policy.get("tier_routes", {})).values()]
+        for mode in notes_removed(self.policy.get("modes", {})).values():
+            entries += notes_removed(notes_removed(mode).get("tier_routes", {})).values()
+        named = {route_id for entry in entries for key in ("routes", "fallback") for group in entry.get(key, []) for route_id in group}
+        return sorted(named - known)
+
     def all_routes(self, families: Iterable[str], force_refresh: bool = False) -> list[Route]:
         """Configured routes after exclusions; gate/pin restrictions apply during selection."""
         routes = static_routes(self.policy)
@@ -715,13 +847,22 @@ class Router:
         else:
             tier = self.policy["tiers"][spec.tier]
             permitted = [route for route in routes if gate or route.id not in gate_only_routes]
-            eligible = [route for route in family_frontiers(permitted) if route.family in allowed and route.family != "local"
-                        and route.effort not in pin_only_efforts and route.id not in pin_only_routes and (route.writes_code or not tier["writes_code"])]
-            qualified = sorted((r for r in eligible if r.score >= tier["floor"]), key=lambda r: self.ordering_key(r, spec.taste))
-            downgrades = sorted((r for r in eligible if tier["fallback_floor"] <= r.score < tier["floor"]), key=lambda r: -r.score)
-            ranked = [(route, False) for route in qualified] + [(route, True) for route in downgrades]
+            listed = self.tier_routes(spec.tier, spec.mode)
+
+            def usable(route: Route) -> bool:
+                return (route.family in allowed and route.family != "local" and route.effort not in pin_only_efforts
+                        and route.id not in pin_only_routes and (route.writes_code or not tier["writes_code"]))
+
+            # Listed routes are the operator's choice: the family frontier does not prune them.
+            eligible = [route for route in (permitted if listed is not None else family_frontiers(permitted)) if usable(route)]
+            if listed is not None:
+                ranked = self.listed_ranking(listed, eligible, oracle, spec.taste)
+            else:
+                qualified = sorted((r for r in eligible if r.score >= tier["floor"]), key=lambda r: self.ordering_key(r, spec.taste))
+                downgrades = sorted((r for r in eligible if tier["fallback_floor"] <= r.score < tier["floor"]), key=lambda r: -r.score)
+                ranked = [(route, False) for route in qualified] + [(route, True) for route in downgrades]
             last_resort = self.policy["free_last_resort"]
-            if free_last_resort and last_resort["enabled"]:
+            if free_last_resort and last_resort["enabled"] and (listed or {}).get("free_last_resort", True):
                 ranked_ids = {route.id for route, _ in ranked}
                 ranked += [(route, True) for route in sorted(eligible, key=lambda r: -r.score)
                            if route.cost_class == "free" and route.score >= last_resort["floor"] and route.id not in ranked_ids]
@@ -856,16 +997,21 @@ class Router:
             until = from_timestamp(entry["until"])
             if until > now_utc():
                 lines.append(f"cooldown {key} until {until.astimezone():%Y-%m-%d %H:%M}: {entry['reason'][:160]}")
+        if unknown := self.unknown_listed_routes():
+            lines.append("tier_routes name unknown routes (skipped): " + ", ".join(unknown))
         lines.append("first choices per tier:")
-        for tier in self.policy["tiers"]:
-            for spec in (tier, tier + self.policy["taste_suffix"]):
-                selection = self.select(spec)
-                picks = [candidate["id"] + (" (downgrade)" if candidate["downgrade"] else "") for candidate in selection.candidates[:3]]
-                if picks:
-                    lines.append(f"  {spec:<20} {' > '.join(picks)}")
-                else:
-                    wake = from_timestamp(selection.next_available_at).astimezone().strftime("%H:%M") if selection.next_available_at else "unknown"
-                    lines.append(f"  {spec:<20} NO ROUTE (next at {wake})")
+        for mode in routing_modes(self.policy):
+            tiers = list(self.policy["tiers"]) if mode == STANDARD_MODE else list(notes_removed(self.policy["modes"][mode].get("tier_routes", {})))
+            for tier in tiers:
+                for spec in (tier, tier + self.policy["taste_suffix"]):
+                    spec = with_mode(spec, mode)
+                    selection = self.select(spec)
+                    picks = [candidate["id"] + (" (downgrade)" if candidate["downgrade"] else "") for candidate in selection.candidates[:3]]
+                    if picks:
+                        lines.append(f"  {spec:<26} {' > '.join(picks)}")
+                    else:
+                        wake = from_timestamp(selection.next_available_at).astimezone().strftime("%H:%M") if selection.next_available_at else "unknown"
+                        lines.append(f"  {spec:<26} NO ROUTE (next at {wake})")
         return "\n".join(lines)
 
 
@@ -918,6 +1064,34 @@ class AvailabilityOracle:
             result = Availability(True)
         self._family_cache[family] = self.cooldown(f"family:{family}") or result
         return self._family_cache[family]
+
+    def headroom(self, family: str) -> float:
+        """Percentage points left before the family's tightest window stops it: the five-hour
+        ceiling, or the weekly one under its pace. Families spending no subscription have no limit
+        here; unknown usage has none left."""
+        if family not in SUBSCRIPTION_FAMILIES:
+            return float("inf")
+        if self._windows is None:
+            self._windows = self.router.usage_windows()
+        windows = self._windows.get(family)
+        if not windows:
+            return float("-inf")
+        policy = self.router.policy
+        ceilings = policy["ceilings"][family]
+        pace = policy.get("weekly_pace", {}).get(family) if self.paced else None
+        now = now_utc()
+        left = []
+        for window in windows:
+            if from_timestamp(float(window["resets_at"])) <= now:
+                continue  # a reading from before the window reset: nothing of the new one is used yet
+            if window["window_seconds"] <= FIVE_HOUR_WINDOW_SECONDS:
+                ceiling = float(ceilings["five_hour"])
+            elif pace:
+                ceiling = paced_weekly_ceiling(window, ceilings["weekly"], pace, now)[0]
+            else:
+                ceiling = float(ceilings["weekly"])
+            left.append(ceiling - float(window["used_percent"]))
+        return min(left, default=float(ceilings["five_hour"]))
 
     def route(self, route: Route) -> Availability:
         if self.router.machine.execution_mode == "t3":

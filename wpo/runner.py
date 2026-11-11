@@ -33,7 +33,7 @@ from .inbox import clear_pause, inbox_of, pause_requested
 from .platform import kill_tree, pid_alive
 from .project import TASKS_RELATIVE_PATH, git
 from .review_brief import ReviewBrief, build_review_brief
-from .routing import RoutingError, resolve_work_spec
+from .routing import RoutingError, record_wp_mode, resolve_work_spec, spec_mode, with_mode, wp_mode
 from .session import NoRouteError, ResumeFailed, ResumeTarget, SessionResult, run_session, session_facts
 from .session_brief import builder_skills, included_files, reviewer_skills
 from .session_commands import HANDOFF_FILE, SESSION_VERIFIED_TREE_FILE
@@ -757,10 +757,14 @@ class WorkPackageRun:
         if pause_requested(self.run_dir) is not None:
             wpfile.set_status(self.wp(), status_to_restore)
             raise RunPaused(None)
+        # Every role, staged ones included, routes in the WP's mode (or the one its spec names), which
+        # is recorded once a route is chosen, so the WP keeps it whatever happens to this runner.
+        mode = spec_mode(spec) or self.mode
+        spec = with_mode(spec, mode)
         try:
             result = run_session(self.context, spec, extra.pop("access", access), prompt, log_stem, self.tree, families=extra.pop("families", self.families),
                                  idle_minutes=self.options.idle_minutes, event_fields={"wp": self.wp_id, "role": role}, extra_env=self.env,
-                                 inbox=inbox_of(self.run_dir), **extra)
+                                 inbox=inbox_of(self.run_dir), on_attempt=self.mode_recorder(mode), **extra)
         except NoRouteError as error:
             if role == "builder" and not error.failures:
                 self.ledger.state["writing"] = writing_before
@@ -779,14 +783,23 @@ class WorkPackageRun:
             raise RunPaused(result)
         return result
 
+    def mode_recorder(self, mode: str):
+        return lambda: record_wp_mode(self.context.project.runs_dir, self.wp_id, mode)
+
+    @property
+    def mode(self) -> str:
+        """The routing mode the WP's first session ran in, else the project's (recorded by `session`)."""
+        return wp_mode(self.context.project.runs_dir, self.wp_id)
+
     @property
     def builder_spec(self) -> str:
         # A re-evaluation's escalation outranks the lane's default (a pool lane's local pin).
-        return self.options.builder_override or self.ledger.escalated_to or self.lane.get("builder_override") or self.wp().builder
+        spec = self.options.builder_override or self.ledger.escalated_to or self.lane.get("builder_override") or self.wp().builder
+        return with_mode(spec, self.mode)
 
     @property
     def reviewer_spec(self) -> str:
-        return self.options.reviewer_override or self.wp().reviewer
+        return with_mode(self.options.reviewer_override or self.wp().reviewer, self.mode)
 
     @property
     def staged(self) -> bool:
@@ -975,7 +988,7 @@ class WorkPackageRun:
         if tier is None:
             return None
         try:
-            selection = self.context.router.select(tier, self.config["worker_families"])
+            selection = self.context.router.select(with_mode(tier, self.mode), self.config["worker_families"])
         except RoutingError as error:
             self.log(f"no delegation this round: {error}")
             return None
@@ -1039,7 +1052,7 @@ class WorkPackageRun:
     def repair(self, round_number: int, failures: list[CommandFailure]) -> bool:
         """Hands mechanical failures to a fresh session on `repair_spec` with only the diagnostics;
         returns whether a repair session ran (the caller re-verifies)."""
-        spec = self.config["repair_spec"]
+        spec = with_mode(self.config["repair_spec"], self.mode)
         commands = ", ".join(failure.command for failure in failures)
         self.emit("repair-attempted", f"{self.wp_id}: only mechanical checks failed ({commands}); a {spec} repair session fixes them first")
         try:
@@ -1047,7 +1060,7 @@ class WorkPackageRun:
             result = run_session(self.context, spec, "worker", repair_prompt(self.context, self.wp(), failures),
                                  self.run_dir / f"attempt-{round_number}-repair", self.tree, write_paths=self.wp().owns, families=self.families,
                                  idle_minutes=self.options.idle_minutes, event_fields={"wp": self.wp_id, "role": "repair"}, extra_env=self.env,
-                                 skills=builder_skills(self.context, self.wp().skills))
+                                 skills=builder_skills(self.context, self.wp().skills), on_attempt=self.mode_recorder(self.mode))
         except NoRouteError as error:
             self.log(f"no route for a repair session ({spec}): {error}; the builder gets the failure")
             return False
@@ -1191,7 +1204,7 @@ class WorkPackageRun:
         prompt = evaluation_prompt(self.context, wp, self.tree, ledger, self.builder_spec, self.run_dir, why)
         self.log(f"re-evaluating: {why}")
         # Any family: a lane restricted to free or local models still gets a strong evaluator.
-        result = self.session(self.config["evaluation_spec"], "evaluator", prompt, self.run_dir / f"evaluation-{ledger.evaluations + 1}", wp.status,
+        result = self.session(with_mode(self.config["evaluation_spec"], self.mode), "evaluator", prompt, self.run_dir / f"evaluation-{ledger.evaluations + 1}", wp.status,
                               access="evaluator", write_paths=[wp_path], families=())
         body = result.result_text.strip()
         decisions = DECISION.findall(body)

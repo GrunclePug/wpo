@@ -249,6 +249,8 @@ function renderBoard(changed) {
   const snapshot = ui.snapshot;
   document.title = `${snapshot.project.name} · wpo`;
   $("project-name").textContent = snapshot.project.name;
+  const mode = snapshot.project.routing_mode || "standard";
+  $("tool-name").textContent = mode === "standard" ? "wpo" : `wpo · ${mode} mode`;
   renderUsage(snapshot.usage);
   renderNativeBackend(snapshot.native_backend);
   renderAttention(snapshot);
@@ -699,7 +701,7 @@ function wpRow(row, changed) {
   const findingsTitle = row.open_findings.map((finding) => `${finding.id}${finding.answered ? " (answered)" : ""} ${finding.location}`).join("\n");
   const unanswered = row.open_findings.filter((finding) => !finding.answered).length;
   return `<tr class="${classes.join(" ")}" role="row" data-row-wp="${esc(row.id)}">
-    <td data-label="WP · lane" role="cell">${wpButton(row.id)}<span class="sub">${esc(row.lane || "no lane")}</span></td>
+    <td data-label="WP · lane" role="cell">${wpButton(row.id)}<span class="sub">${esc(row.lane || "no lane")}${row.routing_mode && row.routing_mode !== "standard" ? ` · ${esc(row.routing_mode)}` : ""}</span></td>
     <td data-label="Work package · latest progress" role="cell" class="title-cell"><span class="wp-title" title="${esc(row.title)}">${esc(row.title)}</span><span class="sub" title="${esc(row.latest_progress)}">${progress}</span></td>
     <td data-label="Status" role="cell" class="status-cell">${statusPill(row.status)}${waiting}</td>
     <td data-label="Steps" role="cell">${steps(row.steps_done, row.steps_total)}</td>
