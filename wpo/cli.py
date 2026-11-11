@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     candidates.add_argument("--spec", required=True)
     candidates.add_argument("--families", action="append")
     candidates.add_argument("--refresh", action="store_true")
+    candidates.add_argument("--gate", action="store_true", help="rank as a review or re-evaluation: gate-only routes, no free fallback")
     route_commands.add_parser("status")
     refresh = route_commands.add_parser("refresh")
     refresh.add_argument("--force", action="store_true")
@@ -497,7 +498,8 @@ def main(argv: list[str] | None = None) -> int:
                 from .routing import with_mode
                 # As the project's next session would rank it; outside a project, as standard.
                 spec = with_mode(arguments.spec, project_mode(context.project.runs_dir)) if context.project else arguments.spec
-                print(json.dumps(asdict(router.select(spec, split_list(arguments.families) or None, arguments.refresh)), indent=2))
+                print(json.dumps(asdict(router.select(spec, split_list(arguments.families) or None, arguments.refresh,
+                                                      free_last_resort=not arguments.gate, gate=arguments.gate)), indent=2))
             elif arguments.route_command == "status":
                 print(router.status_text())
             elif arguments.route_command == "refresh":

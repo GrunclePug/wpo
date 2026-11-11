@@ -170,6 +170,27 @@ def notes_removed(value: object) -> object:
     return {key: item for key, item in value.items() if not key.startswith("$")} if isinstance(value, dict) else value
 
 
+def validate_quota_groups(policy: dict) -> None:
+    """Rejects `quota_groups` a router could not apply, naming the setting."""
+    settings = notes_removed(policy.get("quota_groups") or {})
+    if not isinstance(settings, dict) or settings.keys() - {"groups", "ceilings"}:
+        raise RoutingError("routing.quota_groups must be an object with groups and ceilings")
+    groups = notes_removed(settings.get("groups", {}))
+    if not isinstance(groups, dict):
+        raise RoutingError("routing.quota_groups.groups must map providers to groups")
+    for provider, group in groups.items():
+        group = notes_removed(group)
+        if (not isinstance(group, dict) or group.keys() != {"family", "buckets"} or not isinstance(group["family"], str) or not group["family"].strip()
+                or not isinstance(group["buckets"], list) or not group["buckets"]
+                or any(not isinstance(bucket, str) or not bucket.strip() for bucket in group["buckets"])):
+            raise RoutingError(f"routing.quota_groups.groups.{provider} must be {{\"family\": <usage family>, \"buckets\": [<bucket label>, ...]}}")
+    if groups:
+        ceilings = notes_removed(settings.get("ceilings"))
+        if (not isinstance(ceilings, dict) or ceilings.keys() != {"five_hour", "weekly"}
+                or any(isinstance(value, bool) or not isinstance(value, int | float) for value in ceilings.values())):
+            raise RoutingError("routing.quota_groups.ceilings must give five_hour and weekly as percentages")
+
+
 def validate_listed_tiers(policy: dict) -> None:
     """Rejects `tier_routes` and `modes` a router could not follow, naming the setting."""
     def check(entries: object, where: str) -> None:
@@ -459,6 +480,7 @@ class Router:
         for key in ("routes_exclude", "gate_only_routes", "pin_only_routes", "pin_only_efforts"):
             route_rule_list(self.policy, key)
         validate_listed_tiers(self.policy)
+        validate_quota_groups(self.policy)
         self.emit = emit or (lambda kind, message: None)
         self.state_dir = machine.state_dir / "router"
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -810,7 +832,7 @@ class Router:
         return [route for route in routes if route.id not in excluded and f"family:{route.family}" not in excluded]
 
     def select(self, spec_text: str, families: Iterable[str] | None = None, force_refresh: bool = False,
-               free_last_resort: bool = True, gate: bool = False) -> Selection:
+               free_last_resort: bool = True, gate: bool = False, oracle: AvailabilityOracle | None = None) -> Selection:
         """Ranks the routes for a work spec. With `free_last_resort`, free routes at or above the
         policy's `free_last_resort.floor` come last for every tier, so work proceeds on a free model
         instead of waiting while every paid route is capped, paced or cooling down. Reviews pass
@@ -827,7 +849,8 @@ class Router:
         if unknown:
             raise RoutingError(f"unknown families {sorted(unknown)}; known: {', '.join(self.families)}")
         routes = self.all_routes(allowed, force_refresh)
-        oracle = self.oracle(paced=not spec.pinned_route)
+        # A caller ranking many specs at one moment (route status) passes one paced oracle for all.
+        oracle = oracle if oracle is not None and not spec.pinned_route else self.oracle(paced=not spec.pinned_route)
         selection = Selection(spec=spec.source, tier=spec.tier)
         if spec.pinned_route:
             pinned = [route for route in routes if route.id == spec.pinned_route]
@@ -999,19 +1022,29 @@ class Router:
                 lines.append(f"cooldown {key} until {until.astimezone():%Y-%m-%d %H:%M}: {entry['reason'][:160]}")
         if unknown := self.unknown_listed_routes():
             lines.append("tier_routes name unknown routes (skipped): " + ", ".join(unknown))
-        lines.append("first choices per tier:")
+        lines.append("first choices per tier, and as a review where reviews and re-evaluations rank differently:")
+        oracle = self.oracle()  # one reading of usage, cooldowns and capabilities for every row
+        rows: list[tuple[str, str]] = []
+
+        def first_choices(selection: Selection) -> str:
+            picks = [candidate["id"] + (" (downgrade)" if candidate["downgrade"] else "") for candidate in selection.candidates[:3]]
+            if picks:
+                return " > ".join(picks)
+            wake = from_timestamp(selection.next_available_at).astimezone().strftime("%H:%M") if selection.next_available_at else "unknown"
+            return f"NO ROUTE (next at {wake})"
+
         for mode in routing_modes(self.policy):
             tiers = list(self.policy["tiers"]) if mode == STANDARD_MODE else list(notes_removed(self.policy["modes"][mode].get("tier_routes", {})))
             for tier in tiers:
                 for spec in (tier, tier + self.policy["taste_suffix"]):
                     spec = with_mode(spec, mode)
-                    selection = self.select(spec)
-                    picks = [candidate["id"] + (" (downgrade)" if candidate["downgrade"] else "") for candidate in selection.candidates[:3]]
-                    if picks:
-                        lines.append(f"  {spec:<26} {' > '.join(picks)}")
-                    else:
-                        wake = from_timestamp(selection.next_available_at).astimezone().strftime("%H:%M") if selection.next_available_at else "unknown"
-                        lines.append(f"  {spec:<26} NO ROUTE (next at {wake})")
+                    builders = first_choices(self.select(spec, oracle=oracle))
+                    rows.append((spec, builders))
+                    # Gate sessions rank gate-only routes and never fall back to free ones.
+                    if (reviews := first_choices(self.select(spec, free_last_resort=False, gate=True, oracle=oracle))) != builders:
+                        rows.append((f"{spec} as a review", reviews))
+        width = max((len(label) for label, _ in rows), default=0)
+        lines += [f"  {label:<{width}}  {choices}" for label, choices in rows]
         return "\n".join(lines)
 
 
@@ -1032,7 +1065,8 @@ class CapForecast:
 
 
 class AvailabilityOracle:
-    """Answers whether a route can start now, memoizing per-family facts for one selection."""
+    """Answers whether a route can start now, memoizing per-family facts and native target checks for
+    one selection, or for one status listing."""
 
     def __init__(self, router: Router, paced: bool = True) -> None:
         self.router = router
@@ -1040,6 +1074,7 @@ class AvailabilityOracle:
         self.health = router.load_health()
         self._family_cache: dict[str, Availability] = {}
         self._windows: dict[str, list[dict] | None] | None = None
+        self._native: dict[str, Availability | None] = {}  # T3 target checks by route id
 
     def cooldown(self, key: str) -> Availability | None:
         entry = self.health["cooldowns"].get(key)
@@ -1099,10 +1134,14 @@ class AvailabilityOracle:
             from .t3 import Bridge, T3Error
             if self.router.project is None:
                 return Availability(False, "T3 routing requires a project context")
-            try:
-                Bridge(SimpleNamespace(project=self.router.project, machine=self.router.machine)).target(asdict(route))
-            except T3Error as error:
-                return Availability(False, str(error))
+            if route.id not in self._native:
+                try:
+                    Bridge(SimpleNamespace(project=self.router.project, machine=self.router.machine)).target(asdict(route))
+                    self._native[route.id] = None
+                except T3Error as error:
+                    self._native[route.id] = Availability(False, str(error))
+            if self._native[route.id] is not None:
+                return self._native[route.id]
         if not route.dispatchable:
             return Availability(False, route.not_dispatchable_reason)
         family = self.family(route.family)
@@ -1110,8 +1149,41 @@ class AvailabilityOracle:
             return family
         if route.provider and (cooled := self.cooldown(f"provider:{route.provider}")):
             return cooled
+        if exhausted := self.quota_group(route.provider):
+            return exhausted
         # The family's availability carries its pace grade (cheaper_only) to the route.
         return self.cooldown(f"route:{route.id}") or family
+
+    def quota_group(self, provider: str | None) -> Availability | None:
+        """Blocks a quota group's routes (those whose `provider` names the group) until its buckets
+        reset, once any bucket is at or past the policy's ceiling (`quota_groups`: each group's usage
+        family and bucket labels, and the ceilings in percent used for 5-hour and weekly buckets).
+        Unknown usage blocks nothing: the group's routes then rely on the cooldown a rate-limited
+        session records, as without `quota_groups`."""
+        settings = self.router.policy.get("quota_groups") or {}
+        group = settings.get("groups", {}).get(provider) if provider else None
+        if not group:
+            return None
+        if self._windows is None:
+            self._windows = self.router.usage_windows()
+        windows = {window["label"]: window for window in self._windows.get(group["family"]) or []}
+        now = now_utc()
+        blocked_until: datetime | None = None
+        reasons = []
+        for bucket in group["buckets"]:
+            window = windows.get(bucket)
+            if window is None:
+                continue
+            kind = "five_hour" if window["window_seconds"] <= FIVE_HOUR_WINDOW_SECONDS else "weekly"
+            ceiling = float(settings["ceilings"][kind])
+            resets_at = from_timestamp(float(window["resets_at"]))
+            if float(window["used_percent"]) < ceiling or resets_at <= now:
+                continue
+            reasons.append(f"{group['family']} {bucket} {float(window['used_percent']):.0f}% >= {ceiling:.0f}%")
+            blocked_until = resets_at if blocked_until is None else max(blocked_until, resets_at)
+        if blocked_until is None:
+            return None
+        return Availability(False, "; ".join(reasons), blocked_until)
 
 
 # ----------------------------------------------------------------------------------- classification
