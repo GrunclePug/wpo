@@ -1,5 +1,5 @@
-/* wpo dashboard: an operator's console for many agent lanes. Dark by default (it sits open on a
-   second screen through the night), light when the system asks for it. Restrained palette: neutral
+/* wpo dashboard: an operator's console for many agent lanes. The saved theme overrides the
+   system preference. Restrained palette: neutral
    surfaces, one patina-teal for live work and selection, semantic hues only for states. */
 
 .native-backend { margin: var(--space-2) var(--space-4) 0; }
@@ -66,39 +66,37 @@
   --bar-todo: oklch(0.34 0 0);
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color-scheme: light;
-    --bg: oklch(1 0 0);
-    --surface: oklch(0.978 0 0);
-    --surface-raised: oklch(1 0 0);
-    --hover: oklch(0.955 0 0);
-    --line: oklch(0.9 0 0);
-    --line-strong: oklch(0.8 0 0);
-    --ink: oklch(0.2 0 0);
-    --ink-2: oklch(0.34 0 0);
-    --muted: oklch(0.47 0 0);
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: oklch(1 0 0);
+  --surface: oklch(0.978 0 0);
+  --surface-raised: oklch(1 0 0);
+  --hover: oklch(0.955 0 0);
+  --line: oklch(0.9 0 0);
+  --line-strong: oklch(0.8 0 0);
+  --ink: oklch(0.2 0 0);
+  --ink-2: oklch(0.34 0 0);
+  --muted: oklch(0.47 0 0);
 
-    --primary: oklch(0.47 0.095 180);
-    --primary-fill: oklch(0.52 0.095 180);
-    --primary-tint: oklch(0.52 0.095 180 / 0.11);
-    --warn: oklch(0.5 0.12 65);
-    --warn-tint: oklch(0.75 0.15 78 / 0.2);
-    --danger: oklch(0.5 0.18 25);
-    --danger-tint: oklch(0.6 0.2 25 / 0.12);
-    --ok: oklch(0.48 0.12 150);
-    --ok-tint: oklch(0.6 0.13 150 / 0.13);
-    --info: oklch(0.48 0.11 255);
-    --info-tint: oklch(0.6 0.11 255 / 0.12);
-    --neutral-tint: oklch(0.5 0 0 / 0.09);
+  --primary: oklch(0.47 0.095 180);
+  --primary-fill: oklch(0.52 0.095 180);
+  --primary-tint: oklch(0.52 0.095 180 / 0.11);
+  --warn: oklch(0.5 0.12 65);
+  --warn-tint: oklch(0.75 0.15 78 / 0.2);
+  --danger: oklch(0.5 0.18 25);
+  --danger-tint: oklch(0.6 0.2 25 / 0.12);
+  --ok: oklch(0.48 0.12 150);
+  --ok-tint: oklch(0.6 0.13 150 / 0.13);
+  --info: oklch(0.48 0.11 255);
+  --info-tint: oklch(0.6 0.11 255 / 0.12);
+  --neutral-tint: oklch(0.5 0 0 / 0.09);
 
-    --bar-done: oklch(0.6 0.12 150);
-    --bar-review: oklch(0.6 0.1 255);
-    --bar-in_progress: oklch(0.58 0.1 180);
-    --bar-changes_requested: oklch(0.74 0.14 78);
-    --bar-blocked: oklch(0.58 0.18 25);
-    --bar-todo: oklch(0.88 0 0);
-  }
+  --bar-done: oklch(0.6 0.12 150);
+  --bar-review: oklch(0.6 0.1 255);
+  --bar-in_progress: oklch(0.58 0.1 180);
+  --bar-changes_requested: oklch(0.74 0.14 78);
+  --bar-blocked: oklch(0.58 0.18 25);
+  --bar-todo: oklch(0.88 0 0);
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -146,6 +144,9 @@ a { color: var(--primary); text-underline-offset: 2px; }
 }
 .skip-link:focus { top: var(--space-2); }
 
+.theme-choice { display: flex; align-items: center; gap: var(--space-1); font-size: var(--text-sm); color: var(--ink-2); }
+.theme-choice select { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius-sm); padding: var(--space-1); }
+
 /* ------------------------------------------------------------------------------------- top bar */
 
 .topbar {
@@ -157,7 +158,7 @@ a { color: var(--primary); text-underline-offset: 2px; }
   min-height: 52px;
 }
 
-.identity { display: flex; align-items: baseline; gap: var(--space-2); min-width: 0; flex: 1; }
+.identity { display: flex; align-items: baseline; gap: var(--space-2); min-width: 0; flex: 1 1 16rem; }
 .identity h1 { font-size: var(--text-lg); font-weight: 650; letter-spacing: -0.01em; overflow-wrap: anywhere; }
 .tool-name { color: var(--muted); font-family: var(--font-mono); font-size: var(--text-sm); }
 
