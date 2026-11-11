@@ -1,0 +1,56 @@
+{
+  "$comment": "Copy outside this repository and select with WPO_MACHINE_CONFIG, or use ~/.claude/wp-orchestration.json. Keep secret values in files. T3 is default; attach a repository coordinator before starting work. Select standalone explicitly only for legacy model subprocesses.",
+  "execution_mode": "t3",
+  "t3": {
+    "cli": "t3",
+    "base_dir": null,
+    "providers": {"gpt": "codex", "claude": "claudeAgent", "free": "opencode", "agy": "antigravity", "xai": "grok"},
+    "models": {"sol": "gpt-6.1-sol", "terra": "gpt-6.1-terra", "luna": "gpt-6-luna", "astra": "gpt-6-astra", "haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5"},
+    "options": {},
+    "wake_debounce_seconds": 5,
+    "callback_interval_seconds": 0.5,
+    "coordinator_idle_minutes": 30
+  },
+  "claude": "claude",
+  "agy": "agy",
+  "opencode": "opencode",
+  "state_dir": "~/.local/state/wp-orchestration",
+  "shim_dir": "~/.local/bin",
+  "reviewer_agent": "~/.config/wp-orchestration/reviewer.md",
+  "skills": {
+    "dirs": ["~/.agents/skills", "~/.codex/skills", "~/.claude/skills"],
+    "paths": {}
+  },
+  "user_rules": {"file": "~/.config/wp-orchestration/AGENTS.md", "sections": []},
+  "project_defaults": {"builder_skills": []},
+  "routing": {"routes_extra": []},
+  "usage": {
+    "script": "~/.config/wp-orchestration/usage_budget.py",
+    "cache": "~/.local/state/wp-orchestration/usage-budget-cache.json",
+    "history": "~/.local/state/wp-orchestration/usage-budget-history.jsonl",
+    "max_age_seconds": 300
+  },
+  "keys": {
+    "openrouter": "~/.config/wp-orchestration/keys/openrouter",
+    "artificial_analysis": "~/.config/wp-orchestration/keys/artificial-analysis"
+  },
+  "gpt_proxy": {
+    "port": 8317,
+    "token_file": "~/.config/wp-orchestration/proxy/client-token",
+    "pins_file": "~/.config/wp-orchestration/proxy/model-pins.json",
+    "executable": "cli-proxy-api",
+    "config": "~/.config/wp-orchestration/proxy/config.yaml",
+    "background_tier": "luna",
+    "background_effort": "low",
+    "context_tokens": {}
+  },
+  "local_model": {
+    "model_port": 30000,
+    "shim_port": 8318,
+    "token_file": "~/.config/wp-orchestration/local-model-token",
+    "max_context_tokens": 140000,
+    "max_output_tokens": 32768,
+    "mutex": "Global\\WpoLocalModel"
+  },
+  "dashboard": {"autostart": true, "port": 8470, "project_ports": {}}
+}

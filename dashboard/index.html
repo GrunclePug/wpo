@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <!-- The server replaces the placeholder with its action token; actions send it back (dashboard_server.py). -->
+  <meta name="wpo-action-token" content="__WPO_ACTION_TOKEN__">
+  <title>wpo dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='2' width='14' height='3' rx='1' fill='%2335a99a'/%3E%3Crect x='1' y='7' width='9' height='3' rx='1' fill='%2335a99a'/%3E%3Crect x='1' y='12' width='5' height='3' rx='1' fill='%2335a99a'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#work-packages">Skip to work packages</a>
+  <header class="topbar">
+    <div class="identity">
+      <h1 id="project-name">Work packages</h1>
+      <span class="tool-name">wpo</span>
+    </div>
+    <section class="usage" id="usage" aria-label="Subscription usage">
+      <p class="usage-placeholder">Reading usage…</p>
+    </section>
+    <div class="connection" id="connection" role="status" aria-live="polite">
+      <span class="connection-dot" aria-hidden="true"></span>
+      <span class="connection-text">Connecting…</span>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+  <div class="attention-strip" id="attention" hidden></div>
+  <section class="panel native-backend" id="native-backend" aria-label="T3 execution" hidden></section>
+
+  <div class="layout">
+    <main class="board" id="board">
+      <section class="panel" id="needs-you" aria-labelledby="needs-you-heading" hidden>
+        <div class="panel-head">
+          <h2 id="needs-you-heading">Needs you <span class="count" id="needs-you-count"></span></h2>
+        </div>
+        <ul class="action-list" id="needs-you-list"></ul>
+      </section>
+
+      <section class="panel" aria-labelledby="lanes-heading">
+        <div class="panel-head">
+          <h2 id="lanes-heading">Lanes <span class="count" id="lanes-count"></span></h2>
+        </div>
+        <div class="table-wrap">
+          <table class="grid lanes-table">
+            <thead>
+              <tr>
+                <th scope="col">Lane</th>
+                <th scope="col">Supervisor</th>
+                <th scope="col">Now</th>
+                <th scope="col">Open</th>
+                <th scope="col" class="num">Last line</th>
+              </tr>
+            </thead>
+            <tbody id="lanes-body">
+              <tr class="skeleton-row"><td colspan="5"><span class="skeleton"></span></td></tr>
+              <tr class="skeleton-row"><td colspan="5"><span class="skeleton"></span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" id="work-packages" aria-labelledby="wps-heading" tabindex="-1">
+        <div class="panel-head">
+          <h2 id="wps-heading">Open work packages <span class="count" id="wps-count"></span></h2>
+          <label class="search">
+            <span class="visually-hidden">Filter work packages</span>
+            <input id="wp-filter" type="search" placeholder="Filter by id, title, lane or status" autocomplete="off" spellcheck="false">
+          </label>
+        </div>
+        <div class="table-wrap">
+          <table class="grid wps-table">
+            <colgroup>
+              <col class="c-id"><col class="c-title"><col class="c-status"><col class="c-steps"><col class="c-rounds"><col class="c-session"><col class="c-findings"><col class="c-active">
+            </colgroup>
+            <thead>
+              <tr>
+                <th scope="col">WP · lane</th>
+                <th scope="col">Work package · latest progress</th>
+                <th scope="col">Status</th>
+                <th scope="col">Steps</th>
+                <th scope="col" title="Rounds · failures since the last re-evaluation · re-evaluations">Rounds</th>
+                <th scope="col">Session · context</th>
+                <th scope="col" class="num" title="Open BLOCKING review findings">Findings</th>
+                <th scope="col" class="num">Active</th>
+              </tr>
+            </thead>
+            <tbody id="wps-body">
+              <tr class="skeleton-row"><td colspan="8"><span class="skeleton"></span></td></tr>
+              <tr class="skeleton-row"><td colspan="8"><span class="skeleton"></span></td></tr>
+              <tr class="skeleton-row"><td colspan="8"><span class="skeleton"></span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="split">
+        <section class="panel" aria-labelledby="milestones-heading">
+          <div class="panel-head">
+            <h2 id="milestones-heading">Milestones</h2>
+            <ul class="legend" aria-label="Legend">
+              <li><span class="swatch s-done"></span>done</li>
+              <li><span class="swatch s-review"></span>review</li>
+              <li><span class="swatch s-in_progress"></span>in progress</li>
+              <li><span class="swatch s-changes_requested"></span>changes</li>
+              <li><span class="swatch s-blocked"></span>blocked</li>
+              <li><span class="swatch s-todo"></span>todo</li>
+            </ul>
+          </div>
+          <ol class="milestones" id="milestones"></ol>
+        </section>
+        <section class="panel" aria-labelledby="merged-heading">
+          <div class="panel-head">
+            <h2 id="merged-heading">Recently merged</h2>
+          </div>
+          <ol class="merged" id="merged"></ol>
+        </section>
+      </div>
+
+      <section class="panel" aria-labelledby="request-heading">
+        <div class="panel-head">
+          <h2 id="request-heading">Ask for work</h2>
+        </div>
+        <div class="request-box" id="request-box"></div>
+      </section>
+    </main>
+
+    <aside class="feed" aria-labelledby="events-heading">
+      <div class="panel-head feed-head">
+        <h2 id="events-heading">Events</h2>
+        <div class="segmented" role="group" aria-label="Show events">
+          <button type="button" class="segment" data-feed-filter="all" aria-pressed="true">All</button>
+          <button type="button" class="segment" data-feed-filter="attention" aria-pressed="false">Needs you</button>
+        </div>
+      </div>
+      <ol class="events" id="events" aria-live="off"></ol>
+    </aside>
+
+    <aside class="detail" id="detail" aria-labelledby="detail-title" hidden>
+      <div class="detail-head">
+        <h2 id="detail-title" tabindex="-1">Work package</h2>
+        <button type="button" class="icon-button" id="detail-close" aria-label="Close details (Escape)">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <div class="detail-body" id="detail-body"></div>
+      <div class="detail-actions" id="detail-actions"></div>
+    </aside>
+  </div>
+
+  <ol class="toasts" id="toasts" aria-live="polite" aria-label="Action outcomes"></ol>
+  <div class="visually-hidden" id="announcer" aria-live="polite"></div>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "$comment": "Intelligence scores for free models, matched by normalized name (routing.normalize_model_name). A free model with no entry here is listed as unrated and never dispatched. routing.py refresh overlays Artificial Analysis API scores when ~/.cli-proxy-api/artificialanalysis-key exists; these hand entries come from the benchmarklist.com import of Artificial Analysis Intelligence Index rows sampled 2026-10-18.",
+  "models": [
+    { "names": ["glm-5.3-flash"],                                   "score": 41.8, "source": "benchmarklist AA import", "as_of": "2026-10-18" },
+    { "names": ["ling-3.1-flash"],                                  "score": 41.1, "source": "benchmarklist AA import", "as_of": "2026-10-18" },
+    { "names": ["step-5-preview"],                                  "score": 43.7, "source": "benchmarklist AA import", "as_of": "2026-10-18" },
+    { "names": ["deepseek-v4.1-flash"],                             "score": 39.5, "variant": "max", "source": "benchmarklist AA import (Max)", "as_of": "2026-10-18" },
+    { "names": ["mimo-v2.6-flash"],                                 "score": 37.9, "source": "benchmarklist AA import", "as_of": "2026-10-18" },
+    { "names": ["beam-1.0", "beam-1.0-501b-a23b"],                  "score": 30.3, "source": "benchmarklist AA import", "as_of": "2026-10-18" },
+    { "names": ["minimax-m3"],                                      "score": 29.2, "source": "benchmarklist AA import", "as_of": "2026-10-18" },
+    { "names": ["nemotron-3.5-super-vl", "nemotron-3.5-super-vl-120b-a12b"], "score": 26.5, "source": "benchmarklist AA import", "as_of": "2026-10-18" },
+    { "names": ["inkling-small"],                                   "score": 25.7, "source": "benchmarklist AA import", "as_of": "2026-10-18" },
+    { "names": ["inkling"],                                         "score": 25.0, "variant": "xhigh", "source": "benchmarklist AA import (Xhigh)", "as_of": "2026-10-18" },
+    { "names": ["nemotron-3-ultra", "nemotron-3-ultra-550b-a55b"],  "score": 22.9, "source": "benchmarklist AA import (Reasoning)", "as_of": "2026-10-18" },
+    { "names": ["gemma-4-26b-a4b", "gemma-4-26b-a4b-it"],           "score": 16.7, "source": "benchmarklist AA import (Reasoning)", "as_of": "2026-10-18" }
+  ]
+}
