@@ -979,9 +979,11 @@ class RoundRoutingTests(unittest.TestCase):
         self.assertEqual([elapsed_text(seconds) for seconds in (-3, 40, 720, 10800, 11100, 90000, 172800)],
                          ["0 s", "40 s", "12 min", "3 h", "3 h 5 min", "1 d 1 h", "2 d"])
 
-    def test_a_cap_ends_every_session_of_the_family(self) -> None:
+    @mock.patch.object(routing, "now_utc", return_value=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    def test_a_cap_ends_every_session_of_the_family(self, _clock: mock.Mock) -> None:
         router = routing.Router(machine_in(Path(tempfile.mkdtemp())))
-        started = time.time()
+        # time.time() and datetime.now() have different resolutions on Windows Python 3.11.
+        started = routing.now_utc().timestamp()
         resets = (routing.now_utc() + timedelta(hours=2)).timestamp()
         with mock.patch.object(routing.Router, "usage_windows", return_value={"gpt": [{"label": "5h", "used_percent": 100, "resets_at": resets}]}):
             self.assertIn("5h usage window is at 100%", router.family_cut_off("gpt", started))
@@ -992,7 +994,7 @@ class RoundRoutingTests(unittest.TestCase):
             router.mark("claude-opus-high", "rate_limited", "You've hit your limit")
             self.assertIn("another claude session hit its cap", router.family_cut_off("claude", started))
             # A cap recorded before the session started did not end it.
-            self.assertIsNone(router.family_cut_off("claude", time.time() + 1))
+            self.assertIsNone(router.family_cut_off("claude", started + 1))
 
     def test_a_session_whose_provider_is_cut_off_is_killed(self) -> None:
         from wpo import session
