@@ -18,9 +18,12 @@
       <h1 id="project-name">Work packages</h1>
       <span class="tool-name">wpo</span>
     </div>
-    <section class="usage" id="usage" aria-label="Subscription usage">
-      <p class="usage-placeholder">Reading usage…</p>
-    </section>
+    <details class="usage-disclosure" id="usage-disclosure">
+      <summary id="usage-summary">Subscription usage</summary>
+      <section class="usage" id="usage" aria-label="Subscription usage">
+        <p class="usage-placeholder">Reading usage…</p>
+      </section>
+    </details>
     <div class="connection" id="connection" role="status" aria-live="polite">
       <span class="connection-dot" aria-hidden="true"></span>
       <span class="connection-text">Connecting…</span>
@@ -28,24 +31,39 @@
   </header>
 
   <div class="banner" id="banner" hidden></div>
-  <div class="attention-strip" id="attention" hidden></div>
-  <section class="panel native-backend" id="native-backend" aria-label="T3 execution" hidden></section>
+  <details class="attention-strip" id="attention" hidden>
+    <summary id="attention-summary">Needs attention</summary>
+    <div id="attention-items"></div>
+  </details>
+  <details class="panel native-backend" id="native-disclosure" hidden>
+    <summary id="native-summary">T3 execution</summary>
+    <section id="native-backend" aria-label="T3 execution"></section>
+  </details>
+
+  <nav class="board-nav" aria-label="Dashboard sections">
+    <a href="#lanes">Lanes</a>
+    <a href="#work-packages">Work packages</a>
+    <a href="#needs-you">Needs you</a>
+    <a href="#events-panel">Events</a>
+  </nav>
 
   <div class="layout">
     <main class="board" id="board">
       <section class="panel" id="needs-you" aria-labelledby="needs-you-heading" hidden>
-        <div class="panel-head">
-          <h2 id="needs-you-heading">Needs you <span class="count" id="needs-you-count"></span></h2>
-        </div>
-        <ul class="action-list" id="needs-you-list"></ul>
+        <details id="needs-disclosure">
+          <summary class="panel-head">
+            <h2 id="needs-you-heading">Needs you <span class="count" id="needs-you-count"></span></h2>
+          </summary>
+          <ul class="action-list" id="needs-you-list"></ul>
+        </details>
       </section>
 
-      <section class="panel" aria-labelledby="lanes-heading">
+      <section class="panel" id="lanes" aria-labelledby="lanes-heading">
         <div class="panel-head">
           <h2 id="lanes-heading">Lanes <span class="count" id="lanes-count"></span></h2>
         </div>
-        <div class="table-wrap">
-          <table class="grid lanes-table">
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Lane table">
+          <table class="grid lanes-table" role="table" aria-label="Lanes">
             <thead>
               <tr>
                 <th scope="col">Lane</th>
@@ -71,8 +89,8 @@
             <input id="wp-filter" type="search" placeholder="Filter by id, title, lane or status" autocomplete="off" spellcheck="false">
           </label>
         </div>
-        <div class="table-wrap">
-          <table class="grid wps-table">
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Work package table">
+          <table class="grid wps-table" role="table" aria-label="Open work packages">
             <colgroup>
               <col class="c-id"><col class="c-title"><col class="c-status"><col class="c-steps"><col class="c-rounds"><col class="c-session"><col class="c-findings"><col class="c-active">
             </colgroup>
@@ -128,7 +146,7 @@
       </section>
     </main>
 
-    <aside class="feed" aria-labelledby="events-heading">
+    <aside class="feed" id="events-panel" aria-labelledby="events-heading">
       <div class="panel-head feed-head">
         <h2 id="events-heading">Events</h2>
         <div class="segmented" role="group" aria-label="Show events">

@@ -147,6 +147,26 @@ development platform; Linux has matching platform primitives and CI coverage.
 The installed-artifact check verifies assets, both CLI entry paths, and project
 initialization outside the source checkout.
 
+For dashboard changes, run `uv run python -I -B tools/check_dashboard.py` and
+open its loopback URL in the browser. It serves the real dashboard assets with
+synthetic snapshots and an in-page transport: actions are recorded in memory,
+and no project, lane, coordinator, provider or model is contacted. In the browser
+evaluate `runDashboardChecks()` (it returns a promise), then inspect the rendered
+page and details at 360, 480, 640, 768, 1024 and 1440 px, including a viewport
+480 px tall. The checks cover reflow, filtering and grouping, refreshes during
+typing, focus and selection, disclosures, cooldowns, action payloads and errors,
+and empty/loading/detail states. Stop the fixture server when finished.
+
+To run these checks with exact CSS viewports and real keyboard input, install a
+Playwright Chromium browser and run
+`uv run --with playwright python -I -B tools/check_dashboard.py --check --port 0`.
+Use `--browser-executable <path>` for an existing Chromium installation,
+`--evidence-dir <directory>` to choose where screenshots/results go, and
+`--baseline <revision>` to capture the same synthetic data with older Git assets.
+Evidence defaults to a temporary directory outside the checkout. The browser
+check can also run against an installed wheel using the isolated command above
+with `--with playwright` and `tools/check_dashboard.py --check --port 0`.
+
 See [AGENTS.md](AGENTS.md) for source layout and change-specific checks.
 `SPEC.md` is historical design context; current behavior is documented in the
 skill and references. Keep machine config, credentials, account-synced skills,

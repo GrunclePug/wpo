@@ -238,6 +238,7 @@ function receiveSnapshot(snapshot) {
   }
   ui.snapshot = snapshot;
   keepFocus(() => renderBoard(changed));
+  if (first && location.hash === "#needs-you") $("needs-disclosure").open = true;
   // The board arrives after load, so a section anchor in the address is honoured once it exists.
   if (first && location.hash.length > 1 && !location.hash.startsWith("#/")) document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
   renderConnection();
@@ -261,14 +262,15 @@ function renderBoard(changed) {
 
 function renderNativeBackend(native) {
   const panel = $("native-backend");
-  panel.hidden = !native;
+  $("native-disclosure").hidden = !native;
   if (!native) return;
+  $("native-summary").textContent = `T3 execution · ${native.pending} outstanding${native.stalled ? ` · ${native.stalled} stalled` : ""}`;
   const tasks = native.tasks.map((task) => {
     const href = nativeThreadLink(task.link);
     const link = href ? `<a href="${esc(href)}">Open in T3</a>` : "";
     return `<li><strong>${esc(task.wp || task.kind)}</strong> ${esc(task.role || "")} · ${esc(task.state)} ${link}${task.native_approval ? " · Approval in T3" : ""}${task.detail ? `<p>${esc(task.detail)}</p>` : ""}</li>`;
   }).join("");
-  panel.innerHTML = `<div class="panel-head"><h2>T3 execution</h2><button type="button" id="t3-recover" ${native.pending && !ui.pending.has("t3-recover") ? "" : "disabled"}>Recover coordinator</button></div><p>${native.coordinator_thread_id ? "Coordinator attached" : "Attach a coordinator from a T3 repository thread"} · ${native.pending} outstanding${native.stalled ? ` · ${native.stalled} stalled` : ""}</p>${tasks ? `<ul>${tasks}</ul>` : ""}<p>Recovery wakes coordinators once and keeps held lanes paused. Native permission requests are answered in T3.</p>`;
+  panel.innerHTML = `<div class="panel-head"><span>${native.coordinator_thread_id ? "Coordinator attached" : "Attach a coordinator from a T3 repository thread"}</span><button type="button" class="action-button" id="t3-recover" data-focus-key="t3-recover" ${native.pending && !ui.pending.has("t3-recover") ? "" : "disabled"}>Recover coordinator</button></div>${tasks ? `<ul>${tasks}</ul>` : ""}<p>Recovery wakes coordinators once and keeps held lanes paused. Native permission requests are answered in T3.</p>`;
   $("t3-recover").addEventListener("click", async (event) => {
     event.currentTarget.disabled = true;
     ui.pending.add("t3-recover");
@@ -289,8 +291,11 @@ function nativeThreadLink(value) {
 
 function renderUsage(usage) {
   const parts = [];
+  const summaries = [];
   for (const family of usage.families) {
     const name = family.family === "gpt" ? "GPT" : family.family.charAt(0).toUpperCase() + family.family.slice(1);
+    const summary = family.windows.map((window) => `${window.label} ${Math.round(window.used_percent)}%`).join(", ");
+    summaries.push(`${name} ${summary || "unknown"}`);
     const windows = family.windows.map((window) => usageWindow(window)).join("");
     const unknown = family.windows.length === 0 ? `<span class="forecast is-soon">usage unknown${family.error ? `: ${esc(family.error)}` : ""}</span>` : "";
     parts.push(`<div class="family"><span class="family-name">${esc(name)}${family.plan ? `<small>${esc(family.plan)}</small>` : ""}</span>${windows}${unknown}${forecast(family.forecast, family.windows, usage.lead_minutes)}</div>`);
@@ -304,6 +309,7 @@ function renderUsage(usage) {
       <div class="cooldowns-popover" id="cooldowns" popover><h3>Route cooldowns</h3><ul>${items}</ul></div>`);
   }
   const container = $("usage");
+  $("usage-summary").textContent = `Usage · ${summaries.join(" · ")}`;
   const popoverOpen = container.querySelector("#cooldowns:popover-open") !== null;
   container.innerHTML = parts.join("");
   if (popoverOpen) container.querySelector("#cooldowns")?.showPopover();
@@ -349,7 +355,8 @@ function renderAttention(snapshot) {
   }
   const strip = $("attention");
   strip.hidden = items.length === 0;
-  strip.innerHTML = items.length ? `<span>Needs you:</span>${items.join("")}` : "";
+  $("attention-summary").textContent = `Needs attention · ${waiting} waiting on an answer · ${items.length - Number(Boolean(waiting))} lane or file alerts`;
+  $("attention-items").innerHTML = items.join("");
 }
 
 // ------------------------------------------------------------------------------------- actions
@@ -623,12 +630,12 @@ function laneRow(lane, rowsById) {
   const open = lane.open_wps.length
     ? `<span class="lane-wps" title="${esc(lane.open_wps.join(", "))}">${lane.open_wps.length} · ${esc(lane.open_wps.slice(0, 2).join(", "))}${lane.open_wps.length > 2 ? " …" : ""}</span>`
     : '<span class="dim">—</span>';
-  return `<tr>
-    <td><span class="lane-name">${esc(lane.name)}</span></td>
-    <td class="nowrap">${tags.join(" ")}</td>
-    <td class="lane-now">${now}</td>
-    <td>${open}</td>
-    <td class="num nowrap" title="${esc(lane.last_line || "")}">${lane.last_line_at ? timeTag(lane.last_line_at) : '<span class="dim">—</span>'}</td>
+  return `<tr class="lane-row" role="row">
+    <td data-label="Lane" role="cell"><span class="lane-name">${esc(lane.name)}</span></td>
+    <td data-label="Supervisor" role="cell" class="nowrap">${tags.join(" ")}</td>
+    <td data-label="Now" role="cell" class="lane-now">${now}</td>
+    <td data-label="Open" role="cell">${open}</td>
+    <td data-label="Last line" role="cell" class="num nowrap" title="${esc(lane.last_line || "")}">${lane.last_line_at ? timeTag(lane.last_line_at) : '<span class="dim">—</span>'}</td>
   </tr>`;
 }
 
@@ -691,15 +698,15 @@ function wpRow(row, changed) {
   else if (row.escalated_to) waiting = `<span class="waiting">escalated to <span class="mono">${esc(row.escalated_to)}</span></span>`;
   const findingsTitle = row.open_findings.map((finding) => `${finding.id}${finding.answered ? " (answered)" : ""} ${finding.location}`).join("\n");
   const unanswered = row.open_findings.filter((finding) => !finding.answered).length;
-  return `<tr class="${classes.join(" ")}" data-row-wp="${esc(row.id)}">
-    <td>${wpButton(row.id)}<span class="sub">${esc(row.lane || "no lane")}</span></td>
-    <td class="title-cell"><span class="wp-title" title="${esc(row.title)}">${esc(row.title)}</span><span class="sub" title="${esc(row.latest_progress)}">${progress}</span></td>
-    <td class="status-cell">${statusPill(row.status)}${waiting}</td>
-    <td>${steps(row.steps_done, row.steps_total)}</td>
-    <td class="rounds" title="${row.rounds} rounds · ${row.failures} failures since the last re-evaluation · ${row.evaluations} re-evaluations${row.handoffs ? ` · ${row.handoffs} handoffs this round` : ""}">R${row.rounds} · <span class="${row.failures ? "hot" : ""}">F${row.failures}</span> · <span class="${row.evaluations ? "hot" : ""}">E${row.evaluations}</span></td>
-    <td class="session">${sessionCell(row)}</td>
-    <td class="num" title="${esc(findingsTitle)}">${row.open_findings.length ? `<span class="findings-count has-open">${row.open_findings.length}</span>${unanswered !== row.open_findings.length ? `<span class="sub">${unanswered} unanswered</span>` : ""}` : '<span class="dim">0</span>'}</td>
-    <td class="num nowrap">${row.last_activity ? timeTag(row.last_activity) : '<span class="dim">—</span>'}</td>
+  return `<tr class="${classes.join(" ")}" role="row" data-row-wp="${esc(row.id)}">
+    <td data-label="WP · lane" role="cell">${wpButton(row.id)}<span class="sub">${esc(row.lane || "no lane")}</span></td>
+    <td data-label="Work package · latest progress" role="cell" class="title-cell"><span class="wp-title" title="${esc(row.title)}">${esc(row.title)}</span><span class="sub" title="${esc(row.latest_progress)}">${progress}</span></td>
+    <td data-label="Status" role="cell" class="status-cell">${statusPill(row.status)}${waiting}</td>
+    <td data-label="Steps" role="cell">${steps(row.steps_done, row.steps_total)}</td>
+    <td data-label="Rounds" role="cell" class="rounds" title="${row.rounds} rounds · ${row.failures} failures since the last re-evaluation · ${row.evaluations} re-evaluations${row.handoffs ? ` · ${row.handoffs} handoffs this round` : ""}">R${row.rounds} · <span class="${row.failures ? "hot" : ""}">F${row.failures}</span> · <span class="${row.evaluations ? "hot" : ""}">E${row.evaluations}</span></td>
+    <td data-label="Session · context" role="cell" class="session">${sessionCell(row)}</td>
+    <td data-label="Findings" role="cell" class="num" title="${esc(findingsTitle)}">${row.open_findings.length ? `<span class="findings-count has-open">${row.open_findings.length}</span>${unanswered !== row.open_findings.length ? `<span class="sub">${unanswered} unanswered</span>` : ""}` : '<span class="dim">0</span>'}</td>
+    <td data-label="Active" role="cell" class="num nowrap">${row.last_activity ? timeTag(row.last_activity) : '<span class="dim">—</span>'}</td>
   </tr>`;
 }
 
@@ -791,15 +798,16 @@ function renderEvents(freshIndexes) {
   const list = $("events");
   const expanded = new Set([...list.querySelectorAll(".event.is-expanded")].map((item) => item.dataset.index));
   const shown = ui.events.filter((event) => ui.feedFilter === "all" || event.severity === "attention").slice().reverse();
-  list.innerHTML = shown.map((event) => {
+  const html = shown.map((event) => {
     const attention = event.severity === "attention";
     const classes = ["event", attention ? "is-attention" : "", freshIndexes.has(event.index) ? "is-new" : "", expanded.has(String(event.index)) ? "is-expanded" : ""].filter(Boolean).join(" ");
     const when = eventTime(event);
     return `<li class="${classes}" data-index="${event.index}">
       <div class="event-head">${attention ? '<span class="event-flag" aria-label="needs you">!</span>' : ""}<span class="event-time" title="${esc(event.time)}">${esc(clock(when))}</span><span class="event-kind">${esc(event.kind)}</span>${eventSubject(event)}</div>
-      <p class="event-message" title="Click to expand">${esc(event.message)}</p>
+      <button type="button" class="event-message" aria-expanded="${expanded.has(String(event.index))}" data-focus-key="event-${event.index}" title="Expand or collapse event">${esc(event.message)}</button>
     </li>`;
   }).join("") || `<li class="empty">${ui.feedFilter === "attention" ? "Nothing in the journal needs you." : "The journal is empty."}</li>`;
+  keepFocus(() => { list.innerHTML = html; });
 }
 
 // -------------------------------------------------------------------------------------- detail
@@ -989,12 +997,13 @@ function detailLogs(detail) {
     const tail = log.size > 1024 * 1024 ? `<a href="/raw/${runPath(log.path)}?tail" target="_blank" rel="noopener">tail</a>` : "";
     return `<tr><td class="name">${esc(log.name)}</td><td>${what}</td><td class="num">${bytes(log.size)}</td><td class="num">${timeTag(log.modified)}</td><td class="links">${view}<a href="/raw/${runPath(log.path)}" target="_blank" rel="noopener">raw</a>${tail}</td></tr>`;
   }).join("");
-  return `<section><h3>Logs <span class="count">${detail.logs.length} files, newest first</span></h3><div class="table-wrap"><table class="logs"><thead><tr><th scope="col">File</th><th scope="col">Session</th><th scope="col" class="num">Size</th><th scope="col" class="num">Written</th><th scope="col">Open</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+  return `<section><h3>Logs <span class="count">${detail.logs.length} files, newest first</span></h3><div class="table-wrap" tabindex="0" role="region" aria-label="Run logs"><table class="logs"><thead><tr><th scope="col">File</th><th scope="col">Session</th><th scope="col" class="num">Size</th><th scope="col" class="num">Written</th><th scope="col">Open</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
 }
 
 // -------------------------------------------------------------------------------- interaction
 
 document.addEventListener("click", (event) => {
+  if (event.target.closest('a[href="#needs-you"]')) $("needs-disclosure").open = true;
   const opener = event.target.closest("[data-open-wp]");
   if (opener) { openDetail(opener.dataset.openWp); return; }
   const toggle = event.target.closest("[data-toggle-group]");
@@ -1014,7 +1023,11 @@ document.addEventListener("click", (event) => {
     return;
   }
   const message = event.target.closest(".event-message");
-  if (message) { message.closest(".event").classList.toggle("is-expanded"); return; }
+  if (message) {
+    const expanded = message.closest(".event").classList.toggle("is-expanded");
+    message.setAttribute("aria-expanded", String(expanded));
+    return;
+  }
   const row = event.target.closest("tr.row[data-row-wp]");
   if (row && !event.target.closest("a, button") && !window.getSelection().toString()) openDetail(row.dataset.rowWp);
 });
