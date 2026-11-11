@@ -602,7 +602,8 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
                 event_fields: Mapping[str, str] | None = None, extra_env: Mapping[str, str] | None = None,
                 lead: bool = False, stop_on_compaction: bool = False, skills: Iterable[str] = (),
                 resume: ResumeTarget | None = None, inbox: Path | None = None, resume_only: bool = False,
-                handoff_message: Callable[[str], str] | None = None, recovery: Callable[[str], str] | None = None) -> SessionResult:
+                handoff_message: Callable[[str], str] | None = None, recovery: Callable[[str], str] | None = None,
+                on_attempt: Callable[[], None] | None = None) -> SessionResult:
     """Runs one session on the first route that completes it; `{{ROUTE}}` in the prompt becomes
     the route id. `skills` are loaded into the session's brief. With `resume`, that session is
     continued first when its route is still a candidate; a resume that does not complete falls
@@ -612,7 +613,8 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
     (HandoffTrigger). With `recovery`, a session that fails on its route is assumed to have stopped
     mid-write: `recovery(why)` reports what it left, and the next route's prompt ends with that
     report. The report is made only once a next route is chosen: its Verify run can take an hour,
-    wasted when no route is left. Raises NoRouteError when no route is left, CompactionStop when asked to."""
+    wasted when no route is left. Raises NoRouteError when no route is left, CompactionStop when asked to. `on_attempt()` runs each
+    time a chosen route is about to start a session."""
     if access in WRITES_LISTED_PATHS and not list(write_paths):
         raise ValueError(f"access '{access}' needs write paths")
     # A bad compaction point is a configuration error, not a failure of each route in turn.
@@ -639,6 +641,8 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
             context.journal.emit("resume-failed", f"{resume.route_id} is not available for '{spec}'; starting a fresh session", settings.fields)
         else:
             log_path = route_log_path(log_stem, route, ".resumed")
+            if on_attempt is not None:
+                on_attempt()
             outcome = attempt(context, route, resume.prompt, log_path, settings, resume.session_id)
             if outcome is not None and outcome.outcome == "ok":
                 context.journal.emit("session-resumed", f"continued session {resume.session_id} on {route['id']} ({log_path.name})",
@@ -666,6 +670,8 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
             context.journal.emit("tier-downgrade", f"'{spec}' runs on {route['id']} (score {route['score']}) because nothing at the tier floor is available",
                                  {**settings.fields, "route": route["id"]})
         log_path = route_log_path(log_stem, route)
+        if on_attempt is not None:
+            on_attempt()  # a route was chosen: the session is about to start on it
         outcome = attempt(context, route, prompt, log_path, settings)
         if outcome is None:
             failures.append(f"{route['id']}: busy with another session")

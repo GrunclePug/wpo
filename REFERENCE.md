@@ -117,6 +117,19 @@ the same CLIProxyAPI as GPT (`cli-proxy-api -xai-login`), one account-wide coold
 during cooldowns after failures, without keys, or when the local model is down. `wpo route status`,
 `wpo route candidates --spec code-hard`, `wpo route clear --prefix family:gpt` (a cap lifted early).
 Policy: `models/tiers.json`, free scores `models/scores.json`; projects override in `routing`.
+**Listed tiers.** `tier_routes` gives a tier explicit routes instead of floors:
+`{"code-hard": {"routes": [["claude-opus-medium", "gpt-sol-high"]], "fallback": [[...]], "free_last_resort": true}}`.
+Groups run in order; within a group the family with the most headroom (percentage points left
+before its tightest window stops it: the five-hour ceiling, or the weekly one under its pace) goes
+first, routes spending no subscription before it, Claude first for `+taste`. `fallback` groups are
+the tier's downgrades, and all a family over its weekly pace may serve. Listed routes skip the
+family frontier; gate-only, pin-only and family rules still apply; unknown ids are skipped and
+shown by `wpo route status`; an empty entry lists nothing. **Routing modes:** `modes` maps a name to
+its own `tier_routes`, which replace the standard ones tier by tier. `wpo route mode
+[standard|<mode>]` shows or sets the project's mode (`<runs>/routing-mode.json`, journaled as
+`routing-mode`); a WP records the mode in which its first route was chosen
+(`<runs>/<WP>/routing-mode.json`) and keeps it for every role, staged ones, repairs and delegated
+workers included, so a switch reaches only WPs that start afterwards. Its specs then carry the mode (`code-hard@hard`); the dashboard shows both.
 A failed session (cap, API error, crash, no activity for `idle_minutes`) falls back to the next route
 in the same tree; when nothing is left the run stops with exit 4 without counting the round. A
 subscription session (claude, gpt) with no first model turn after `first_output_minutes`, or one that

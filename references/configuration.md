@@ -75,6 +75,40 @@ the other route lists require exact IDs. For example:
 }
 ```
 
+### Listed tiers and routing modes
+
+`routing.tier_routes` gives a tier an explicit route list instead of its score floors. Each entry
+holds `routes`, ordered groups of exact route IDs; optional `fallback` groups, served as the tier's
+downgrades (and all a family over its weekly pace may serve); and `free_last_resort` (default
+`true`). Groups are tried in order. Within a group the subscription family with the most quota
+headroom goes first (percentage points left before its tightest window stops it), routes that
+spend no subscription before it, and Claude first for a `+taste` spec. Listed routes skip the
+family Pareto frontier but keep every restriction above; IDs that name no route are skipped and
+reported by `wpo route status`. An empty entry lists nothing. Tiers without an entry keep floors.
+A listed tier still needs its `tiers` entry, for `writes_code`; its floors are read only where the
+tier is not listed. A later layer (machine over bundled, project over machine) replaces a tier's
+entry whole rather than merging into it. Malformed entries fail with an error naming the setting.
+
+`routing.modes` maps a mode name to its own `tier_routes`, which replace the standard entries
+tier by tier. `wpo route mode [standard|<mode>]` shows or sets a project's mode; each WP records
+the mode in which its first route was chosen and keeps it for every later session, repairs and
+delegated workers included. Specs then carry it as a suffix, such as `code-hard@hard`. Ad-hoc
+sessions (`wpo dispatch`, placements, audits) and `wpo route candidates` use the project's mode
+unless their spec names one. A mode the
+configuration no longer defines routes as `standard` (`wpo route mode` says so); a mode name may
+not be `standard` or contain `@`.
+
+```json
+{
+  "routing": {
+    "tier_routes": {
+      "code-hard": {"routes": [["claude-opus-medium", "gpt-sol-high"]], "fallback": [["claude-opus-low", "gpt-sol-medium"]]}
+    },
+    "modes": {"hard": {"tier_routes": {"code-hard": {"routes": [["claude-opus-high", "gpt-sol-xhigh"]], "free_last_resort": false}}}}
+  }
+}
+```
+
 ### Carried user rules
 
 `user_rules` accepts an ordered list of file objects. Each `file` is an explicit path (with

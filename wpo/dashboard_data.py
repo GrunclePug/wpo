@@ -40,7 +40,7 @@ from .lanes import pool_lanes, read_holds, supervisor_pid
 from .machine import MachineConfig
 from .platform import pid_alive
 from .project import CONFIG_RELATIVE_PATH
-from .routing import SUBSCRIPTION_FAMILIES, Route, from_timestamp, now_utc, paced_weekly_ceiling, static_routes
+from .routing import SUBSCRIPTION_FAMILIES, Route, from_timestamp, now_utc, paced_weekly_ceiling, project_mode, static_routes, wp_mode
 from .runner import LEDGER_FILE, NO_ROUTE_FILE, RoundLedger
 from .session import route_log_path, turn_context_tokens
 from .supervisor import ROUTE_WAIT_FILE
@@ -567,6 +567,7 @@ class DashboardData:
             "lane": wp.lane,
             "status": wp.status,
             "builder_spec": ledger.get("escalated_to") or wp.builder,
+            "routing_mode": wp_mode(self.runs, wp.id),
             "steps_done": sections["steps_done"],
             "steps_total": sections["steps_total"],
             "latest_progress": sections["latest_progress"],
@@ -682,7 +683,7 @@ class DashboardData:
             counts[wp.status] += 1
         titles = {wp.id: wp.title for wp in main}
         return {
-            "project": {"name": context.project.name, "root": str(context.project.root)},
+            "project": {"name": context.project.name, "root": str(context.project.root), "routing_mode": project_mode(self.runs)},
             "lanes": lanes,
             "wps": rows,
             "milestones": [{"name": name, "counts": counts, "total": sum(counts.values())}

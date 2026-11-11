@@ -33,6 +33,7 @@ from .orchestrator import (
     dispatch_session,
     trusted_families,
 )
+from .routing import project_mode, with_mode
 from .session import NoRouteError, describe_next
 from .similarity import SimilarityIndex
 
@@ -150,7 +151,7 @@ def run_audit(context: Context, mechanical_only: bool, today: date | None = None
     print(f"lint: {counts}\nreport: {path}")
     if mechanical_only:
         return 0
-    spec = context.project.config["audit"]["spec"]
+    spec = with_mode(context.project.config["audit"]["spec"], project_mode(context.project.runs_dir))
     run_dir = path.with_suffix("")
     try:
         families = trusted_families(context)
