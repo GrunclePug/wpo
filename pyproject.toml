@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wp-orchestration"
+version = "0.1.0"
+description = "Work-package orchestration, verification, review, and dashboard for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "poipoi300" }]
+dependencies = ["psutil>=6"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Software Development",
+]
+
+[project.scripts]
+wpo = "wpo.cli:entrypoint"
+
+[dependency-groups]
+dev = ["ruff>=0.8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["wpo"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"bin/wpo.py" = "wpo/resources/bin/wpo.py"
+"dashboard" = "wpo/resources/dashboard"
+"models" = "wpo/resources/models"
+"references" = "wpo/resources/references"
+"templates" = "wpo/resources/templates"
+"SKILL.md" = "wpo/resources/SKILL.md"
+"REFERENCE.md" = "wpo/resources/REFERENCE.md"
+"SPEC.md" = "wpo/resources/SPEC.md"
+"README.md" = "wpo/resources/README.md"
+"LICENSE" = "wpo/resources/LICENSE"
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+  "wpo", "bin", "dashboard", "models", "references", "templates", "tests", "tools",
+  "SKILL.md", "REFERENCE.md", "SPEC.md", "README.md", "LICENSE", "AGENTS.md",
+  "pyproject.toml", "uv.lock", ".github", ".gitignore",
+]
+
+[tool.ruff]
+target-version = "py311"
