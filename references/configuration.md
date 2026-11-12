@@ -1,5 +1,30 @@
 # Portable configuration
 
+## Build output and disk space
+
+`remove_after_merge` lists per-WP build directories. `{wp}` expands to the WP ID and
+`{worktree}` to its actual checkout, including the registered T3 checkout. For Rust projects,
+`"remove_after_merge": ["{worktree}/target"]` cleans compiled output after a successful merge
+while retaining T3's checkout, branch, source changes and orchestration history. External
+per-WP paths such as `C:/Build/target-{wp}` remain supported. Paths must contain one of those
+tokens; normalized external paths must stay within their WP-specific directory. Shared paths,
+checkout roots, foreign/nested repositories, Git data, linked paths and tracked content are refused.
+Output inside its own checkout must be Git-ignored; orchestration history is always protected.
+An unsuccessful removal is reported as `cleanup-failed`; it does not undo the merge.
+
+`wpo clean-builds` reports configured cleanup for WPs already done on main; `--wp WP-0001`
+limits the report, and `--apply` removes that output. Open/pending WPs, held unfinished work,
+claimed WPs and outstanding native sessions (including stalled ones) are protected. The command
+does not remove migrated source checkouts or historical logs; retire those explicitly only after
+verifying migration and preserving unique uncommitted work.
+
+`minimum_build_free_gib` is an optional free-space floor on the checkout's volume before a WP
+runner starts. For example, `20` requires 20 GiB free. `null` disables it. Insufficient space
+blocks the WP and raises an attention event before a model launches, without cooling model routes
+or deleting anything. After freeing space, unblock and resume the WP explicitly. This is a
+pre-run check, not a reservation or continuous disk monitor; explicit external build volumes
+may need their own space checks.
+
 The skill is source and reusable guidance. Never commit your live machine config, API tokens,
 model-proxy login state, session transcripts, run logs, or account usage history into it.
 
