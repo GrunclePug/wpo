@@ -66,11 +66,16 @@ class Context:
 
     def effective_wps(self, main_copies: list[wpfile.WorkPackage] | None = None) -> list[wpfile.WorkPackage]:
         """Main's WPs, except that a WP with a worktree is read from it: its live status and progress
-        stay there until it merges. A worktree copy that does not parse falls back to main's.
+        stay there until it merges. A WP done on main is read from main: under T3 its checkout
+        outlives the merge, and the orchestrator may settle a WP on main (`wpo commit-main`) whose
+        checkout still holds an open copy. A worktree copy that does not parse falls back to main's.
         `main_copies` is a listing of main the caller already holds (the dashboard caches it until
         main moves); None reads main now."""
         effective = []
         for main_copy in self.main_wps() if main_copies is None else main_copies:
+            if main_copy.status == "done":
+                effective.append(main_copy)
+                continue
             worktree_copy = self.project.wp_dir(self.project.worktree(main_copy.id)) / main_copy.file_name
             if not worktree_copy.exists():
                 effective.append(main_copy)

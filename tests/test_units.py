@@ -1098,7 +1098,7 @@ class CatchUpWithMainTests(unittest.TestCase):
 
 class RecoveryIntegrationTests(unittest.TestCase):
     """A supervisor's pass merges WPs done in their checkout but not on main, and never a WP main
-    already holds as done, though under T3 its checkout outlives the merge."""
+    already holds as done, though under T3 its checkout outlives the merge; such a WP is read from main."""
 
     def setUp(self) -> None:
         from wpo.context import Context
@@ -1183,6 +1183,27 @@ class RecoveryIntegrationTests(unittest.TestCase):
         supervisor.loop()
         self.assertEqual(supervisor.next_wp.call_count, 3, "three passes ran")
         supervisor.integrate.assert_called_once_with("WP-0042")
+
+    def test_a_wp_done_on_main_is_read_from_main_though_its_checkout_is_open(self) -> None:
+        # Settled on main (`wpo commit-main`) while its retained checkout still holds an open copy.
+        from wpo.user_actions import effective_wp
+        self.commit_main("done")
+        self.retain_checkout()
+        self.write_wp(self.checkout, "in_progress")
+        (wp,) = self.context.effective_wps()
+        self.assertEqual((wp.status, wp.path.parent), ("done", self.project.wp_dir()))
+        wp, in_worktree = effective_wp(self.context, "WP-0042")
+        self.assertEqual((wp.status, in_worktree), ("done", False))
+
+    def test_a_wp_open_on_main_is_read_from_its_checkout(self) -> None:
+        from wpo.user_actions import effective_wp
+        self.commit_main("review")
+        self.retain_checkout()
+        self.write_wp(self.checkout, "done")
+        (wp,) = self.context.effective_wps()
+        self.assertEqual((wp.status, wp.path.parent), ("done", self.project.wp_dir(self.checkout)))
+        wp, in_worktree = effective_wp(self.context, "WP-0042")
+        self.assertEqual((wp.status, in_worktree), ("done", True))
 
 
 class IntegrationChecksTests(unittest.TestCase):
