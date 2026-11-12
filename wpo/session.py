@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -502,6 +503,9 @@ class SessionSettings:
     # Called with the route of a finished native session before its result is consumed (the
     # runner's writer recording), so a crash or a stop after it cannot lose it.
     on_finished: Callable[[dict], None] | None = None
+    # A delegated worker's admission: given the route, a context manager held while its native
+    # request is published, which raises SessionCancelled once the worker may no longer run.
+    admission: Callable[[dict], AbstractContextManager] | None = None
 
 
 def attempt(context: Context, route: dict, prompt: str, log_path: Path, settings: SessionSettings,
@@ -618,7 +622,7 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
                 resume: ResumeTarget | None = None, inbox: Path | None = None, resume_only: bool = False,
                 handoff_message: Callable[[str], str] | None = None, recovery: Callable[[str], str] | None = None,
                 on_attempt: Callable[[], None] | None = None, exclude_model_families: Iterable[str] = (),
-                on_finished: Callable[[dict], None] | None = None) -> SessionResult:
+                on_finished: Callable[[dict], None] | None = None, admission: Callable[[dict], AbstractContextManager] | None = None) -> SessionResult:
     """Runs one session on the first route that completes it; `{{ROUTE}}` in the prompt becomes
     the route id. `skills` are loaded into the session's brief. With `resume`, that session is
     continued first when its route is still a candidate; a resume that does not complete falls
@@ -637,7 +641,7 @@ def run_session(context: Context, spec: str, access: str, prompt: str, log_stem:
     validate_compaction_limits(context.project.config)
     settings = SessionSettings(access, list(write_paths), cwd, build_brief(context, cwd, skills), dict(extra_env or {}), lead, stop_on_compaction,
                                idle_minutes if idle_minutes is not None else float(context.project.config["idle_minutes"]), dict(event_fields or {}),
-                               inbox, handoff_message, on_finished)
+                               inbox, handoff_message, on_finished, admission)
     if resume_only and resume is None:
         raise ValueError("resume_only needs a session to resume")
     families = list(families)

@@ -41,6 +41,12 @@ CANCEL_ORIGIN_RANK = {"compaction": 0, "cutoff": 1, "cleanup": 2, "operator": 3}
 WAKE_SEND_TIMEOUT_SECONDS = 45
 
 
+def is_legacy(request: dict) -> bool:
+    """A request that finished before completions recorded what a task changed. It is never scope
+    checked again: its tree at completion is unknown, so every later edit would count against it."""
+    return request["state"] in TERMINAL_STATES and "completed_changes" not in request
+
+
 def request_id_for(kind: str, key: str, generation: int = 1) -> str:
     """A request's id. Generation 1 keeps the original derivation, so existing request files stay
     valid; later generations hash an encoding no generation-1 input (which starts with a kind name)
@@ -629,12 +635,20 @@ class Bridge:
         return current
 
     def cancel_wp(self, wp_id: str, why: str, origin: str, role: str | None = None) -> None:
+        """Cancels every matching request. A failed wake does not stop the rest: each cancel's
+        intent is on its request before its wake, and the failures are raised together after."""
+        failures = []
         for path in (self.directory / "requests").glob("*.json"):
             request = read_json(path)
             if request["state"] in ("done", "failed", "cancelled"):
                 continue
             if request["payload"].get("wp") == wp_id and (role is None or request["payload"].get("role") == role):
-                self.cancel_request(request, why, origin)
+                try:
+                    self.cancel_request(request, why, origin)
+                except (T3Error, OSError, subprocess.TimeoutExpired) as error:
+                    failures.append(f"{request['id']}: {error}")
+        if failures:
+            raise T3Error(f"cancelling {wp_id}'s requests could not wake their coordinator: {'; '.join(failures)}")
 
     def recover(self, coordinator: str | None = None) -> int:
         requests = [read_json(path) for path in (self.directory / "requests").glob("*.json")]
@@ -793,8 +807,10 @@ def run_attempt(context: Context, route: dict, prompt: str, log_path: Path, sett
             # with a new generation is checked like any other task.
             if lease and not (receipt and not receipt["consumed"] and receipt["request_id"] == lease["request_id"]):
                 previous = read_json(bridge.request_path(lease["request_id"]))
-                if previous and previous["state"] not in TERMINAL_STATES:
-                    raise T3Error("A previous native scope-checked task has no terminal callback; reconcile it before starting another worker in this checkout")
+                # One whose completion snapshot failed waits until it is finished (the worker
+                # barrier or a settle): until then, its check needs the checkout as it is.
+                if previous and (previous["state"] not in TERMINAL_STATES or (previous.get("completed_changes", []) is None and not previous.get("consumed_at"))):
+                    raise T3Error("A previous native scope-checked task in this checkout is unfinished; reconcile it before starting another worker in this checkout")
             return _run_attempt(context, route, prompt, log_path, settings, resume_session)
     return _run_attempt(context, route, prompt, log_path, settings, resume_session)
 
@@ -865,11 +881,14 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
     log_path.with_name(log_path.name + ".prompt.md").write_text(prompt_text, encoding="utf-8")
 
     @contextlib.contextmanager
-    def lease(request_id: str):
-        # The scope lease names the request before it is published, so the next task in this
-        # checkout can never start while it runs unseen.
-        write_json(bridge.directory / "scope" / f"{scope_key(settings.cwd)}.json", {"request_id": request_id, "log_path": str(log_path)})
-        yield
+    def publishing(request_id: str):
+        # Admission (a delegated worker's, held across the submit) and the scope lease, which names
+        # the request before it is published, so the next task in this checkout can never start
+        # while it runs unseen.
+        with settings.admission(route) if settings.admission else contextlib.nullcontext():
+            if settings.access != "builder":
+                write_json(bridge.directory / "scope" / f"{scope_key(settings.cwd)}.json", {"request_id": request_id, "log_path": str(log_path)})
+            yield
     request, receipt = bridge.begin_session(log_path, {"wp": wp_id, "role": role, "title": f"{wp_id or context.project.name}: {role}",
                             "native_role": {"reviewer": "review", "read": "research", "docs": "research", "evaluator": "general", "worker": "implementation", "builder": "implementation"}[settings.access],
                             "prompt": prompt_text, "target": target, "route": route, "log_path": str(log_path),
@@ -877,7 +896,7 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
                             "resume_session": resume_session, "stop_on_compaction": settings.stop_on_compaction,
                             "idle_minutes": settings.idle_minutes, "heartbeat_file": str(log_path.parent / "heartbeat"),
                             "progress_file": str(context.wp_in_tree(wp_id, settings.cwd).path) if wp_id else None},
-                            bridge.coordinator_for(wp_id), lease if settings.access != "builder" else None)
+                            bridge.coordinator_for(wp_id), publishing)
     write_json(identity_path, {"version": 1, "env": {**identity, "WPO_T3_REQUEST_ID": request["id"]}, "project": str(context.project.root)})
     if not log_path.exists():
         log_path.write_text(json.dumps({"type": "system", "subtype": "init", "session_id": request["id"], "backend": "t3",
@@ -891,7 +910,11 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
     except T3Error as error:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"type": "result", "is_error": True, "result": str(error), "backend": "t3", "recoverable_request_id": request["id"]}) + "\n")
-        if wp_id:
+        if wp_id and (settings.lead or settings.fields.get("role") == "worker"):
+            # A write to the WP file now would land in a running worker's completion snapshot: the
+            # lead's runner blocks the WP once its workers are stopped.
+            error.stalled_wp = wp_id
+        elif wp_id:
             from . import wpfile
             wpfile.set_status(context.wp_in_tree(wp_id, settings.cwd), "blocked")
             context.journal.emit("wp-blocked", str(error), {"wp": wp_id})

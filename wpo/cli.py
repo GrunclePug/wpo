@@ -107,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     delegate_commands.add_parser("list")
     delegate_run = delegate_commands.add_parser("run")
     delegate_run.add_argument("--name", required=True)
+    delegate_run.add_argument("--token", help=argparse.SUPPRESS)
 
     supervise = commands.add_parser("supervise", help="run a lane or milestone unattended (normally via `lanes resume`)")
     target = supervise.add_mutually_exclusive_group(required=True)
@@ -590,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
             elif arguments.delegate_command == "list":
                 delegation.list()
             else:
-                delegation.run_worker(arguments.name)
+                delegation.run_worker(arguments.name, arguments.token)
         except DelegateError as error:
             print(f"delegate error: {error}", file=sys.stderr)
             return 2
