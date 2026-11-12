@@ -290,6 +290,12 @@ class Bridge:
             requests.append(request)
         return requests
 
+    def wp_requests(self, wp_id: str, kind: str | None = None, role: str | None = None) -> list[dict]:
+        """The WP's requests, oldest first, optionally of one kind and one role."""
+        return sorted((request for request in self.requests() if request["payload"].get("wp") == wp_id
+                       and kind in (None, request["kind"]) and role in (None, request["payload"].get("role"))),
+                      key=lambda request: request["created_at"])
+
     def pending(self, coordinator: str) -> list[dict]:
         return [request for request in self.requests() if request["coordinator_thread_id"] == coordinator
                 and request["state"] in ("pending", "claimed", "running", "waiting", "stalled")]
@@ -309,7 +315,7 @@ class Bridge:
         # wakes the host agent, which records the result using `t3 complete`.
         while True:
             current = read_json(self.request_path(request["id"]))
-            if current["state"] in ("done", "failed", "cancelled"):
+            if current["state"] in TERMINAL_STATES:
                 return current
             if current["state"] == "stalled":
                 raise T3Error(current["detail"])
@@ -497,7 +503,7 @@ class Bridge:
 
     def complete(self, request_id: str, result: dict) -> dict:
         state = result.get("state", "done")
-        if state not in ("done", "failed", "cancelled"):
+        if state not in TERMINAL_STATES:
             raise T3Error("A completion state must be done, failed or cancelled")
         path = self.request_path(request_id)
         # What a scope-checked task changed, recorded when it completes: a later finish (the worker
@@ -548,7 +554,7 @@ class Bridge:
                 raise T3Error("The native response has no taskId; record its error as a failed completion")
             if request.get("task_id") and request["task_id"] != response.get("taskId"):
                 raise T3Error("A second native task was returned for one request; cancel the duplicate explicitly")
-            state = request["state"] if request["state"] in ("done", "failed", "cancelled") else "running"
+            state = request["state"] if request["state"] in TERMINAL_STATES else "running"
             request.update(state=state, task_id=response.get("taskId"), thread_id=response.get("childThreadId"), started_at=time.time(),
                            link=response.get("link"), native_response=response, updated_at=time.time())
             write_json(path, request)
@@ -564,7 +570,7 @@ class Bridge:
         guard writes or checks happens before the request is published; the coordinator is woken
         only after the guard has exited."""
         guard = guard or contextlib.nullcontext
-        receipt = log_path.with_name(log_path.name + ".t3-invocation.json")
+        receipt = receipt_path(log_path)
         with FileLock(receipt.with_suffix(".lock")):
             previous = read_json(receipt)
             if previous is not None and not previous["consumed"]:
@@ -601,9 +607,7 @@ class Bridge:
         while it is not terminal: finishing a long-ended one now would scope-check it against a
         checkout that has moved on since."""
         found = []
-        for request in self.requests():
-            if not request or request.get("kind") != "session" or request["payload"].get("wp") != wp_id:
-                continue
+        for request in self.wp_requests(wp_id, "session"):
             if request["payload"].get("role") == "worker":
                 # The worker barrier finishes a stopped worker, once nothing of the WP still runs.
                 if not request.get("consumed_at") and not is_legacy(request):
@@ -614,13 +618,13 @@ class Bridge:
                     found.append(request)
                 continue
             log_path = request["payload"].get("log_path")
-            receipt = read_json(Path(log_path).with_name(Path(log_path).name + ".t3-invocation.json")) if log_path else None
+            receipt = read_json(receipt_path(Path(log_path))) if log_path else None
             if receipt is None:
                 if request["state"] not in TERMINAL_STATES:
                     found.append(request)
             elif receipt["request_id"] == request["id"] and not receipt["consumed"]:
                 found.append(request)
-        return sorted(found, key=lambda request: request["created_at"])
+        return found
 
     def cancel_request(self, request: dict, why: str, origin: str) -> dict:
         """Asks for a request to be cancelled; `origin` is one of CANCEL_ORIGIN_RANK. The origin is
@@ -651,20 +655,19 @@ class Bridge:
         """Cancels every matching request. A failed wake does not stop the rest: each cancel's
         intent is on its request before its wake, and the failures are raised together after."""
         failures = []
-        for request in self.requests():
-            if request["state"] in ("done", "failed", "cancelled"):
+        for request in self.wp_requests(wp_id, role=role):
+            if request["state"] in TERMINAL_STATES:
                 continue
-            if request["payload"].get("wp") == wp_id and (role is None or request["payload"].get("role") == role):
-                try:
-                    self.cancel_request(request, why, origin)
-                except (T3Error, OSError, subprocess.TimeoutExpired) as error:
-                    failures.append(f"{request['id']}: {error}")
+            try:
+                self.cancel_request(request, why, origin)
+            except (T3Error, OSError, subprocess.TimeoutExpired) as error:
+                failures.append(f"{request['id']}: {error}")
         if failures:
             raise T3Error(f"cancelling {wp_id}'s requests could not wake their coordinator: {'; '.join(failures)}")
 
     def recover(self, coordinator: str | None = None) -> int:
         requests = self.requests()
-        outstanding = [request for request in requests if request["state"] not in ("done", "failed", "cancelled")
+        outstanding = [request for request in requests if request["state"] not in TERMINAL_STATES
                        and (coordinator is None or request["coordinator_thread_id"] == coordinator)]
         for target in sorted({request["coordinator_thread_id"] for request in outstanding}):
             self.wake(target, force=True)
@@ -761,7 +764,7 @@ def cli_command(context: Context, arguments) -> int:
             original = completed["payload"].get("original_request_id")
             if original:
                 current = read_json(bridge.request_path(original))
-                if current["state"] not in ("done", "failed", "cancelled"):
+                if current["state"] not in TERMINAL_STATES:
                     bridge.complete(original, {"state": "cancelled", "detail": completed["payload"].get("reason"), "task_id": current.get("task_id")})
         if completed["kind"] == "message" and completed["state"] == "done" and completed["payload"].get("message_path"):
             from .inbox import mark_delivered
@@ -814,7 +817,7 @@ def run_attempt(context: Context, route: dict, prompt: str, log_path: Path, sett
         with NamedMutex(context.project.mutex_name("t3-scope", key)):
             bridge = Bridge(context)
             lease = read_json(bridge.directory / "scope" / f"{key}.json")
-            receipt = read_json(log_path.with_name(log_path.name + ".t3-invocation.json"))
+            receipt = read_json(receipt_path(log_path))
             # Our own reconnect, to the request the lease names, is admitted; a reused log path
             # with a new generation is checked like any other task.
             if lease and not (receipt and not receipt["consumed"] and receipt["request_id"] == lease["request_id"]):
@@ -936,6 +939,11 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
         if settings.inbox:
             clear_live(settings.inbox)
     return finish_attempt(context, request, settings.on_finished, handoff_reason=controls.handoff_reason)
+
+
+def receipt_path(log_path: Path) -> Path:
+    """A session log's invocation receipt: which request the log's current generation runs."""
+    return log_path.with_name(log_path.name + ".t3-invocation.json")
 
 
 def scope_key(cwd: Path) -> str:
@@ -1064,7 +1072,7 @@ def finish_attempt(context: Context, request: dict, on_finished=None, recovery: 
                 current = read_json(path)
                 current.update(disposition=disposition, violation=violation, consumed_at=time.time())
                 write_json(path, current)
-            receipt = log_path.with_name(log_path.name + ".t3-invocation.json")
+            receipt = receipt_path(log_path)
             with FileLock(receipt.with_suffix(".lock")):
                 recorded = read_json(receipt)
                 if recorded is not None and recorded["request_id"] == completed["id"] and not recorded["consumed"]:
