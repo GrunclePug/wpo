@@ -37,7 +37,7 @@ from .review_brief import ReviewBrief, build_review_brief
 from .routing import Route, RoutingError, model_family_of, record_wp_mode, resolve_work_spec, spec_mode, with_mode, wp_mode
 from .session import CompactionStop, NoRouteError, ResumeFailed, ResumeTarget, SessionCancelled, SessionResult, run_session, session_facts
 from .session_brief import builder_skills, included_files, reviewer_skills
-from .session_commands import HANDOFF_FILE, SESSION_VERIFIED_TREE_FILE
+from .session_commands import HANDOFF_FILE, SESSION_VERIFIED_TREE_FILE, checks_fingerprint, outside_owns
 from .whats_new import NOTHING_TO_TRY, TRY_IT_SECTION, try_it_problem
 
 EXIT_NO_ROUTE = 4
@@ -1186,12 +1186,21 @@ class WorkPackageRun:
         record = self.run_dir / SESSION_VERIFIED_TREE_FILE
         if not record.exists():
             return False
-        verified = record.read_text(encoding="utf-8").strip()
-        changed = git(self.tree, "diff", "--name-only", verified, worktree_tree_id(self.tree), check=False)
+        try:
+            saved = json.loads(record.read_text(encoding="utf-8"))
+        except ValueError:
+            return False  # a record from before fingerprints: verify once more
+        wp = self.wp()
+        if not isinstance(saved, dict) or saved.get("checks") != checks_fingerprint(self.context, wp, self.tree):
+            return False
+        changed = git(self.tree, "diff", "--name-only", saved["tree"], worktree_tree_id(self.tree), check=False)
         if changed.returncode != 0:
             return False
-        wp_path = wp_relative(self.context, self.wp())
-        return all(path == wp_path for path in changed.stdout.splitlines() if path)
+        wp_path = wp_relative(self.context, wp)
+        if not all(path == wp_path for path in changed.stdout.splitlines() if path):
+            return False
+        # The owns check reads main's current contents: main moving can fail an unchanged tree.
+        return not outside_owns(self.context, wp, self.tree)
 
     def defer_verification(self, failures: list[CommandFailure]) -> None:
         """Every failed check failed on the machine (killed, out of disk or memory), so the code was
