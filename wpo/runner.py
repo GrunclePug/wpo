@@ -1294,7 +1294,6 @@ class WorkPackageRun:
             self.log(f"no route for a repair session ({spec}): {error}; the builder gets the failure")
             return False
         except SessionCancelled as cancelled:
-            # As in `session`: the operator stopped it, so the run ends as a pause, not a failure.
             raise RunPaused(None, f"the repair session was {cancelled}") from cancelled
         self.log(f"repair session ran on {result.route['id']}{result.fallback_note} for {commands}")
         return True

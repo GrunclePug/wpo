@@ -209,7 +209,6 @@ End with a short report: the files you changed, the commands you ran to check yo
         except NoRouteError as error:
             state.update(state="no-route", detail=str(error))
         except SessionCancelled as cancelled:
-            # The builder's worker cleanup (or the operator) stopped it: no other route is tried.
             state.update(state="failed", detail=f"stopped: {cancelled}")
         except Exception as error:  # the lead must learn of any failure, whatever its type
             if getattr(error, "stalled_wp", None):
