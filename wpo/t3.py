@@ -109,6 +109,15 @@ class Bridge:
             raise T3Error("No T3 coordinator is attached. In a T3 thread for this repository, load wp-orchestration and run wpo t3 attach with its live capability result. No CLI fallback is permitted.")
         return thread
 
+    def coordinator_family(self) -> str | None:
+        """The route family of the provider the coordinator was attached from (the capability
+        result's inheritedProviderInstanceId mapped back through `t3.providers`), or None."""
+        inherited = (read_json(self.directory / "capabilities.json") or {}).get("inheritedProviderInstanceId")
+        for family, provider in self.settings.get("providers", {}).items():
+            if inherited and (provider.get("providerInstanceId") if isinstance(provider, dict) else provider) == inherited:
+                return family
+        return None
+
     def capabilities(self) -> dict:
         cached = read_json(self.directory / "capabilities.json")
         if not cached:

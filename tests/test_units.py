@@ -1475,6 +1475,48 @@ class ContradictoryReviewTests(ScratchT3ProjectCase):
         self.assertEqual(self.review("RULING R1-F1 STILL-OPEN: the fix does not remove the defect\nVERDICT: PASS"), "changes_requested")
 
 
+class OrchestratorRoomTests(ScratchT3ProjectCase):
+    """A finishing lane waits for room on the orchestrator's own model family."""
+
+    def room(self, windows: dict, inherited: str | None = None) -> tuple[bool, list[str]]:
+        from wpo.t3 import write_json
+        capabilities = {"parentThreadId": "coordinator", "providers": []}
+        if inherited:
+            capabilities["inheritedProviderInstanceId"] = inherited
+        write_json(self.project.runs_dir / "t3" / "capabilities.json", capabilities)
+        supervisor = self.supervisor()
+        slept = []
+
+        def sleep(wake_at, reason):
+            slept.append(reason)
+            raise StopIteration
+        supervisor.sleep_until = sleep
+        supervisor.set_state = lambda state: None
+
+        def window(used):
+            return [{"label": "5h", "used_percent": used, "resets_at": time.time() + 3600, "window_seconds": 18000}]
+        with mock.patch.object(self.context.router, "usage_windows", return_value={family: window(used) for family, used in windows.items()}):
+            try:
+                result = supervisor.wait_for_orchestrator_room()
+            except StopIteration:
+                result = False
+        return result, slept
+
+    def test_a_coordinator_attached_from_codex_waits_on_gpt(self) -> None:
+        self.assertEqual(self.room({"gpt": 10, "claude": 99}, inherited="codex"), (True, []))
+        self.assertEqual(self.room({"gpt": 95, "claude": 10}, inherited="codex")[1], ["waiting for gpt room before handing back to the orchestrator"])
+
+    def test_without_the_attach_record_it_is_claude(self) -> None:
+        self.assertEqual(self.room({"gpt": 10, "claude": 99})[1], ["waiting for claude room before handing back to the orchestrator"])
+
+    def test_the_setting_wins(self) -> None:
+        self.project.config["orchestrator_family"] = "gpt"
+        self.assertEqual(self.room({"gpt": 10, "claude": 99}, inherited="claudeAgent"), (True, []))
+
+    def test_unknown_usage_does_not_hold_the_finish(self) -> None:
+        self.assertEqual(self.room({"claude": 99}, inherited="codex"), (True, []))
+
+
 class IntegrationChecksTests(unittest.TestCase):
     """The full checks run only on the merge, and a check that writes into the tree fails it."""
 

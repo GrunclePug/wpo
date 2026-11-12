@@ -482,19 +482,34 @@ class Supervisor:
         picked[1].release()
         return True
 
+    def orchestrator_family(self) -> str:
+        """The model family the orchestrator runs on: `orchestrator_family`, else under T3 the
+        family its coordinator was attached from, else claude."""
+        if family := self.project.config["orchestrator_family"]:
+            return family
+        if self.context.machine.execution_mode == "t3":
+            from .t3 import Bridge
+            if family := Bridge(self.context).coordinator_family():
+                return family
+        return "claude"
+
     def wait_for_orchestrator_room(self) -> bool:
-        """"finished" wakes the orchestrator, which runs on Claude; wait until Claude has room.
-        Returns False when runnable work appeared meanwhile, so the lane resumes instead."""
+        """"finished" wakes the orchestrator; wait until its model family has room. Unknown usage
+        does not hold it: the hold saves quota, it does not wait for a reading. Returns False when
+        runnable work appeared meanwhile, so the lane resumes instead."""
         threshold = self.project.config["orchestrator_room_percent"]
+        family = self.orchestrator_family()
         while threshold is not None:
-            windows = self.context.router.usage_windows().get("claude")
+            windows = self.context.router.usage_windows().get(family)
             five_hour = next((window for window in windows or [] if window["window_seconds"] <= 18000), None)
-            if five_hour and five_hour["used_percent"] < threshold:
+            if five_hour is None:
+                self.log(f"{family} usage is unknown; handing back to the orchestrator without waiting for room")
                 return True
-            wake_at = datetime.fromtimestamp(float(five_hour["resets_at"]), timezone.utc) + timedelta(minutes=2) if five_hour \
-                else datetime.now(timezone.utc) + UNKNOWN_ROUTE_RECHECK
+            if five_hour["used_percent"] < threshold:
+                return True
+            wake_at = datetime.fromtimestamp(float(five_hour["resets_at"]), timezone.utc) + timedelta(minutes=2)
             self.set_state("sleeping")
-            self.sleep_until(min(wake_at, datetime.now(timezone.utc) + POOL_IDLE_RECHECK), "waiting for Claude room before handing back to the orchestrator")
+            self.sleep_until(min(wake_at, datetime.now(timezone.utc) + POOL_IDLE_RECHECK), f"waiting for {family} room before handing back to the orchestrator")
             if self.work_appeared():
                 self.take_lane_slot()
                 return False
