@@ -739,6 +739,81 @@ class QuotaGroupTests(unittest.TestCase):
         self.assertEqual(target.call_count, 1, "one oracle checks a route's native target once")
 
 
+class FreshUsageTests(unittest.TestCase):
+    """A stale usage reading never makes Claude or GPT available, and can still block a quota group."""
+
+    def router(self, usage: dict, script: str | None = None, machine_routing: dict | None = None) -> routing.Router:
+        directory = Path(tempfile.mkdtemp())
+        machine = machine_in(directory)
+        machine.raw["routing"] = machine_routing or {}
+        cache = directory / "usage.json"
+        cache.write_text(json.dumps(usage), encoding="utf-8")
+        machine.raw["usage"] = {**machine.raw["usage"], "cache": str(cache), "max_age_seconds": 300}
+        if script is not None:
+            (directory / "usage.py").write_text(script, encoding="utf-8")
+            machine.raw["usage"]["script"] = str(directory / "usage.py")
+        return routing.Router(machine)
+
+    @staticmethod
+    def family(name: str, used: float, fetched_at: float | None = None) -> dict:
+        resets = (routing.now_utc() + timedelta(hours=2)).timestamp()
+        windows = [{"label": "5h", "used_percent": used, "resets_at": resets, "window_seconds": 18000},
+                   {"label": "weekly", "used_percent": used, "resets_at": resets + 86400, "window_seconds": 7 * 86400}]
+        return {"family": name, "plan": None, "windows": windows, "notes": [], "error": None, **({"fetched_at": fetched_at} if fetched_at else {})}
+
+    def opus(self) -> routing.Route:
+        return next(route for route in routing.static_routes(routing.load_policy()) if route.family == "claude")
+
+    def test_a_days_old_reading_is_unknown_for_routing(self) -> None:
+        old = time.time() - 48 * 3600
+        stale = self.router({"fetched_at": old, "families": [self.family("claude", 5.0)]})
+        availability = stale.oracle().route(self.opus())
+        self.assertFalse(availability.available)
+        self.assertIn("usage unknown", availability.reason)
+        fresh = self.router({"fetched_at": time.time(), "families": [self.family("claude", 5.0)]})
+        self.assertTrue(fresh.oracle().route(self.opus()).available, "the same reading, fresh, allows it")
+        self.assertIsNotNone(stale.usage_windows(refresh=False)["claude"], "the dashboard still shows the stale reading")
+
+    def test_one_familys_old_reading_under_a_fresh_snapshot(self) -> None:
+        old = time.time() - 48 * 3600
+        router = self.router({"fetched_at": time.time(), "families": [self.family("claude", 5.0, fetched_at=old), self.family("gpt", 5.0)]})
+        windows = router.usage_windows()
+        self.assertIsNone(windows["claude"])
+        self.assertIsNotNone(windows["gpt"])
+
+    def test_a_stale_quota_group_reading_still_blocks_and_never_allows_more(self) -> None:
+        quota = {"groups": {"agy-gemini": {"family": "agy", "buckets": ["5h"]}}, "ceilings": {"five_hour": 70, "weekly": 85}}
+        flash = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "agy-gemini-flash-high")
+        old = time.time() - 48 * 3600
+        over = self.router({"fetched_at": old, "families": [self.family("agy", 95.0)]}, machine_routing={"quota_groups": quota})
+        self.assertFalse(over.oracle().route(flash).available, "a stale reading over the ceiling still blocks the group")
+        under = self.router({"fetched_at": old, "families": [self.family("agy", 10.0)]}, machine_routing={"quota_groups": quota})
+        self.assertTrue(under.oracle().route(flash).available, "under the ceiling it allows, as unknown usage does")
+
+    def test_concurrent_failing_refreshes_neither_crash_nor_repeat(self) -> None:
+        import threading
+        runs = Path(tempfile.mkdtemp()) / "runs"
+        script = f"import pathlib, time\nwith open({str(runs)!r}, 'a') as f: f.write('x')\ntime.sleep(0.6)\n"
+        router = self.router({"fetched_at": time.time() - 3600, "families": [self.family("claude", 5.0)]}, script=script)
+        errors, barrier = [], threading.Barrier(3)
+
+        def call():
+            barrier.wait()
+            try:
+                router.usage_windows()
+            except Exception as error:  # noqa: BLE001 - any exception fails the test
+                errors.append(error)
+        with mock.patch.object(routing, "USAGE_REFRESH_LOCK_SECONDS", 0.1):
+            threads = [threading.Thread(target=call) for _ in range(3)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            router.usage_windows()  # a fourth caller after the failure backs off too
+        self.assertEqual(errors, [])
+        self.assertEqual(runs.read_text(), "x", "the failing script ran once")
+
+
 class EventTests(unittest.TestCase):
     def test_emit_read_cursor_and_quiet_wait(self) -> None:
         journal = Journal(Path(tempfile.mkdtemp()))

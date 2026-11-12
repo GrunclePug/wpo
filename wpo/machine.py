@@ -67,6 +67,9 @@ DEFAULTS: dict = {
         # Every reading usage_budget.py fetched, one JSON row per window: the burn-rate source.
         "history": "~/.local/state/wp-orchestration/usage-budget-history.jsonl",
         "max_age_seconds": 300,
+        # A family's reading older than this (its own fetched_at, else the snapshot's) is unknown for
+        # routing, which blocks Claude and GPT routes safely; the dashboard still shows it.
+        "max_reading_age_seconds": 1800,
     },
     "keys": {
         "openrouter": "~/.config/wp-orchestration/keys/openrouter",
@@ -193,6 +196,10 @@ class MachineConfig:
     @property
     def usage_max_age_seconds(self) -> float:
         return float(self.raw["usage"]["max_age_seconds"])
+
+    @property
+    def usage_max_reading_age_seconds(self) -> float:
+        return float(self.raw["usage"].get("max_reading_age_seconds", 1800))
 
     def key_file(self, name: str) -> Path:
         return _expand(self.raw["keys"][name])

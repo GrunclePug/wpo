@@ -28,7 +28,8 @@
     "script": "~/.config/wp-orchestration/usage_budget.py",
     "cache": "~/.local/state/wp-orchestration/usage-budget-cache.json",
     "history": "~/.local/state/wp-orchestration/usage-budget-history.jsonl",
-    "max_age_seconds": 300
+    "max_age_seconds": 300,
+    "max_reading_age_seconds": 1800
   },
   "keys": {
     "openrouter": "~/.config/wp-orchestration/keys/openrouter",

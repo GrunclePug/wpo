@@ -133,7 +133,11 @@ settings fail with an error naming the setting.
 ```
 
 The usage adapter (machine `usage.script`, not bundled) writes the cache at `usage.cache`; wpo
-reads it as JSON and runs the script when the cache is older than `usage.max_age_seconds`:
+reads it as JSON and runs the script when the cache is older than `usage.max_age_seconds`. A
+refresh that leaves the cache stale is not retried by every waiting supervisor in turn, and for
+routing a family's reading older than `usage.max_reading_age_seconds` (1800; its own `fetched_at`
+when given, else the snapshot's) counts as unknown, which blocks Claude and GPT routes. Quota
+groups still read stale windows, since there a reading can only block; the dashboard shows them all:
 
 ```json
 {
