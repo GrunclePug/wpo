@@ -37,10 +37,15 @@ def main() -> None:
         for command in ([sys.executable, "-I", "-m", "wpo"], [sys.executable, "-I", "-B", str(wpo.ENTRY_POINT)]):
             if "t3" not in run(*command, "--help", cwd=root, environment=environment):
                 raise RuntimeError("Installed CLI omitted the native backend")
+            if "continue" not in run(*command, "continuous", "--help", cwd=root, environment=environment):
+                raise RuntimeError("Installed CLI omitted continuous operation")
         run(sys.executable, "-I", "-m", "wpo", "init", "--name", "installed-check", cwd=root, environment=environment)
         config = json.loads((root / ".orchestration/config.json").read_text(encoding="utf-8"))
         if config["name"] != "installed-check":
             raise RuntimeError("Installed project template was not applied")
+        state = json.loads(run(sys.executable, "-I", "-m", "wpo", "continuous", "status", cwd=root, environment=environment))
+        if state["policy"]["enabled"] or state["scheduler"]["state"] != "not_started":
+            raise RuntimeError("Installed continuous operation must remain opt-in")
     print("Installed wheel passed: resources, module/helper CLIs, and project initialization.")
 
 

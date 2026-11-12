@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     from .t3 import add_cli
     add_cli(commands)
+    from .continuous import add_cli as add_continuous_cli
+    add_continuous_cli(commands)
 
     route = commands.add_parser("route", help="the tier router")
     route_commands = route.add_subparsers(dest="route_command", required=True)
@@ -395,6 +397,14 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "t3":
         from .t3 import cli_command
         return cli_command(context, arguments)
+
+    if arguments.command == "continuous":
+        from .continuous import cli_command
+        try:
+            return cli_command(context, arguments)
+        except (TypeError, ValueError) as error:
+            print(f"continuous: {error}", file=sys.stderr)
+            return 2
 
     if arguments.command == "dashboard":
         return dashboard_command(context, arguments)

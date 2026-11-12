@@ -168,6 +168,8 @@ DEFAULTS: dict = {
     # one more waits until a slot frees, so parallel lanes do not run more full builds than the
     # disks and memory carry. Integration takes none (one runs at a time anyway). 0: no limit.
     "build_slots": 0,
+    # Continuous operation is opt-in via `wpo continuous start`; all values are local policy.
+    "continuous": {"interval_seconds": 30, "checkpoint_seconds": 3600, "no_progress_seconds": 1800, "failed_rounds": 3},
     # Lanes `wpo lanes resume` keeps live at once, pool lanes not counted; lanes nearest to merging
     # (WPs in review or changes requested) start first. 0: no limit.
     "max_active_lanes": 0,

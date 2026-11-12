@@ -70,6 +70,11 @@ only; running/stalled entries are not new launch requests.
   reason recurring is a new request and wakes the coordinator again. The original journal keeps every row.
 
 Before the first `delegate_task` in each thread, call `orchestrator_capabilities` as required by T3.
+Save auxiliary response/callback JSON outside `<runs>/t3/requests/`, for example
+under `<runs>/t3/receipts/`. The requests directory is reserved for canonical
+32-hex request records; auxiliary filenames are ignored and malformed canonical
+records stop processing with their path rather than being treated as launch plans.
+
 Persist the native response using `wpo t3 started --request <id> --response-file <json>`, preferably
 within the same code-mode tool execution as the native launch, before yielding control. Use the raw
 tool response or its structured content. Then honor the returned `next`: end the turn when told.

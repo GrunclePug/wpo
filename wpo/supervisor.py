@@ -35,7 +35,7 @@ from . import wpfile
 from .commands import run_commands
 from .context import Context
 from .integrate import EXIT_MEANINGS, EXIT_MERGED
-from .platform import NamedMutex, spawn_detached
+from .platform import FileLock, NamedMutex, spawn_detached
 from .project import git
 from .routing import with_mode, wp_mode
 from .runner import EXIT_NO_ROUTE, LEDGER_FILE, NO_ROUTE_FILE, RoundLedger, session_env
@@ -104,8 +104,12 @@ class Supervisor:
 
     def claim(self, wp_id: str) -> NamedMutex | None:
         """Claims a WP machine-wide for this supervisor; None when another supervisor runs it."""
-        mutex = NamedMutex(self.project.mutex_name("wp", wp_id))
-        return mutex if mutex.acquire(blocking=False) else None
+        from .continuous import admit
+        with FileLock(self.project.runs_dir / "continuous" / "admission.lock"):
+            if not admit(self.context, wp_id):
+                return None
+            mutex = NamedMutex(self.project.mutex_name("wp", wp_id))
+            return mutex if mutex.acquire(blocking=False) else None
 
     def report_parse_errors(self) -> None:
         for path, error in self.context.parse_errors.items():
@@ -155,7 +159,8 @@ class Supervisor:
     def next_wp(self) -> tuple[wpfile.WorkPackage, NamedMutex] | None:
         """The next runnable WP, claimed; release the claim when its run ends."""
         merged = self.context.merged_done_ids()
-        effective = self.context.effective_wps()
+        from .continuous import block_reason
+        effective = [wp for wp in self.context.effective_wps() if not block_reason(self.context, wp.id)]
         self.report_parse_errors()
         from .lanes import read_holds
         if self.name in read_holds(self.context):
@@ -452,6 +457,7 @@ class Supervisor:
 
     def loop(self) -> None:
         while True:
+            from .continuous import block_reason
             # A WP that finished but did not merge (a conflict since resolved, an interrupted
             # supervisor) is merged before new work starts. A WP committed as done on main is
             # settled (by its integration, or by the orchestrator through `wpo commit-main`):
@@ -460,7 +466,8 @@ class Supervisor:
             main_copies = self.context.main_wps()
             merged = self.context.merged_done_ids(main_copies)
             for wp in self.context.effective_wps(main_copies):
-                if (wp.status == "done" and wp.id not in merged and self.selected(wp) and wp.id not in self.integration_failed
+                if (wp.status == "done" and wp.id not in merged and not block_reason(self.context, wp.id)
+                        and self.selected(wp) and wp.id not in self.integration_failed
                         and self.project.worktree(wp.id).exists() and self.settled_for_integration(wp)):
                     self.integrate(wp.id)
             picked = self.next_wp()
@@ -541,6 +548,9 @@ class Supervisor:
                 if self.integration_failed:
                     break
                 self.log(f"no runnable {self.name} work package left")
+                from .continuous import manages_lane
+                if manages_lane(self.context, self.name):
+                    break
                 if self.wait_for_orchestrator_room():
                     break
                 self.log("a work package became runnable while waiting; resuming")

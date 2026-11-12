@@ -63,6 +63,20 @@ class T3BackendTests(unittest.TestCase):
         with mock.patch.object(Bridge, "wake"):
             return self.bridge.submit(kind, key, payload, "coordinator")
 
+    def test_auxiliary_receipts_never_become_native_requests(self) -> None:
+        request = self.submit()
+        write_json(self.bridge.directory / "requests" / (request["id"] + ".started.json"), {"taskId": "native"})
+        self.assertEqual([item["id"] for item in self.bridge.pending("coordinator")], [request["id"]])
+        with mock.patch.object(Bridge, "wake"):
+            self.assertEqual(self.bridge.recover("coordinator"), 1)
+            self.bridge.cancel_wp("WP-0001", "test", "operator")
+
+    def test_malformed_canonical_request_fails_with_its_path(self) -> None:
+        path = self.bridge.directory / "requests" / ("f" * 32 + ".json")
+        write_json(path, {"taskId": "wrong record"})
+        with self.assertRaisesRegex(T3Error, "Malformed native request record"):
+            self.bridge.pending("coordinator")
+
     def test_target_uses_exact_native_provider_model_and_effort_option(self) -> None:
         self.assertEqual(self.bridge.target(ROUTE), {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "high"}})
         with self.assertRaisesRegex(T3Error, "unavailable or disabled"):

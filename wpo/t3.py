@@ -277,9 +277,21 @@ class Bridge:
             self.wake(coordinator, created_after=request["created_at"])
         return request
 
+    def requests(self) -> list[dict]:
+        """Read canonical request records; auxiliary response files are not requests."""
+        requests = []
+        for path in sorted((self.directory / "requests").glob("*.json")):
+            if len(path.stem) != 32 or any(character not in "0123456789abcdef" for character in path.stem):
+                continue
+            request = read_json(path)
+            if (not isinstance(request, dict) or request.get("id") != path.stem
+                    or not {"kind", "state", "coordinator_thread_id", "payload"} <= request.keys()):
+                raise T3Error(f"Malformed native request record: {path}")
+            requests.append(request)
+        return requests
+
     def pending(self, coordinator: str) -> list[dict]:
-        return [request for path in sorted((self.directory / "requests").glob("*.json"))
-                if (request := read_json(path)) and request["coordinator_thread_id"] == coordinator
+        return [request for request in self.requests() if request["coordinator_thread_id"] == coordinator
                 and request["state"] in ("pending", "claimed", "running", "waiting", "stalled")]
 
     def update(self, request_id: str, **fields) -> dict:
@@ -589,8 +601,7 @@ class Bridge:
         while it is not terminal: finishing a long-ended one now would scope-check it against a
         checkout that has moved on since."""
         found = []
-        for path in (self.directory / "requests").glob("*.json"):
-            request = read_json(path)
+        for request in self.requests():
             if not request or request.get("kind") != "session" or request["payload"].get("wp") != wp_id:
                 continue
             if request["payload"].get("role") == "worker":
@@ -640,8 +651,7 @@ class Bridge:
         """Cancels every matching request. A failed wake does not stop the rest: each cancel's
         intent is on its request before its wake, and the failures are raised together after."""
         failures = []
-        for path in (self.directory / "requests").glob("*.json"):
-            request = read_json(path)
+        for request in self.requests():
             if request["state"] in ("done", "failed", "cancelled"):
                 continue
             if request["payload"].get("wp") == wp_id and (role is None or request["payload"].get("role") == role):
@@ -653,7 +663,7 @@ class Bridge:
             raise T3Error(f"cancelling {wp_id}'s requests could not wake their coordinator: {'; '.join(failures)}")
 
     def recover(self, coordinator: str | None = None) -> int:
-        requests = [read_json(path) for path in (self.directory / "requests").glob("*.json")]
+        requests = self.requests()
         outstanding = [request for request in requests if request["state"] not in ("done", "failed", "cancelled")
                        and (coordinator is None or request["coordinator_thread_id"] == coordinator)]
         for target in sorted({request["coordinator_thread_id"] for request in outstanding}):
@@ -714,7 +724,7 @@ def cli_command(context: Context, arguments) -> int:
         bridge.attach(arguments.thread, unwrap_result(read_json(arguments.capabilities_file)), unwrap_result(read_json(arguments.workspace_file)))
         print("Attached T3 coordinator; existing WP statuses, holds, and supervisors were not resumed.")
     elif command == "status":
-        requests = [read_json(path) for path in (bridge.directory / "requests").glob("*.json")]
+        requests = bridge.requests()
         print(json.dumps({"backend": context.machine.execution_mode, "coordinator_thread_id": bridge.coordinator,
                           "capabilities_recorded": (bridge.directory / "capabilities.json").is_file(),
                           "requests": {state: sum(r["state"] == state for r in requests) for state in ("pending", "running", "waiting", "stalled", "done", "failed", "cancelled")},
