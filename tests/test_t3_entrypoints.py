@@ -7,7 +7,6 @@ import dataclasses
 import json
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -17,28 +16,24 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # native_fixtures
+
+from native_fixtures import CAPABILITIES, ROUTE, NativeTestCase, init_repository
 
 from wpo import dashboard, session
-from wpo.context import Context
-from wpo.events import Journal
 from wpo.integrate import Integration
-from wpo.machine import DEFAULTS as MACHINE_DEFAULTS
-from wpo.machine import MachineConfig
-from wpo.project import DEFAULTS as PROJECT_DEFAULTS
 from wpo.project import Project, git
-from wpo.routing import AvailabilityOracle, Route, Router
+from wpo.routing import AvailabilityOracle, Route
 from wpo.session_brief import SessionBrief
-from wpo.t3 import Bridge, T3Error, cli_command, read_json, run_attempt, write_json
-
-CAPABILITIES = {
-    "parentThreadId": "coordinator", "providers": [
-        {"providerInstanceId": "codex", "canRunChildTask": True, "models": [
-            {"id": "gpt-6.1-sol", "options": [{"id": "reasoningEffort", "values": ["low", "high"]}]}
-        ]},
-        {"providerInstanceId": "claudeAgent", "canRunChildTask": False, "models": []},
-    ],
-}
-ROUTE = {"id": "gpt-sol-high", "family": "gpt", "harness": "gpt", "model": "sol", "effort": "high", "cost_class": "subscription"}
+from wpo.t3 import (
+    Bridge,
+    T3Error,
+    cli_command,
+    read_json,
+    receipt_path,
+    run_attempt,
+    write_json,
+)
 
 
 def finished_read(bridge, request, callback=None) -> dict:
@@ -46,18 +41,7 @@ def finished_read(bridge, request, callback=None) -> dict:
     return bridge.update(request["id"], state="done", result={"text": "read"})
 
 
-class T3BackendTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.scratch = tempfile.TemporaryDirectory(prefix="wpo-native-")
-        self.addCleanup(self.scratch.cleanup)
-        self.root = Path(self.scratch.name)
-        self.project = Project(self.root, {**PROJECT_DEFAULTS, "name": "scratch", "autofix": {}}, "t3")
-        self.machine = MachineConfig({**MACHINE_DEFAULTS, "state_dir": str(self.root / "state"), "dashboard": {"autostart": False},
-                                      "t3": {**MACHINE_DEFAULTS["t3"], "cli": sys.executable, "callback_interval_seconds": 0.001}})
-        self.context = Context(self.project, self.machine, Router(self.machine, project=self.project), Journal(self.project.runs_dir))
-        self.bridge = Bridge(self.context)
-        self.bridge.attach("coordinator", CAPABILITIES)
-
+class T3BackendTests(NativeTestCase):
     def submit(self, kind="session", key="one", payload=None):
         payload = payload or {"wp": "WP-0001", "prompt": "Do the task", "title": "test", "native_role": "implementation", "target": self.bridge.target(ROUTE)}
         with mock.patch.object(Bridge, "wake"):
@@ -287,7 +271,7 @@ class T3BackendTests(unittest.TestCase):
         legacy.assert_not_called()
 
     def test_native_result_preserves_existing_jsonl_and_session_identity(self) -> None:
-        settings = session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "builder"})
+        settings = self.settings()
         log = self.root / "session.log"
         def complete(bridge, request, callback=None):
             self.assertIn("--session", request["payload"]["prompt"])
@@ -303,7 +287,7 @@ class T3BackendTests(unittest.TestCase):
 
     def test_families_that_load_instructions_natively_get_the_native_brief(self) -> None:
         brief = SessionBrief(None, "", "full rules", native_text="native rules")
-        settings = session.SessionSettings("builder", ["src/**"], self.root, brief, {}, False, False, 30, {"role": "builder"})
+        settings = dataclasses.replace(self.settings(), brief=brief)
         prompts = []
         def complete(bridge, request, callback=None):
             prompts.append(request["payload"]["prompt"])
@@ -353,7 +337,7 @@ class T3BackendTests(unittest.TestCase):
 
     def finished_attempt(self, completed: dict, settings=None):
         """Runs a native attempt whose request comes back as `completed` (merged over the request)."""
-        settings = settings or session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "builder"})
+        settings = settings or self.settings()
         with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", lambda bridge, request, callback=None: bridge.update(request["id"], task_id="t", **completed)):
             return run_attempt(self.context, ROUTE, "Task", self.root / f"attempt-{uuid.uuid4().hex}.log", settings)
 
@@ -369,7 +353,7 @@ class T3BackendTests(unittest.TestCase):
         self.assertEqual(outcome.outcome, "session_error", "a quota cut-off keeps the failure path")
 
     def test_a_staged_compaction_stop_is_not_a_cleanup_cancel(self) -> None:
-        settings = session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, True, 30, {"role": "executor"})
+        settings = self.settings(stop_on_compaction=True, role="executor")
         with self.assertRaises(session.CompactionStop):
             self.finished_attempt({"state": "cancelled", "compacted": True, "cancel_origin": "cleanup"}, settings)
 
@@ -424,10 +408,7 @@ class T3BackendTests(unittest.TestCase):
 
     def native_session(self, log: Path, access: str = "builder", before_tree: str | None = None, **completion) -> dict:
         """A session request begun under `log` and completed with `completion`, as the bridge records it."""
-        payload = {**self.submit()["payload"], "route": ROUTE, "log_path": str(log), "cwd": str(self.root), "access": access,
-                   "write_paths": [], "before_tree": before_tree, "wp": None, "stop_on_compaction": False}
-        with mock.patch.object(Bridge, "wake"):
-            request, _ = self.bridge.begin_session(log, payload, "coordinator")
+        request = self.begin(log, wp=None, access=access, before_tree=before_tree)
         return self.bridge.update(request["id"], state="done", task_id="native", result={"text": "Done", "outcome": "ok"}, **completion)
 
     def test_two_finishes_of_one_request_consume_it_once(self) -> None:
@@ -441,7 +422,7 @@ class T3BackendTests(unittest.TestCase):
         self.assertEqual(read_json(self.bridge.request_path(request["id"]))["consumed_at"], first)
         self.assertEqual(writers, [], "an already consumed request only returns what was recorded")
         self.assertEqual(sum('"type": "result"' in line for line in log.read_text().splitlines()), 1)
-        self.assertTrue(read_json(log.with_name(log.name + ".t3-invocation.json"))["consumed"])
+        self.assertTrue(read_json(receipt_path(log))["consumed"])
 
     def test_a_finish_interrupted_before_consumption_is_replayed_once(self) -> None:
         from wpo import t3
@@ -470,14 +451,9 @@ class T3BackendTests(unittest.TestCase):
     def test_a_scope_violation_is_logged_as_an_error_live_and_in_recovery(self) -> None:
         from wpo.commands import worktree_tree_id
         from wpo.t3 import finish_attempt
-        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
-            git(self.root, *arguments)
-        code = self.root / "code.txt"
-        code.write_text("original\n")
-        git(self.root, "add", ".")
-        git(self.root, "commit", "-qm", "base")
+        self.repository()
         before = worktree_tree_id(self.root)
-        code.write_text("a reviewer's edit\n")
+        (self.root / "src" / "code.txt").write_text("a reviewer's edit\n")
         for recovery in (False, True):
             log = self.root / f"review-{recovery}.log"
             request = self.native_session(log, access="reviewer", before_tree=before)
@@ -491,21 +467,12 @@ class T3BackendTests(unittest.TestCase):
             self.assertIn("outside its access contract", result["result"])
 
     def repository(self) -> None:
-        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
-            git(self.root, *arguments)
-        (self.root / ".gitignore").write_text(".orchestration/\nstate/\n")
-        (self.root / "src").mkdir()
-        (self.root / "src" / "code.txt").write_text("original\n")
-        git(self.root, "add", ".")
-        git(self.root, "commit", "-qm", "base")
+        init_repository(self.root, {".gitignore": ".orchestration/\nstate/\n", "src/code.txt": "original\n"})
 
     def worker_request(self, log: Path) -> dict:
         """A pending worker session limited to `src/**`, begun in the scratch repository."""
         from wpo.commands import worktree_tree_id
-        payload = {**self.submit()["payload"], "route": ROUTE, "log_path": str(log), "cwd": str(self.root), "access": "worker",
-                   "write_paths": ["src/**"], "before_tree": worktree_tree_id(self.root), "wp": None, "stop_on_compaction": False}
-        with mock.patch.object(Bridge, "wake"):
-            return self.bridge.begin_session(log, payload, "coordinator")[0]
+        return self.begin(log, wp=None, role="worker", access="worker", write_paths=["src/**"], before_tree=worktree_tree_id(self.root))
 
     def test_a_task_is_judged_on_the_changes_it_had_at_completion(self) -> None:
         from wpo.t3 import finish_attempt
@@ -548,7 +515,7 @@ class T3BackendTests(unittest.TestCase):
                       read_json(self.bridge.request_path(request["id"]))["violation"])
 
     def read_session(self, log: str) -> tuple[session.SessionSettings, Path]:
-        return (session.SessionSettings("read", [], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "read"}),
+        return (self.settings("read", []),
                 self.project.runs_dir / log)
 
     def test_the_scope_lease_names_a_request_before_it_is_published(self) -> None:
@@ -556,7 +523,7 @@ class T3BackendTests(unittest.TestCase):
         settings, log = self.read_session("first.log")
         with mock.patch.object(Bridge, "submit", side_effect=RuntimeError("killed at the submit")), self.assertRaises(RuntimeError):
             run_attempt(self.context, ROUTE, "Read", log, settings)
-        receipt = read_json(log.with_name(log.name + ".t3-invocation.json"))
+        receipt = read_json(receipt_path(log))
         lease = read_json(next((self.bridge.directory / "scope").glob("*.json")))
         self.assertEqual(lease["request_id"], receipt["request_id"])
         settings, log = self.read_session("second.log")
@@ -574,7 +541,7 @@ class T3BackendTests(unittest.TestCase):
             run_attempt(self.context, ROUTE, "Read", other, other_settings)
         with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", finished_read):
             run_attempt(self.context, ROUTE, "Read", log, settings)  # its own reconnect is admitted
-        receipt = log.with_name(log.name + ".t3-invocation.json")
+        receipt = receipt_path(log)
         held = read_json(next((self.bridge.directory / "scope").glob("*.json")))["request_id"]
         self.bridge.update(held, state="running", consumed_at=None)
         write_json(receipt, {**read_json(receipt), "consumed": True})
@@ -594,7 +561,7 @@ class T3BackendTests(unittest.TestCase):
         self.assertEqual(events, ["enter", "exit", "wake"])
 
     def test_a_cancelled_builder_is_recorded_as_the_writer_before_the_stop(self) -> None:
-        settings = session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "builder"})
+        settings = self.settings()
         seen = []
 
         def record(route):
@@ -610,13 +577,13 @@ class T3BackendTests(unittest.TestCase):
         payload = self.submit()["payload"]
         with mock.patch.object(Bridge, "submit", side_effect=RuntimeError("killed before the submit")), self.assertRaises(RuntimeError):
             self.bridge.begin_session(log, payload, "coordinator")
-        receipt = read_json(log.with_name(log.name + ".t3-invocation.json"))
+        receipt = read_json(receipt_path(log))
         self.assertFalse(receipt["consumed"])
         self.assertIsNone(read_json(self.bridge.request_path(receipt["request_id"])), "nothing was submitted")
         with mock.patch.object(Bridge, "wake"):
             request, _ = self.bridge.begin_session(log, payload, "coordinator")
         self.assertNotEqual(request["id"], receipt["request_id"], "an interrupted start is not reconnected to")
-        self.assertEqual(read_json(log.with_name(log.name + ".t3-invocation.json"))["generation"], 2)
+        self.assertEqual(read_json(receipt_path(log))["generation"], 2)
 
     def test_a_consumed_request_wins_over_its_stale_receipt(self) -> None:
         log = self.root / "stale.log"
@@ -637,13 +604,7 @@ class T3BackendTests(unittest.TestCase):
 
     def wp_session(self, name: str, role: str = "builder", wp: str = "WP-0001", **fields) -> dict:
         """A session request for `wp` begun under its own log, left running."""
-        log = self.root / "runs" / f"{name}.log"
-        log.parent.mkdir(exist_ok=True)
-        payload = {"wp": wp, "role": role, "prompt": "Task", "title": name, "native_role": "implementation", "target": self.bridge.target(ROUTE),
-                   "route": ROUTE, "log_path": str(log), "cwd": str(self.root), "access": "reviewer" if role == "reviewer" else "builder",
-                   "write_paths": [], "before_tree": None, "stop_on_compaction": False}
-        with mock.patch.object(Bridge, "wake"):
-            request, _ = self.bridge.begin_session(log, payload, "coordinator")
+        request = self.begin(self.root / "runs" / f"{name}.log", wp=wp, role=role, access="reviewer" if role == "reviewer" else "builder")
         return self.bridge.update(request["id"], **{"state": "running", "task_id": f"task-{name}", **fields})
 
     def test_outstanding_sessions_follow_consumption_not_receipts_alone(self) -> None:
@@ -658,9 +619,9 @@ class T3BackendTests(unittest.TestCase):
                                                                               ("legacy-none-running", "running"), ("legacy-superseded", "done"))}
         for name, request in legacy.items():
             stored = read_json(self.bridge.request_path(request["id"]))
-            del stored["consumed_at"]  # written before PR 3a
+            del stored["consumed_at"]  # written before that field existed
             write_json(self.bridge.request_path(request["id"]), stored)
-            receipt = Path(request["payload"]["log_path"] + ".t3-invocation.json")
+            receipt = receipt_path(Path(request["payload"]["log_path"]))
             if name.startswith("legacy-none"):
                 receipt.unlink()
             elif name == "legacy-superseded":
@@ -685,7 +646,7 @@ class T3BackendTests(unittest.TestCase):
                 return current
             return bridge.update(request["id"], **complete)
         with mock.patch.object(Bridge, "wait", wait), \
-                mock.patch("wpo.runner.stop_delegated_workers", side_effect=lambda context, wp: order.append(("barrier", wp.id))), \
+                mock.patch("wpo.runner.stop_delegated_workers", side_effect=lambda context, wp: order.append(("barrier", wp.id)) or []), \
                 mock.patch("wpo.wpfile.parse", return_value=SimpleNamespace(path=wp_path)), mock.patch("wpo.wpfile.log_progress"):
             result = settle_native_sessions(self.context, wp, lambda role, route: writers.append((role, route["id"])))
         return result, writers, order
@@ -706,15 +667,10 @@ class T3BackendTests(unittest.TestCase):
     def test_settling_notes_never_read_as_a_later_survivors_edit(self) -> None:
         from wpo.commands import worktree_tree_id
         from wpo.runner import settle_native_sessions
-        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
-            git(self.root, *arguments)
         wp_path = self.project.wp_dir(self.root) / "WP-0001-x.md"
-        wp_path.parent.mkdir(parents=True)
-        wp_path.write_text("---\nid: WP-0001\ntitle: x\nmilestone: M1\nstatus: review\ndepends_on: []\nbuilder: code\nreviewer: review\n"
-                           "owns: [src/**]\n---\n\n## Progress log\n", encoding="utf-8")
-        (self.root / ".gitignore").write_text("runs/\nstate/\n.orchestration/\n")
-        git(self.root, "add", ".")
-        git(self.root, "commit", "-qm", "base")
+        init_repository(self.root, {".gitignore": "runs/\nstate/\n.orchestration/\n", str(wp_path.relative_to(self.root)):
+                                    "---\nid: WP-0001\ntitle: x\nmilestone: M1\nstatus: review\ndepends_on: []\nbuilder: code\nreviewer: review\n"
+                                    "owns: [src/**]\n---\n\n## Progress log\n"})
         before = worktree_tree_id(self.root)
         builder = self.wp_session("builder")
         reviewer = self.wp_session("reviewer", role="reviewer")
@@ -741,7 +697,7 @@ class T3BackendTests(unittest.TestCase):
             raise T3Error("no callback for 30 minutes; marked stalled")
         barrier = []
         from wpo.runner import settle_native_sessions
-        with mock.patch.object(Bridge, "wait", stalled), mock.patch("wpo.runner.stop_delegated_workers", side_effect=lambda c, wp: barrier.append(wp.id)), \
+        with mock.patch.object(Bridge, "wait", stalled), mock.patch("wpo.runner.stop_delegated_workers", side_effect=lambda c, wp: barrier.append(wp.id) or []), \
                 self.assertRaisesRegex(T3Error, "Reconcile it"):
             settle_native_sessions(self.context, SimpleNamespace(id="WP-0001", path=self.root / "WP-0001.md"), lambda role, route: None)
         self.assertEqual(barrier, ["WP-0001"])
@@ -814,13 +770,6 @@ class T3BackendTests(unittest.TestCase):
                 self.quiet_wait(True, lambda bridge, request_id, clock, seen=stalled_at: seen.append(clock[0]), idle_minutes, hard_minutes=2)
             self.assertEqual(stalled_at[-1], 1000 + 90, f"stalled at 120 s with idle_minutes {idle_minutes}")
 
-    def test_an_unlaunched_request_is_woken_once_more_then_stalls(self) -> None:
-        with self.assertRaisesRegex(T3Error, "never launched") as raised:
-            self.quiet_wait(False, lambda bridge, request_id, clock: None)
-        self.assertIsNotNone(raised.exception)
-        stored = [read_json(path) for path in (self.bridge.directory / "requests").glob("*.json")]
-        self.assertTrue(any(r.get("rewoken_at") and r["state"] == "stalled" for r in stored))
-
     def test_terminal_and_wrong_task_callbacks_cannot_replace_results(self) -> None:
         request = self.submit()
         self.bridge.record_started(request["id"], {"taskId": "native", "childThreadId": "child"})
@@ -856,15 +805,9 @@ class T3BackendTests(unittest.TestCase):
         self.assertIsNotNone(stored["rewoken_at"])
 
     def test_readonly_mutations_are_retained_and_rejected_without_fallback(self) -> None:
-        git(self.root, "init", "-q", "-b", "main")
-        git(self.root, "config", "user.name", "Test")
-        git(self.root, "config", "user.email", "test@example.com")
-        (self.root / ".gitignore").write_text(".orchestration/\nstate/\n")
+        init_repository(self.root, {".gitignore": ".orchestration/\nstate/\n", "code.txt": "original\n"})
         code = self.root / "code.txt"
-        code.write_text("original\n")
-        git(self.root, "add", ".")
-        git(self.root, "commit", "-qm", "base")
-        settings = session.SessionSettings("read", [], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "read"})
+        settings = self.settings("read", [])
         def complete(bridge, request, callback=None):
             self.assertEqual(request["payload"]["native_role"], "research")
             self.assertEqual(request["payload"]["access"], "read")
@@ -878,13 +821,7 @@ class T3BackendTests(unittest.TestCase):
         source = self.project.worktrees_root / "WP-0001"
         source.mkdir(parents=True)
         self.addCleanup(lambda: __import__("shutil").rmtree(source.parent, ignore_errors=True))
-        git(source, "init", "-q", "-b", "main")
-        git(source, "config", "user.name", "Test")
-        git(source, "config", "user.email", "test@example.com")
-        (source / "staged.txt").write_text("base\n")
-        (source / "dirty.txt").write_text("base\n")
-        git(source, "add", ".")
-        git(source, "commit", "-qm", "base")
+        init_repository(source, {"staged.txt": "base\n", "dirty.txt": "base\n"})
         target = self.root / "native"
         subprocess.run(["git", "clone", "-q", str(source), str(target)], check=True, capture_output=True)
         (source / "staged.txt").write_text("staged\n")
@@ -902,12 +839,7 @@ class T3BackendTests(unittest.TestCase):
         source = self.project.worktrees_root / "WP-0001"
         source.mkdir(parents=True)
         self.addCleanup(lambda: __import__("shutil").rmtree(source.parent, ignore_errors=True))
-        git(source, "init", "-q", "-b", "main")
-        git(source, "config", "user.name", "Test")
-        git(source, "config", "user.email", "test@example.com")
-        (source / "base.txt").write_text("base")
-        git(source, "add", ".")
-        git(source, "commit", "-qm", "base")
+        init_repository(source, {"base.txt": "base"})
         target = self.root / "native-linked"
         subprocess.run(["git", "clone", "-q", str(source), str(target)], check=True, capture_output=True)
         (source / "data").mkdir()
@@ -1010,11 +942,7 @@ class T3BackendTests(unittest.TestCase):
 
     def native_checkout(self) -> tuple[Path, str]:
         """A real repository with a separate checkout on its own branch, as T3 prepares one."""
-        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
-            git(self.root, *arguments)
-        (self.root / "README").write_text("x\n")
-        git(self.root, "add", "README")
-        git(self.root, "commit", "-qm", "base")
+        init_repository(self.root, {"README": "x\n"})
         tree = self.root.parent / f"{self.root.name}-native"
         git(self.root, "worktree", "add", "-q", "-b", "t3/native", str(tree))
         self.addCleanup(lambda: __import__("shutil").rmtree(tree, ignore_errors=True))

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import os
 import sys
-import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -14,17 +14,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # native_fixtures
 
-from wpo import session, wpfile
+from native_fixtures import ROUTE, NativeTestCase, init_repository
+
+from wpo import wpfile
 from wpo.commands import worktree_tree_id
-from wpo.context import Context
 from wpo.delegate import DelegateError, Delegation
-from wpo.events import Journal
-from wpo.machine import DEFAULTS as MACHINE_DEFAULTS
-from wpo.machine import MachineConfig
-from wpo.project import DEFAULTS as PROJECT_DEFAULTS
-from wpo.project import Project, git
-from wpo.routing import Router
 from wpo.runner import (
     WorkPackageRun,
     delegation_unsettled,
@@ -34,20 +30,17 @@ from wpo.runner import (
     stop_delegated_workers,
 )
 from wpo.session import SessionCancelled
-from wpo.session_brief import SessionBrief
 from wpo.t3 import (
     Bridge,
     T3Error,
     finish_attempt,
     read_json,
+    receipt_path,
     run_attempt,
     scope_key,
     write_json,
 )
 
-CAPABILITIES = {"parentThreadId": "coordinator", "providers": [{"providerInstanceId": "codex", "canRunChildTask": True, "models": [
-    {"id": "gpt-6.1-sol", "options": [{"id": "reasoningEffort", "values": ["low", "high"]}]}]}]}
-ROUTE = {"id": "gpt-sol-high", "family": "gpt", "harness": "gpt", "model": "sol", "effort": "high", "cost_class": "subscription"}
 WP_TEXT = ("---\nid: WP-0001\ntitle: x\nmilestone: M1\nstatus: in_progress\ndepends_on: []\nbuilder: code\nreviewer: review\n"
            "owns: [src/**]\n---\n\n## Progress log\n")
 
@@ -60,27 +53,11 @@ def finish_wait(bridge, request, callback=None) -> dict:
     return bridge.complete(request["id"], {"state": "cancelled", "task_id": current.get("task_id")})
 
 
-class DelegationTests(unittest.TestCase):
+class DelegationTests(NativeTestCase):
     def setUp(self) -> None:
-        self.scratch = tempfile.TemporaryDirectory(prefix="wpo-delegate-")
-        self.addCleanup(self.scratch.cleanup)
-        self.root = Path(self.scratch.name)
-        self.project = Project(self.root, {**PROJECT_DEFAULTS, "name": "scratch", "autofix": {}}, "t3")
-        self.machine = MachineConfig({**MACHINE_DEFAULTS, "state_dir": str(self.root / "state"), "dashboard": {"autostart": False},
-                                      "t3": {**MACHINE_DEFAULTS["t3"], "cli": sys.executable, "callback_interval_seconds": 0.001}})
-        self.context = Context(self.project, self.machine, Router(self.machine, project=self.project), Journal(self.project.runs_dir))
-        self.bridge = Bridge(self.context)
-        self.bridge.attach("coordinator", CAPABILITIES)
-        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
-            git(self.root, *arguments)
-        (self.root / ".gitignore").write_text(".orchestration/\nstate/\n")
-        (self.root / "src").mkdir()
-        (self.root / "src" / "a.txt").write_text("a\n")
+        super().setUp()
         self.wp_path = self.project.wp_dir(self.root) / "WP-0001-x.md"
-        self.wp_path.parent.mkdir(parents=True)
-        self.wp_path.write_text(WP_TEXT, encoding="utf-8")
-        git(self.root, "add", ".")
-        git(self.root, "commit", "-qm", "base")
+        init_repository(self.root, {".gitignore": ".orchestration/\nstate/\n", "src/a.txt": "a\n", str(self.wp_path.relative_to(self.root)): WP_TEXT})
         environment = mock.patch.dict(os.environ, {"WPO_WORK_PACKAGE": "WP-0001", "WPO_TREE": str(self.root)})
         environment.start()
         self.addCleanup(environment.stop)
@@ -95,21 +72,13 @@ class DelegationTests(unittest.TestCase):
 
     def worker(self, name: str = "piece", write_paths=("src/a.txt",), state: str = "running") -> dict:
         """A worker's native request begun in its task directory, as `run_attempt` publishes it."""
-        log = self.delegation.directory / name / f"session.{ROUTE['id']}.log"
-        log.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"wp": "WP-0001", "role": "worker", "prompt": "Task", "title": name, "native_role": "implementation", "target": self.bridge.target(ROUTE),
-                   "route": ROUTE, "log_path": str(log), "cwd": str(self.root), "access": "worker", "write_paths": list(write_paths),
-                   "before_tree": worktree_tree_id(self.root), "stop_on_compaction": False}
-        with mock.patch.object(Bridge, "wake"):
-            request, _ = self.bridge.begin_session(log, payload, "coordinator")
+        request = self.begin(self.delegation.directory / name / f"session.{ROUTE['id']}.log", role="worker", access="worker",
+                             write_paths=list(write_paths), before_tree=worktree_tree_id(self.root))
         return self.bridge.update(request["id"], state=state, task_id=f"task-{name}")
-
-    def lead_session(self, worker: dict) -> dict:
+    def lead_session(self) -> dict:
+        """The lead's own builder session, pending, in the scratch checkout."""
         """The lead's own builder session, pending, in the same checkout as `worker`."""
-        log = self.project.runs_dir / "WP-0001" / "builder.log"
-        payload = {**worker["payload"], "role": "builder", "access": "builder", "log_path": str(log), "before_tree": None, "write_paths": []}
-        with mock.patch.object(Bridge, "wake"):
-            return self.bridge.begin_session(log, payload, "coordinator")[0]
+        return self.begin(self.project.runs_dir / "WP-0001" / "builder.log")
 
     def complete(self, request: dict) -> dict:
         return self.bridge.complete(request["id"], {"state": "done", "text": "done", "task_id": request["task_id"]})
@@ -184,8 +153,7 @@ class DelegationTests(unittest.TestCase):
         self.record(pid=None)
         admission = self.admission()
         self.barrier()
-        settings = session.SessionSettings("worker", ["src/a.txt"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30,
-                                           {"role": "worker"}, admission=admission)
+        settings = dataclasses.replace(self.settings("worker", ["src/a.txt"]), admission=admission)
         with mock.patch.object(Bridge, "wake"), self.assertRaises(SessionCancelled):
             run_attempt(self.context, ROUTE, "Task", self.project.runs_dir / "refused.log", settings)
         self.assertFalse(list((self.bridge.directory / "requests").glob("*.json")))
@@ -225,7 +193,7 @@ class DelegationTests(unittest.TestCase):
         second = self.worker()
         self.assertNotEqual(second["id"], first["id"])
         self.assertEqual(second["state"], "running")
-        self.assertEqual(read_json(Path(second["payload"]["log_path"] + ".t3-invocation.json"))["generation"], 2)
+        self.assertEqual(read_json(receipt_path(Path(second["payload"]["log_path"])))["generation"], 2)
 
     def test_reuse_rechecks_for_a_session_published_while_it_waited_for_the_lock(self) -> None:
         open_delegation(self.context, "WP-0001")
@@ -246,7 +214,7 @@ class DelegationTests(unittest.TestCase):
         self.record(state="failed")
         with self.assertRaisesRegex(DelegateError, "native session to collect"):
             self.start()
-        receipt = Path(request["payload"]["log_path"] + ".t3-invocation.json")
+        receipt = receipt_path(Path(request["payload"]["log_path"]))
         write_json(receipt, {**read_json(receipt), "request_id": "0" * 32})  # refused at admission: never published
         self.start()
 
@@ -256,7 +224,7 @@ class DelegationTests(unittest.TestCase):
         self.bridge.update(request["id"], state="cancelled")  # stopped by the old barrier: no completion snapshot
         self.record(state="failed")
         self.start()
-        receipt = read_json(Path(request["payload"]["log_path"] + ".t3-invocation.json"))
+        receipt = read_json(receipt_path(Path(request["payload"]["log_path"])))
         self.assertEqual((receipt["consumed"], receipt["retired"]), (True, "legacy"))
         self.assertNotEqual(self.worker()["id"], request["id"])
 
@@ -357,7 +325,7 @@ class DelegationTests(unittest.TestCase):
         worker = self.worker()
         (self.root / "outside.txt").write_text("x\n")
         self.complete(worker)
-        lead = self.lead_session(worker)
+        lead = self.lead_session()
         self.assertEqual(self.barrier(wait=False), [])
         self.assertEqual(self.wp.status, "in_progress")
         self.bridge.complete(lead["id"], {"state": "done", "text": "done"})
@@ -405,8 +373,7 @@ class DelegationTests(unittest.TestCase):
     # Stalls
 
     def stall(self, role: str) -> T3Error:
-        settings = session.SessionSettings("worker", ["src/a.txt"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30,
-                                           {"wp": "WP-0001", "role": role})
+        settings = self.settings("worker", ["src/a.txt"], wp="WP-0001", role=role)
         with mock.patch.object(Bridge, "validate_workspace", return_value=self.root), mock.patch.object(Bridge, "wake"), \
                 mock.patch.object(Bridge, "wait", side_effect=T3Error("marked stalled")), self.assertRaisesRegex(T3Error, "marked stalled") as raised:
             run_attempt(self.context, ROUTE, "Task", self.project.runs_dir / f"{role}.log", settings)
@@ -461,7 +428,7 @@ class DelegationTests(unittest.TestCase):
         with mock.patch("wpo.commands.changed_since", side_effect=RuntimeError("git broke")):
             self.complete(previous)
         write_json(self.bridge.directory / "scope" / f"{scope_key(self.root)}.json", {"request_id": previous["id"], "log_path": previous["payload"]["log_path"]})
-        settings = session.SessionSettings("read", [], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "read"})
+        settings = self.settings("read", [])
         with self.assertRaisesRegex(T3Error, "is unfinished"):
             run_attempt(self.context, ROUTE, "Read", self.project.runs_dir / "next.log", settings)
         finish_attempt(self.context, previous, recovery=True)
@@ -500,7 +467,7 @@ class DelegationTests(unittest.TestCase):
         open_delegation(self.context, "WP-0001")
         task_dir = self.record(pid=4242)
         worker = self.worker()
-        lead = self.bridge.update(self.lead_session(worker)["id"], state="running", task_id="task-lead")
+        lead = self.bridge.update(self.lead_session()["id"], state="running", task_id="task-lead")
         marked_at_first_cancel = []
         real = Bridge.cancel_request
 
