@@ -601,7 +601,7 @@ class Bridge:
         """The WP's native sessions no runner has finished, oldest first, read from the request store
         (a request made before receipts were written first can lack one): every non-worker session
         not consumed, and every worker session not terminal or, unless legacy, not consumed (the
-        worker barrier finishes those).
+        worker barrier finishes those, once nothing of the WP still runs).
         A request with `consumed_at` is consumed exactly when it is set. One from before that field
         is consumed when its receipt is, or names a later request; without a receipt it counts only
         while it is not terminal: finishing a long-ended one now would scope-check it against a
@@ -609,7 +609,6 @@ class Bridge:
         found = []
         for request in self.wp_requests(wp_id, "session"):
             if request["payload"].get("role") == "worker":
-                # The worker barrier finishes a stopped worker, once nothing of the WP still runs.
                 if not request.get("consumed_at") and not is_legacy(request):
                     found.append(request)
                 continue
@@ -965,8 +964,8 @@ def with_session_prefix(text: str, prefix: str) -> str:
 
 class SessionControls:
     """What runs while a native session is waited on: the orchestrator's inbox messages, the staged
-    compaction cancel, the quota cut-off and the handoff request. A recovered session (PR 3b) gets
-    the compaction cancel and the cut-off; inbox delivery and handoff need a live builder."""
+    compaction cancel, the quota cut-off and the handoff request. A recovered session gets the
+    compaction cancel and the cut-off; inbox delivery and handoff need a live builder."""
 
     def __init__(self, context: Context, bridge: Bridge, request: dict, route: dict, stop_on_compaction: bool, fields: dict,
                  inbox: Path | None = None, handoff_message=None) -> None:

@@ -358,7 +358,6 @@ class Supervisor:
         spec = self.session_spec(wp)
         first = "none (verify only)"
         if surviving := self.surviving_sessions(wp.id):
-            # The runner settles them first; until then no route is chosen and main is not merged in.
             self.log(f"{wp.id} has native sessions or delegated workers that outlived their runner ({surviving}); the runner settles them first")
             code = self.run_wp(wp, catch_up=False)
             return self.after_run(wp, code, spec)
