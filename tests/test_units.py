@@ -1096,6 +1096,95 @@ class CatchUpWithMainTests(unittest.TestCase):
         self.assertEqual((self.worktree / "edited.txt").read_text(encoding="utf-8"), "builder work\n")
 
 
+class RecoveryIntegrationTests(unittest.TestCase):
+    """A supervisor's pass merges WPs done in their checkout but not on main, and never a WP main
+    already holds as done, though under T3 its checkout outlives the merge."""
+
+    def setUp(self) -> None:
+        from wpo.context import Context
+        from wpo.machine import DEFAULTS as MACHINE_DEFAULTS
+        from wpo.project import DEFAULTS as PROJECT_DEFAULTS
+        from wpo.project import Project, git
+        from wpo.routing import Router
+        self.git = git
+        scratch = tempfile.TemporaryDirectory(prefix="wpo-recovery-")
+        self.addCleanup(scratch.cleanup)
+        base = Path(scratch.name)
+        self.root, self.checkout = base / "repo", base / "native"
+        self.root.mkdir()
+        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            git(self.root, *arguments)
+        self.project = Project(self.root, {**PROJECT_DEFAULTS, "name": "scratch", "autofix": {}}, "t3")
+        machine = MachineConfig({**MACHINE_DEFAULTS, "state_dir": str(base / "state"), "dashboard": {"autostart": False}})
+        self.context = Context(self.project, machine, Router(machine, project=self.project), Journal(self.project.runs_dir))
+        (self.root / ".gitignore").write_text(".orchestration/\n", encoding="utf-8")
+
+    def write_wp(self, tree: Path, status: str) -> None:
+        directory = self.project.wp_dir(tree)
+        directory.mkdir(parents=True, exist_ok=True)
+        text = WP_TEXT.replace("lane: core   # a comment", "lane: life").replace("status: todo", f"status: {status}").replace("depends_on: [WP-0001, WP-0002]", "depends_on: []")
+        (directory / "WP-0042-example.md").write_text(text, encoding="utf-8")
+
+    def commit_main(self, status: str) -> None:
+        self.write_wp(self.root, status)
+        self.git(self.root, "add", "-A")
+        self.git(self.root, "commit", "-q", "--allow-empty", "-m", f"WP-0042 {status}")
+
+    def retain_checkout(self) -> None:
+        """The WP's T3 checkout, on a branch at main's tip, recorded as T3 records it."""
+        self.git(self.root, "worktree", "add", "-q", "-b", "t3/example", str(self.checkout), "main")
+        record = self.project.wp_run_dir("WP-0042") / "t3-workspace.json"
+        record.write_text(json.dumps({"path": str(self.checkout), "branch": "t3/example"}), encoding="utf-8")
+
+    def supervisor(self):
+        from wpo.supervisor import Supervisor
+        supervisor = Supervisor(self.context, "life", True, [], {})
+        supervisor.integrate = mock.Mock(return_value=True)
+        return supervisor
+
+    def test_a_wp_done_on_main_is_not_merged_again_though_its_checkout_remains(self) -> None:
+        self.commit_main("done")
+        self.retain_checkout()
+        (self.checkout / "stray.txt").write_text("left in the checkout\n", encoding="utf-8")
+        supervisor = self.supervisor()
+        supervisor.loop()
+        supervisor.integrate.assert_not_called()
+
+    def test_a_wp_done_only_in_its_uncommitted_checkout_is_merged(self) -> None:
+        # The branch holds nothing main lacks (a builder's work stays uncommitted until integration),
+        # so a guard asking git whether main contains the branch would skip it.
+        self.commit_main("review")
+        self.retain_checkout()
+        self.write_wp(self.checkout, "done")
+        self.assertEqual(self.git(self.root, "merge-base", "--is-ancestor", "t3/example", "main", check=False).returncode, 0)
+        supervisor = self.supervisor()
+        supervisor.loop()
+        supervisor.integrate.assert_called_once_with("WP-0042")
+
+    def test_restarted_supervisors_leave_a_merged_wp_alone(self) -> None:
+        self.commit_main("done")
+        self.retain_checkout()
+        for _ in range(3):
+            supervisor = self.supervisor()
+            supervisor.loop()
+            supervisor.integrate.assert_not_called()
+
+    def test_later_passes_of_one_supervisor_see_its_own_merge(self) -> None:
+        from types import SimpleNamespace
+        self.commit_main("review")
+        self.retain_checkout()
+        self.write_wp(self.checkout, "done")
+        supervisor = self.supervisor()
+        # The stub merges as integration does: main gets the WP as done, and the checkout stays.
+        supervisor.integrate.side_effect = lambda wp_id: self.commit_main("done") or True
+        pick = (SimpleNamespace(id="WP-OTHER"), SimpleNamespace(release=lambda: None))
+        supervisor.next_wp = mock.Mock(side_effect=[pick, pick, None])
+        supervisor.run_claimed = mock.Mock(return_value=None)
+        supervisor.loop()
+        self.assertEqual(supervisor.next_wp.call_count, 3, "three passes ran")
+        supervisor.integrate.assert_called_once_with("WP-0042")
+
+
 class IntegrationChecksTests(unittest.TestCase):
     """The full checks run only on the merge, and a check that writes into the tree fails it."""
 

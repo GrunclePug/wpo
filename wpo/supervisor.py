@@ -398,9 +398,15 @@ class Supervisor:
     def loop(self) -> None:
         while True:
             # A WP that finished but did not merge (a conflict since resolved, an interrupted
-            # supervisor) is merged before new work starts.
-            for wp in self.context.effective_wps():
-                if wp.status == "done" and self.selected(wp) and wp.id not in self.integration_failed and self.project.worktree(wp.id).exists():
+            # supervisor) is merged before new work starts. A WP committed as done on main is
+            # settled (by its integration, or by the orchestrator through `wpo commit-main`):
+            # under T3 its checkout outlives the merge, so the checkout alone does not mean unmerged.
+            # Main is read again each pass, since this lane's own merges move it.
+            main_copies = self.context.main_wps()
+            merged = self.context.merged_done_ids(main_copies)
+            for wp in self.context.effective_wps(main_copies):
+                if (wp.status == "done" and wp.id not in merged and self.selected(wp) and wp.id not in self.integration_failed
+                        and self.project.worktree(wp.id).exists()):
                     self.integrate(wp.id)
             picked = self.next_wp()
             if picked is None:
