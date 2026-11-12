@@ -814,13 +814,6 @@ def worker_runs(pid: int | None, token: str | None) -> bool:
     return bool(pid) and (python_process_runs(pid, token) if token else pid_alive(pid, ("python", "python3")))
 
 
-def worker_requests(context: Context, wp_id: str) -> list[dict]:
-    """The WP's native worker requests, oldest first."""
-    requests = (read_json(path) for path in (Bridge(context).directory / "requests").glob("*.json"))
-    return sorted((request for request in requests if request and request["kind"] == "session" and request["payload"].get("wp") == wp_id
-                   and request["payload"].get("role") == "worker"), key=lambda request: request["created_at"])
-
-
 def stop_delegated_workers(context: Context, wp: wpfile.WorkPackage, wait: bool = True) -> list[str]:
     """The worker barrier: a worker still editing after its lead's session ended would race
     verification and review. It closes the WP's delegation gate (a worker not yet published is then
@@ -868,13 +861,13 @@ def stop_delegated_workers(context: Context, wp: wpfile.WorkPackage, wait: bool 
         except T3Error as error:
             errors.append(str(error))
         # Admission is closed, so no worker request can be published after this scan.
-        for request in worker_requests(context, wp.id) if wait else ():
+        for request in bridge.wp_requests(wp.id, "session", "worker") if wait else ():
             if request["state"] not in TERMINAL_STATES:
                 try:
                     bridge.wait(request)
                 except (T3Error, OSError, subprocess.TimeoutExpired) as error:
                     errors.append(f"worker request {request['id']}: {error}")
-        requests = worker_requests(context, wp.id)
+        requests = bridge.wp_requests(wp.id, "session", "worker")
         quiet = all(request["state"] in TERMINAL_STATES for request in [*requests, *bridge.outstanding_sessions(wp.id)])
     # The only step that writes the checkout. A worker request still running would take these writes
     # into its completion snapshot, and a live lead could edit the WP's status after it.
@@ -1004,7 +997,7 @@ class WorkPackageRun:
         try:
             violations = stop_delegated_workers(self.context, self.wp()) or []
         finally:
-            if getattr(in_flight, "stalled_wp", None) and all(request["state"] in TERMINAL_STATES for request in worker_requests(self.context, self.wp_id)):
+            if getattr(in_flight, "stalled_wp", None) and all(request["state"] in TERMINAL_STATES for request in Bridge(self.context).wp_requests(self.wp_id, "session", "worker")):
                 wpfile.set_status(self.wp(), "blocked")
                 self.emit("wp-blocked", str(in_flight))
         if violations:
