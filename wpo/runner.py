@@ -1243,6 +1243,16 @@ class WorkPackageRun:
             self.log("reviewer gave no verdict; left in review for a human")
             self.emit("wp-blocked", f"{self.wp_id} reviewer gave no verdict; left in review")
             raise WorkPackageEnded
+        if verdict == "PASS":
+            # The protocol allows PASS only when no BLOCKING finding is open after the review's own
+            # rulings; a PASS that raises one or rules one still open requests changes.
+            contradicted = ([finding["id"] for finding in parsed.findings if finding["severity"] == "BLOCKING"]
+                            + [ruling["id"] for ruling in parsed.rulings if ruling["ruling"] in findings.OPEN_RULINGS])
+            if contradicted:
+                verdict = "CHANGES_REQUESTED"
+                note = f"review {review_number} said PASS but left {', '.join(contradicted)} blocking; treated as changes requested"
+                self.log(note)
+                wpfile.append_to_section(self.wp(), "Review", [f"The runner: {note}."])
         still_open = findings.record_review(self.run_dir, review_number, parsed, passed=verdict == "PASS")
         if verdict == "PASS":
             self.finish("verified and review passed; done", f"{self.wp_id} verified and review passed")

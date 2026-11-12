@@ -1428,6 +1428,53 @@ class SessionVerifiedTests(ScratchT3ProjectCase):
         self.assertFalse(self.run.session_verified())
 
 
+class ContradictoryReviewTests(ScratchT3ProjectCase):
+    """A review's PASS cannot close the blocking findings it raises or rules open itself."""
+
+    def review(self, body: str) -> str:
+        """Runs the runner's review step on WP-0042 with a reviewer that answers `body`; the WP's status after."""
+        from types import SimpleNamespace
+
+        from wpo.runner import WorkPackageEnded, WorkPackageRun
+
+        class Run(WorkPackageRun):
+            reviewer_spec = "review"
+        self.commit_main("review")
+        run = object.__new__(Run)
+        run.context, run.config, run.tree, run.wp_id = self.context, self.project.config, self.root, "WP-0042"
+        run.run_dir = self.project.wp_run_dir("WP-0042")
+        run.wp = lambda: self.context.wp_in_tree("WP-0042", self.root)
+        run.log, run.emit = (lambda *a: None), (lambda *a, **k: None)
+        run.independent_review_exclusion = list
+        run.session = lambda *a, **k: SimpleNamespace(result_text=body, log_path=self.root / "review.log", route={"id": "gpt-sol-xhigh"})
+        with mock.patch("wpo.runner.build_review_brief", return_value=SimpleNamespace(full_text="brief")), \
+                mock.patch("wpo.runner.review_brief_section", return_value="brief"), \
+                mock.patch("wpo.runner.review_prompt", return_value="prompt"), mock.patch("wpo.runner.reviewer_skills", return_value=[]), \
+                mock.patch("wpo.runner.review_text", side_effect=lambda text, log, number: text):
+            try:
+                run.review(1)
+            except WorkPackageEnded:
+                pass
+        return run.wp().status
+
+    def test_a_pass_with_a_new_blocking_finding_requests_changes(self) -> None:
+        from wpo import findings
+        body = ("FINDING R1-F1 BLOCKING src/core/lib.rs:3\n  Basis: criterion 1\n  Problem: wrong\n  Fix: right\nVERDICT: PASS")
+        self.assertEqual(self.review(body), "changes_requested")
+        self.assertEqual([f["id"] for f in findings.load(self.project.wp_run_dir("WP-0042"))["findings"] if findings.is_open(f)], ["R1-F1"])
+        self.assertIn("said PASS but left R1-F1 blocking", self.context.wp_in_tree("WP-0042", self.root).path.read_text())
+
+    def test_a_pass_with_only_non_blocking_findings_finishes(self) -> None:
+        body = "FINDING R1-F1 NON-BLOCKING src/core/lib.rs:3\n  Basis: style\n  Problem: naming\n  Fix: rename\nVERDICT: PASS"
+        self.assertEqual(self.review(body), "done")
+
+    def test_a_pass_with_a_still_open_ruling_requests_changes(self) -> None:
+        from wpo import findings
+        run_dir = self.project.wp_run_dir("WP-0042")
+        findings.record_review(run_dir, 1, findings.parse_review("FINDING R1-F1 BLOCKING a.rs:1\n  Basis: x\nVERDICT: CHANGES_REQUESTED", 1), passed=False)
+        self.assertEqual(self.review("RULING R1-F1 STILL-OPEN: the fix does not remove the defect\nVERDICT: PASS"), "changes_requested")
+
+
 class IntegrationChecksTests(unittest.TestCase):
     """The full checks run only on the merge, and a check that writes into the tree fails it."""
 
