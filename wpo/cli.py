@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -124,6 +125,9 @@ def build_parser() -> argparse.ArgumentParser:
     hold.add_argument("--reason", default="held by the orchestrator")
 
     commands.add_parser("status", help="print the board (and write the board file when configured)")
+    clean_builds = commands.add_parser("clean-builds", help="plan build-output cleanup for WPs done on main; preserves checkout/source/history")
+    clean_builds.add_argument("--wp", action="append", default=[], help="only these WPs (repeatable; default: all)")
+    clean_builds.add_argument("--apply", action="store_true", help="remove the reported output; default is a dry run")
 
     job = commands.add_parser("job", help="detached orchestrator jobs")
     job_commands = job.add_subparsers(dest="job_command", required=True)
@@ -385,6 +389,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if arguments.command == "dashboard":
         return dashboard_command(context, arguments)
+    if arguments.command == "clean-builds":
+        from .artifacts import clean_merged
+        from .project import ProjectError
+        try:
+            print(json.dumps(clean_merged(context, arguments.wp, arguments.apply), indent=2))
+        except (ProjectError, OSError, subprocess.CalledProcessError) as error:
+            print(f"Build cleanup refused: {error}", file=sys.stderr)
+            return 2
+        return 0
     from .dashboard import autostart
     autostart(context.project, context.machine)
 

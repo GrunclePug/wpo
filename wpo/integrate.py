@@ -188,14 +188,27 @@ class Integration:
     def cleanup(self) -> None:
         """Removes the worktree, branch and build output after main moved; a failure here (files
         locked on Windows) does not undo the merge, so it is journaled for the orchestrator."""
+        from .artifacts import remove_output
+        from .project import ProjectError
+        try:
+            output_paths = self.project.paths_removed_after_merge(self.wp_id)
+        except (ProjectError, OSError, subprocess.CalledProcessError) as error:
+            self.log(f"build cleanup refused: {error}")
+            self.context.journal.emit("cleanup-failed", f"{self.wp_id} merged, but build cleanup was refused: {error}", {"wp": self.wp_id})
+            output_paths = []
         if self.context.machine.execution_mode == "t3":
             self.log("retained T3-owned worktree and branch; their lifecycle belongs to T3")
         else:
             self.cleanup_standalone_worktree()
-        for path in self.project.paths_removed_after_merge(self.wp_id):
+        for path in output_paths:
             if path.exists():
-                shutil.rmtree(path, ignore_errors=True)
-                self.log(f"removed {path}")
+                try:
+                    remove_output(path)
+                except (OSError, ProjectError) as error:
+                    self.log(f"build cleanup failed for {path}: {error}")
+                    self.context.journal.emit("cleanup-failed", f"{self.wp_id} merged, but build cleanup failed for {path}: {error}", {"wp": self.wp_id})
+                else:
+                    self.log(f"removed {path}")
 
     def cleanup_standalone_worktree(self) -> None:
         try:

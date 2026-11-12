@@ -1338,6 +1338,12 @@ class WorkPackageEnded(Exception):
 
 def run_wp(context: Context, wp_id: str, tree: Path, options: RunOptions) -> int:
     """Runs a WP; returns 0, or EXIT_NO_ROUTE when no route could serve a session."""
+    from .artifacts import space_problem
+    if problem := space_problem(context.project, tree):
+        wpfile.set_status(context.wp_in_tree(wp_id, tree), "blocked")
+        context.journal.emit("wp-blocked", f"{wp_id}: {problem}", {"wp": wp_id})
+        print(problem)
+        return 0
     try:
         WorkPackageRun(context, wp_id, tree, options).run()
     except RunStopped as stopped:

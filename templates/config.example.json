@@ -18,6 +18,7 @@
   "shared_files": [],
   "env": {},
   "remove_after_merge": [],
+  "minimum_build_free_gib": null,
   "worktree_setup": [],
   "lockfile_reconcilers": [],
   "post_merge_hooks": [],
