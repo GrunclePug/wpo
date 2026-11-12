@@ -737,13 +737,13 @@ def settle_native_sessions(context: Context, wp: wpfile.WorkPackage, record_writ
     run goes on. Then the worker barrier stops any surviving workers, also when settling failed.
     Returns the requests whose scope check failed (their WP is blocked). Standalone mode has only
     the barrier, for workers a dead runner left."""
+    outstanding, delegation = unsettled(context, wp.id)
+    if not outstanding and not delegation:
+        return []
     if context.machine.execution_mode != "t3":
-        return (stop_delegated_workers(context, wp) or []) if delegation_unsettled(context, wp.id) else []
+        return stop_delegated_workers(context, wp)
     from .t3 import SessionControls
     bridge = Bridge(context)
-    outstanding = bridge.outstanding_sessions(wp.id)
-    if not outstanding and not delegation_unsettled(context, wp.id):
-        return []
     violations, notes = [], []
     try:
         for request in (request for request in outstanding if request["payload"].get("role") != "worker"):
@@ -795,6 +795,13 @@ def delegation_unsettled(context: Context, wp_id: str) -> bool:
     gate = read_json(gate_path(context, wp_id), {})
     return (bool(gate.get("open")) or gate.get("report_since") is not None
             or any(read_json(path, {}).get("state") == "running" for path in gate_path(context, wp_id).parent.glob("*/state.json")))
+
+
+def unsettled(context: Context, wp_id: str) -> tuple[list[dict], bool]:
+    """What of the WP outlived its runner: its native sessions no runner has finished (T3 only),
+    and whether its delegation still needs a barrier."""
+    sessions = Bridge(context).outstanding_sessions(wp_id) if context.machine.execution_mode == "t3" else []
+    return sessions, delegation_unsettled(context, wp_id)
 
 
 def delegation_open(context: Context, wp_id: str) -> bool:
@@ -995,7 +1002,7 @@ class WorkPackageRun:
         """The lead's worker barrier. A lead that stalled left the WP's status alone, since a worker
         still running would take that write into its snapshot: it is blocked here, once none is."""
         try:
-            violations = stop_delegated_workers(self.context, self.wp()) or []
+            violations = stop_delegated_workers(self.context, self.wp())
         finally:
             if getattr(in_flight, "stalled_wp", None) and all(request["state"] in TERMINAL_STATES for request in Bridge(self.context).wp_requests(self.wp_id, "session", "worker")):
                 wpfile.set_status(self.wp(), "blocked")
@@ -1513,7 +1520,6 @@ class WorkPackageRun:
         # Native sessions an earlier runner left are finished before the phase is chosen from the
         # WP's status: a surviving builder may have set review while it was still writing.
         if violations := settle_native_sessions(self.context, self.wp(), self.record_writer):
-            from .t3 import T3Error
             raise T3Error(f"{self.wp_id}: a session that outlived its runner changed paths outside its access ({', '.join(violations)}); the WP is blocked")
         wp = self.wp()
         if self.ledger.interrupted:

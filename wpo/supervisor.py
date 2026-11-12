@@ -38,7 +38,7 @@ from .integrate import EXIT_MEANINGS, EXIT_MERGED
 from .platform import FileLock, NamedMutex, spawn_detached
 from .project import git
 from .routing import with_mode, wp_mode
-from .runner import EXIT_NO_ROUTE, LEDGER_FILE, NO_ROUTE_FILE, RoundLedger, session_env
+from .runner import EXIT_NO_ROUTE, LEDGER_FILE, NO_ROUTE_FILE, RoundLedger, session_env, unsettled
 from .scope import owned_packages, reached_packages
 from .session import describe_next
 
@@ -410,12 +410,8 @@ class Supervisor:
     def surviving_sessions(self, wp_id: str) -> int:
         """How many of the WP's native sessions (T3) outlived their runner, plus one when its
         delegated workers are not settled yet (both modes)."""
-        from .runner import delegation_unsettled
-        unsettled = int(delegation_unsettled(self.context, wp_id))
-        if self.context.machine.execution_mode != "t3":
-            return unsettled
-        from .t3 import Bridge
-        return len(Bridge(self.context).outstanding_sessions(wp_id)) + unsettled
+        sessions, delegation = unsettled(self.context, wp_id)
+        return len(sessions) + delegation
 
     def after_run(self, wp: wpfile.WorkPackage, code: int, spec: str) -> datetime | None:
         status = self.status_of(wp.id)

@@ -20,7 +20,8 @@ from .context import Context
 from .platform import NamedMutex
 from .project import git
 from .scope import scope_for, scoped_checks
-from .runner import VERIFIED_TREE_FILE, delegation_unsettled, session_env
+from .runner import VERIFIED_TREE_FILE, session_env, unsettled
+from .t3 import Bridge, T3Error
 
 EXIT_MERGED, EXIT_CONFLICT, EXIT_VERIFY_FAILED, EXIT_FAST_FORWARD_FAILED = 0, 5, 6, 7
 # Outcomes of bringing main in again under the mutex (not exit codes).
@@ -221,17 +222,16 @@ class Integration:
             self.context.journal.emit("cleanup-failed", f"{self.wp_id} merged into main, but removing its worktree or branch failed: {error}", {"wp": self.wp_id})
 
     def run(self) -> int:
-        if delegation_unsettled(self.context, self.wp_id):
+        outstanding, delegation = unsettled(self.context, self.wp_id)
+        if delegation:
             raise RuntimeError(f"{self.wp_id}'s delegated workers are not settled; run the WP (its runner stops its workers), then integrate")
+        if outstanding:
+            # Integration commits the checkout without a scope check: a session still writing
+            # there, or one never checked, must be settled first (by running the WP).
+            raise T3Error(f"{self.wp_id} has native sessions no runner has finished ({', '.join(r['id'] for r in outstanding)}); "
+                          "run the WP (its runner settles them) or wait, then integrate")
         if self.context.machine.execution_mode == "t3":
-            from .t3 import Bridge, T3Error
-            bridge = Bridge(self.context)
-            if outstanding := bridge.outstanding_sessions(self.wp_id):
-                # Integration commits the checkout without a scope check: a session still writing
-                # there, or one never checked, must be settled first (by running the WP).
-                raise T3Error(f"{self.wp_id} has native sessions no runner has finished ({', '.join(r['id'] for r in outstanding)}); "
-                              "run the WP (its runner settles them) or wait, then integrate")
-            bridge.validate_workspace(self.wp_id)
+            Bridge(self.context).validate_workspace(self.wp_id)
         if not self.worktree.exists():
             raise FileNotFoundError(f"no worktree for {self.wp_id} at {self.worktree}")
         current = git(self.project.root, "symbolic-ref", "--short", "HEAD", check=False).stdout.strip()
