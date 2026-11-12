@@ -101,6 +101,8 @@ cancelled request. Repeated callbacks are idempotent. Stable invocation receipts
 Python process to its existing task; a consumed continuation creates a new task generation and
 archives the old log rather than replaying its result. A receipt names its request before the request is submitted, and a finished session's request records when its result was consumed (`consumed_at`); that record wins over the receipt. One completion path finishes every session: the writer is recorded, then the scope check, then the result is logged and consumed, each step safe to repeat after a crash.
 
+A native task can outlive its runner (a T3 restart, a killed supervisor). When the WP runs again, its runner first settles every such session, oldest first, before it chooses a phase from the WP's status: it waits for the task, records its writer, checks its scope and consumes its result. No route is chosen and main is not merged into the checkout until then, and the supervisor's automatic integration settles them first too; `wpo integrate` refuses a WP that still has one. Recovery restores safety, not the session's control flow: an operator's cancel, a failure or a compaction is logged and the run continues; only a scope violation (the WP is blocked) ends it. A survivor that stalled stops the run until it is reconciled. Surviving workers are stopped by the worker barrier as at the end of a builder session.
+
 ## Activity, permissions and recovery
 
 Session prompts carry an explicit `--session` prefix. Use it for WPO commands; native provider

@@ -1268,6 +1268,82 @@ class BackendExitTests(ScratchT3ProjectCase):
         self.assertIn("repair session was", raised.exception.reason)
 
 
+class SurvivingSessionTests(ScratchT3ProjectCase):
+    """A restarted WP settles native sessions that outlived their runner before anything else."""
+
+    def survivor(self) -> dict:
+        from wpo.t3 import Bridge
+        payload = {"wp": "WP-0042", "role": "builder", "route": {"id": "gpt-sol-high", "family": "gpt"}, "log_path": str(self.root / "x.log")}
+        with mock.patch.object(Bridge, "wake"):
+            return Bridge(self.context).submit("session", "survivor", payload, "coordinator", initial={"consumed_at": None})
+
+    def test_the_supervisor_neither_routes_nor_merges_main_before_settling(self) -> None:
+        self.commit_main("review")
+        self.survivor()
+        supervisor = self.supervisor()
+        (wp,) = self.context.effective_wps()
+        calls = []
+        supervisor.run_wp = lambda wp, catch_up=True: calls.append(catch_up) or 0
+        supervisor.status_of = lambda wp_id: "review"
+        with mock.patch.object(self.context.router, "select", side_effect=AssertionError("no route pre-check")):
+            supervisor.run_claimed(wp)
+        self.assertEqual(calls, [False], "run without merging main into the checkout")
+
+    def test_automatic_integration_settles_first_and_skips_a_blocked_wp(self) -> None:
+        self.commit_main("review")
+        self.retain_checkout()
+        self.write_wp(self.checkout, "done")
+        self.survivor()
+        for violations, integrated in ((["request"], False), ([], True)):
+            supervisor = self.supervisor()
+            with mock.patch("wpo.runner.settle_native_sessions", return_value=violations) as settle:
+                supervisor.loop()
+            settle.assert_called_once()
+            self.assertEqual(supervisor.integrate.called, integrated)
+
+    def test_automatic_integration_rereads_the_status_a_survivor_may_have_changed(self) -> None:
+        self.commit_main("review")
+        self.retain_checkout()
+        self.write_wp(self.checkout, "done")
+        self.survivor()
+        supervisor = self.supervisor()
+        with mock.patch("wpo.runner.settle_native_sessions", side_effect=lambda *a: self.write_wp(self.checkout, "blocked") or []):
+            supervisor.loop()
+        supervisor.integrate.assert_not_called()
+
+    def test_wpo_integrate_refuses_a_wp_with_unsettled_sessions(self) -> None:
+        from wpo.integrate import Integration
+        from wpo.t3 import T3Error
+        self.commit_main("done")
+        self.survivor()
+        with self.assertRaisesRegex(T3Error, "no runner has finished"):
+            Integration(self.context, "WP-0042", False).run()
+
+    def test_the_runner_settles_before_choosing_its_phase(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo.runner import WorkPackageRun
+        from wpo.t3 import T3Error
+        order = []
+        run = object.__new__(WorkPackageRun)
+        run.context, run.wp_id = self.context, "WP-0042"
+        run.wp = lambda: SimpleNamespace(id="WP-0042", status="review", path=self.root / "WP.md")
+        run.record_writer = lambda role, route: None
+
+        class Phase(Exception):
+            pass
+        run.ledger = SimpleNamespace(interrupted=False, rounds=1)
+        run.log = lambda message: (order.append("phase"), (_ for _ in ()).throw(Phase()))
+        with mock.patch("wpo.runner.settle_native_sessions", side_effect=lambda *a: order.append("settle") or ["request"]), \
+                self.assertRaisesRegex(T3Error, "outside its access"):
+            run.run()
+        self.assertEqual(order, ["settle"], "a scope violation ends the run before any phase")
+        order.clear()
+        with mock.patch("wpo.runner.settle_native_sessions", side_effect=lambda *a: order.append("settle") or []), self.assertRaises(Phase):
+            run.run()
+        self.assertEqual(order, ["settle", "phase"])
+
+
 class IntegrationChecksTests(unittest.TestCase):
     """The full checks run only on the merge, and a check that writes into the tree fails it."""
 

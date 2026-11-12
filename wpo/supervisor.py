@@ -36,10 +36,10 @@ from .commands import run_commands
 from .context import Context
 from .integrate import EXIT_MEANINGS, EXIT_MERGED
 from .platform import NamedMutex, spawn_detached
-from .scope import owned_packages, reached_packages
 from .project import git
 from .routing import with_mode, wp_mode
 from .runner import EXIT_NO_ROUTE, LEDGER_FILE, NO_ROUTE_FILE, RoundLedger, session_env
+from .scope import owned_packages, reached_packages
 from .session import describe_next
 
 RESUMABLE_STATUSES = ("todo", "changes_requested", "in_progress", "review")
@@ -244,13 +244,15 @@ class Supervisor:
             return
         self.log(f"prewarming {wp.id}: {'; '.join(chosen)}")
 
-    def ensure_worktree(self, wp_id: str) -> Path:
+    def ensure_worktree(self, wp_id: str, catch_up: bool = True) -> Path:
         """The WP's worktree, created from main on first use (a branch left by a removed worktree is
-        checked out again), with the project's setup commands run in it."""
+        checked out again), with the project's setup commands run in it. Without `catch_up`, main
+        is not merged in (a native session may still be writing there)."""
         if self.context.machine.execution_mode == "t3":
             from .t3 import Bridge
             worktree = Bridge(self.context).ensure_workspace(wp_id)
-            self.catch_up_with_main(worktree)
+            if catch_up:
+                self.catch_up_with_main(worktree)
             return worktree
         worktree = self.project.worktree(wp_id)
         if worktree.exists():
@@ -285,9 +287,9 @@ class Supervisor:
         self.integration_failed.add(wp_id)
         return False
 
-    def run_wp(self, wp: wpfile.WorkPackage) -> int:
+    def run_wp(self, wp: wpfile.WorkPackage, catch_up: bool = True) -> int:
         created = not self.project.worktree(wp.id).exists()
-        worktree = self.ensure_worktree(wp.id)
+        worktree = self.ensure_worktree(wp.id, catch_up)
         if created:
             self.prewarm(wp, worktree)
         arguments = ["run", "--wp", wp.id, "--tree", str(worktree)]
@@ -350,6 +352,11 @@ class Supervisor:
         """Runs one claimed WP; returns when to retry it if no route could serve it."""
         spec = self.session_spec(wp)
         first = "none (verify only)"
+        if surviving := self.surviving_sessions(wp.id):
+            # The runner settles them first; until then no route is chosen and main is not merged in.
+            self.log(f"{wp.id} has {surviving} native session(s) that outlived their runner; the runner settles them first")
+            code = self.run_wp(wp, catch_up=False)
+            return self.after_run(wp, code, spec)
         if spec != "none":
             selection = self.context.router.select(spec, self.families or None, free_last_resort=wp.status != "review", gate=wp.status == "review")
             if not selection.candidates:
@@ -357,7 +364,52 @@ class Supervisor:
                 return self.route_wait(wp.id, spec, selection.next_available_at, unavailable)
             first = selection.candidates[0]["id"]
         self.log(f"running {wp.id} ({wp.status}) for '{spec}'; first route {first}")
-        code = self.run_wp(wp)
+        return self.after_run(wp, self.run_wp(wp), spec)
+
+    def settled_for_integration(self, wp: wpfile.WorkPackage) -> bool:
+        """Whether a done-but-unmerged WP may be integrated now. Native sessions that outlived their
+        runner are settled first, under the WP's claim (integration commits whatever they left,
+        without a scope check); one whose scope check fails blocks the WP instead."""
+        if not self.surviving_sessions(wp.id):
+            return True
+        claim = self.claim(wp.id)
+        if claim is None:
+            return False  # another supervisor runs it; a later pass looks again
+        from .runner import (
+            LEDGER_FILE,
+            RoundLedger,
+            record_writer_in,
+            settle_native_sessions,
+        )
+        from .t3 import T3Error
+        try:
+            ledger = RoundLedger(self.project.runs_dir / wp.id / LEDGER_FILE)
+            violations = settle_native_sessions(self.context, wp, lambda role, route: record_writer_in(ledger, role, route))
+        except T3Error as error:
+            violations = None
+            self.emit("integration-failed", f"{wp.id} not integrated: {error}", wp=wp.id)
+        finally:
+            claim.release()
+        if violations is None or violations:
+            self.integration_failed.add(wp.id)
+            if violations:
+                self.log(f"{wp.id} not integrated: a session that outlived its runner changed paths outside its access; the WP is blocked")
+            return False
+        # A survivor may have changed the WP's status while it finished: integrate only what is still done.
+        status = self.context.wp_in_tree(wp.id, self.project.worktree(wp.id)).status
+        if status != "done":
+            self.log(f"{wp.id} not integrated: after settling its surviving sessions it is {status}")
+            return False
+        return True
+
+    def surviving_sessions(self, wp_id: str) -> int:
+        """How many of the WP's native sessions outlived their runner (T3); 0 standalone."""
+        if self.context.machine.execution_mode != "t3":
+            return 0
+        from .t3 import Bridge
+        return len(Bridge(self.context).outstanding_sessions(wp_id))
+
+    def after_run(self, wp: wpfile.WorkPackage, code: int, spec: str) -> datetime | None:
         status = self.status_of(wp.id)
         self.log(f"{wp.id} runner exit {code}; status {status}")
         if code == EXIT_NO_ROUTE:
@@ -406,7 +458,7 @@ class Supervisor:
             merged = self.context.merged_done_ids(main_copies)
             for wp in self.context.effective_wps(main_copies):
                 if (wp.status == "done" and wp.id not in merged and self.selected(wp) and wp.id not in self.integration_failed
-                        and self.project.worktree(wp.id).exists()):
+                        and self.project.worktree(wp.id).exists() and self.settled_for_integration(wp)):
                     self.integrate(wp.id)
             picked = self.next_wp()
             if picked is None:

@@ -512,6 +512,121 @@ class T3BackendTests(unittest.TestCase):
             wpfile.write_text(path, "---\nid: WP-0001\n---\nnew\n")
         self.assertEqual(path.read_text(encoding="utf-8"), "---\nid: WP-0001\n---\nprevious\n")
 
+    def wp_session(self, name: str, role: str = "builder", wp: str = "WP-0001", **fields) -> dict:
+        """A session request for `wp` begun under its own log, left running."""
+        log = self.root / "runs" / f"{name}.log"
+        log.parent.mkdir(exist_ok=True)
+        payload = {"wp": wp, "role": role, "prompt": "Task", "title": name, "native_role": "implementation", "target": self.bridge.target(ROUTE),
+                   "route": ROUTE, "log_path": str(log), "cwd": str(self.root), "access": "reviewer" if role == "reviewer" else "builder",
+                   "write_paths": [], "before_tree": None, "stop_on_compaction": False}
+        with mock.patch.object(Bridge, "wake"):
+            request, _ = self.bridge.begin_session(log, payload, "coordinator")
+        return self.bridge.update(request["id"], **{"state": "running", "task_id": f"task-{name}", **fields})
+
+    def test_outstanding_sessions_follow_consumption_not_receipts_alone(self) -> None:
+        running = self.wp_session("running")
+        finished = self.wp_session("finished", state="done")  # finished but never consumed
+        consumed = self.wp_session("consumed", state="done", consumed_at=time.time())
+        worker_running = self.wp_session("worker-running", role="worker")
+        worker_done = self.wp_session("worker-done", role="worker", state="done")
+        self.wp_session("other", wp="WP-0002")
+        legacy = {name: self.wp_session(name, state=state) for name, state in (("legacy-receipt", "done"), ("legacy-none-done", "done"),
+                                                                              ("legacy-none-running", "running"), ("legacy-superseded", "done"))}
+        for name, request in legacy.items():
+            stored = read_json(self.bridge.request_path(request["id"]))
+            del stored["consumed_at"]  # written before PR 3a
+            write_json(self.bridge.request_path(request["id"]), stored)
+            receipt = Path(request["payload"]["log_path"] + ".t3-invocation.json")
+            if name.startswith("legacy-none"):
+                receipt.unlink()
+            elif name == "legacy-superseded":
+                write_json(receipt, {**read_json(receipt), "request_id": "0" * 32})
+        ids = [request["id"] for request in self.bridge.outstanding_sessions("WP-0001")]
+        self.assertEqual(set(ids), {running["id"], finished["id"], worker_running["id"], legacy["legacy-receipt"]["id"], legacy["legacy-none-running"]["id"]})
+        self.assertNotIn(consumed["id"], ids)
+        self.assertNotIn(worker_done["id"], ids)
+
+    def settle(self, wp_path: Path, complete: dict | None = None):
+        """Runs settle_native_sessions for WP-0001, completing each waited request with `complete`."""
+        from wpo.runner import settle_native_sessions
+        wp_path.write_text("---\nid: WP-0001\n---\n\n## Progress log\n", encoding="utf-8")
+        wp = SimpleNamespace(id="WP-0001", path=wp_path)
+        writers, order = [], []
+
+        def wait(bridge, request, callback=None):
+            order.append(("wait", request["id"]))
+            current = read_json(bridge.request_path(request["id"]))
+            if current["state"] in ("done", "failed", "cancelled") or complete is None:
+                return current
+            return bridge.update(request["id"], **complete)
+        with mock.patch.object(Bridge, "wait", wait), \
+                mock.patch("wpo.runner.stop_delegated_workers", side_effect=lambda context, wp: order.append(("barrier", wp.id))), \
+                mock.patch("wpo.wpfile.parse", return_value=SimpleNamespace(path=wp_path)), mock.patch("wpo.wpfile.log_progress"):
+            result = settle_native_sessions(self.context, wp, lambda role, route: writers.append((role, route["id"])))
+        return result, writers, order
+
+    def test_settling_finishes_survivors_and_records_their_writers_before_the_barrier(self) -> None:
+        older = self.wp_session("builder")
+        newer = self.wp_session("reviewer", role="reviewer")
+        worker = self.wp_session("worker", role="worker")
+        violations, writers, order = self.settle(self.root / "WP-0001.md", {"state": "done", "result": {"text": "ok", "outcome": "ok"}})
+        self.assertEqual(violations, [])
+        self.assertEqual(order, [("wait", older["id"]), ("wait", newer["id"]), ("barrier", "WP-0001")], "oldest first; workers go to the barrier")
+        self.assertEqual(writers, [("builder", ROUTE["id"]), ("reviewer", ROUTE["id"])])
+        for request in (older, newer):
+            self.assertIsNotNone(read_json(self.bridge.request_path(request["id"]))["consumed_at"])
+        self.assertEqual(read_json(self.bridge.request_path(worker["id"]))["state"], "running", "not finished here")
+        self.assertEqual([r["id"] for r in self.bridge.outstanding_sessions("WP-0001")], [worker["id"]])
+
+    def test_settling_notes_never_read_as_a_later_survivors_edit(self) -> None:
+        from wpo.commands import worktree_tree_id
+        from wpo.runner import settle_native_sessions
+        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            git(self.root, *arguments)
+        wp_path = self.project.wp_dir(self.root) / "WP-0001-x.md"
+        wp_path.parent.mkdir(parents=True)
+        wp_path.write_text("---\nid: WP-0001\ntitle: x\nmilestone: M1\nstatus: review\ndepends_on: []\nbuilder: code\nreviewer: review\n"
+                           "owns: [src/**]\n---\n\n## Progress log\n", encoding="utf-8")
+        (self.root / ".gitignore").write_text("runs/\nstate/\n.orchestration/\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "base")
+        before = worktree_tree_id(self.root)
+        builder = self.wp_session("builder")
+        reviewer = self.wp_session("reviewer", role="reviewer")
+        stored = read_json(self.bridge.request_path(reviewer["id"]))
+        stored["payload"]["before_tree"] = before
+        write_json(self.bridge.request_path(reviewer["id"]), stored)
+        for request in (builder, reviewer):
+            self.bridge.update(request["id"], state="done", result={"text": "ok", "outcome": "ok"})
+        with mock.patch("wpo.runner.stop_delegated_workers"):
+            violations = settle_native_sessions(self.context, SimpleNamespace(id="WP-0001", path=wp_path), lambda role, route: None)
+        self.assertEqual(violations, [], "neither survivor edited anything")
+        self.assertEqual(wp_path.read_text().count("settled a"), 2)
+
+    def test_settling_continues_past_an_operator_cancel_and_a_failure(self) -> None:
+        self.wp_session("cancelled", cancel_origin="operator")
+        self.wp_session("failed")
+        violations, _, order = self.settle(self.root / "WP-0001.md", {"state": "cancelled"})
+        self.assertEqual(violations, [])
+        self.assertEqual(order[-1], ("barrier", "WP-0001"))
+
+    def test_a_stalled_survivor_stops_settling_and_the_barrier_still_runs(self) -> None:
+        self.wp_session("stalled")
+        def stalled(bridge, request, callback=None):
+            raise T3Error("no callback for 30 minutes; marked stalled")
+        barrier = []
+        from wpo.runner import settle_native_sessions
+        with mock.patch.object(Bridge, "wait", stalled), mock.patch("wpo.runner.stop_delegated_workers", side_effect=lambda c, wp: barrier.append(wp.id)), \
+                self.assertRaisesRegex(T3Error, "Reconcile it"):
+            settle_native_sessions(self.context, SimpleNamespace(id="WP-0001", path=self.root / "WP-0001.md"), lambda role, route: None)
+        self.assertEqual(barrier, ["WP-0001"])
+
+    def test_nothing_outstanding_changes_nothing(self) -> None:
+        from wpo.runner import settle_native_sessions
+        with mock.patch("wpo.runner.stop_delegated_workers") as barrier:
+            self.assertEqual(settle_native_sessions(self.context, SimpleNamespace(id="WP-0001", path=self.root / "x.md"), lambda role, route: None), [])
+        barrier.assert_not_called()
+
     def test_terminal_and_wrong_task_callbacks_cannot_replace_results(self) -> None:
         request = self.submit()
         self.bridge.record_started(request["id"], {"taskId": "native", "childThreadId": "child"})
