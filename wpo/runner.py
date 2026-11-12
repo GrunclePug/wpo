@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ from .commands import CommandFailure, build_slot, changed_paths, matches_main, i
 from .context import Context
 from .harness import SESSION_WORKER_AGENT, SHELL_CHAINING, CLAUDE_CLI_HARNESSES, command_prefixes, handoff_limit
 from .inbox import clear_pause, inbox_of, pause_requested
-from .platform import kill_tree, pid_alive
+from .platform import kill_tree, pid_alive, replace_file
 from .project import TASKS_RELATIVE_PATH, git
 from .review_brief import ReviewBrief, build_review_brief
 from .routing import Route, RoutingError, model_family_of, record_wp_mode, resolve_work_spec, spec_mode, with_mode, wp_mode
@@ -112,7 +113,10 @@ class RoundLedger:
         return json.loads(path.read_text(encoding="utf-8")).get("escalated_to") if path.exists() else None
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(self.state, indent=2) + "\n", encoding="utf-8")
+        # Atomic: a finish replayed after a kill must never find a half-written ledger.
+        staging = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        staging.write_text(json.dumps(self.state, indent=2) + "\n", encoding="utf-8")
+        replace_file(staging, self.path)
 
     def reset(self) -> None:
         self.state = self.fresh()
@@ -772,7 +776,8 @@ class WorkPackageRun:
         try:
             result = run_session(self.context, spec, extra.pop("access", access), prompt, log_stem, self.tree, families=extra.pop("families", self.families),
                                  idle_minutes=self.options.idle_minutes, event_fields={"wp": self.wp_id, "role": role}, extra_env=self.env,
-                                 inbox=inbox_of(self.run_dir), on_attempt=self.mode_recorder(mode), **extra)
+                                 inbox=inbox_of(self.run_dir), on_attempt=self.mode_recorder(mode),
+                                 on_finished=lambda route: self.record_writer(role, route), **extra)
         except NoRouteError as error:
             if role == "builder" and not error.failures:
                 self.ledger.state["writing"] = writing_before

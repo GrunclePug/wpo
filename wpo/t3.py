@@ -235,7 +235,7 @@ class Bridge:
                 raise T3Error(f"T3 coordinator wake failed: {(completed.stderr or completed.stdout).strip()[:1000]}")
             write_json(stamp, {"at": started, "thread_id": thread_id})
 
-    def submit(self, kind: str, key: str, payload: dict, coordinator: str) -> dict:
+    def submit(self, kind: str, key: str, payload: dict, coordinator: str, initial: dict | None = None) -> dict:
         generation = 1
         while True:
             request_id = request_id_for(kind, key, generation)
@@ -245,7 +245,8 @@ class Bridge:
                 request = read_json(path)
                 if request is None:
                     request = {"version": 1, "id": request_id, "kind": kind, "state": "pending", "coordinator_thread_id": coordinator,
-                               "created_at": time.time(), "payload": payload, "task_id": None, "thread_id": None, "link": None}
+                               "created_at": time.time(), "payload": payload, "task_id": None, "thread_id": None, "link": None,
+                               **(initial or {})}
                     if generation > 1:
                         request["generation"] = generation
                     write_json(path, request)
@@ -493,13 +494,22 @@ class Bridge:
         with FileLock(receipt.with_suffix(".lock")):
             previous = read_json(receipt)
             if previous is not None and not previous["consumed"]:
-                return read_json(self.request_path(previous["request_id"])), receipt
+                current = read_json(self.request_path(previous["request_id"]))
+                if current is not None and not current.get("consumed_at"):
+                    return current, receipt
+                # No request (a start interrupted before its submit) or one already finished whose
+                # receipt write was lost: the request's `consumed_at` is authoritative.
+                previous = {**previous, "consumed": True}
+                write_json(receipt, previous)
             generation = previous["generation"] + 1 if previous else 1
-            request = self.submit("session", f"{log_path}:{generation}", payload, coordinator)
-            write_json(receipt, {"version": 1, "generation": generation, "request_id": request["id"], "consumed": False})
+            key = f"{log_path}:{generation}"
+            # The receipt names the request before it is submitted (and may wake a coordinator), so a
+            # crash in between never leaves a launched request without a receipt.
+            write_json(receipt, {"version": 1, "generation": generation, "request_id": request_id_for("session", key), "consumed": False})
             if log_path.is_file():
                 archived = log_path.with_name(f"{log_path.stem}.generation-{generation - 1}{log_path.suffix}")
                 log_path.replace(archived)
+            request = self.submit("session", key, payload, coordinator, initial={"consumed_at": None})
             return request, receipt
 
     def cancel_request(self, request: dict, why: str, origin: str) -> dict:
@@ -696,8 +706,7 @@ def run_attempt(context: Context, route: dict, prompt: str, log_path: Path, sett
 
 
 def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, settings, resume_session=None):
-    from .inbox import clear_live, pending_messages, write_live
-    from .routing import SessionOutcome
+    from .inbox import clear_live, write_live
     from .session_brief import loads_instructions_natively
 
     bridge = Bridge(context)
@@ -777,40 +786,10 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
                                        "t3": {"request_id": request["id"], "target": target}}) + "\n", encoding="utf-8")
     if settings.inbox:
         write_live(settings.inbox, log_path, os.getpid())
-    launched_at = time.time()
-    next_quota_check = 0.0
-    handoff_reason = None
-    cancellation_sent = False
-    from .session import QuotaHandoffSlot
-    quota_slot = QuotaHandoffSlot(context.router.state_dir, route["family"], str(log_path))
-    def messages(current):
-        nonlocal next_quota_check, handoff_reason, cancellation_sent
-        if settings.inbox and current.get("thread_id"):
-            for message in pending_messages(settings.inbox):
-                bridge.submit("message", message.name, {"thread_id": current["thread_id"], "message": message.read_text(encoding="utf-8"), "message_path": str(message)},
-                              current["coordinator_thread_id"])
-        if current.get("task_id") and not cancellation_sent and current.get("compacted") and settings.stop_on_compaction:
-            bridge.cancel_request(current, "native compaction callback reached staged context boundary", "compaction")
-            cancellation_sent = True
-        if current.get("thread_id") and time.time() >= next_quota_check and not cancellation_sent:
-            from .harness import handoff_limit
-            from .session import quota_running_out
-            next_quota_check = time.time() + 60
-            if cut_off := context.router.family_cut_off(route["family"], launched_at):
-                bridge.cancel_request(current, cut_off, "cutoff")
-                cancellation_sent = True
-                context.journal.emit("session-cut-off", f"T3 cancellation requested: {cut_off}", settings.fields)
-            elif settings.handoff_message is not None and handoff_reason is None:
-                quota_reason = quota_running_out(context, route)
-                handoff_reason = quota_reason if quota_reason and quota_slot.try_claim() else None
-                if current.get("context_tokens", 0) >= handoff_limit(context.project.config, route["harness"]):
-                    handoff_reason = "native callback reached WPO context handoff threshold"
-                if handoff_reason:
-                    bridge.submit("message", request["id"] + ":handoff", {"thread_id": current["thread_id"],
-                                  "message": settings.handoff_message(handoff_reason)}, current["coordinator_thread_id"])
-                    context.journal.emit("handoff-requested", f"T3 handoff requested: {handoff_reason}", settings.fields)
+    controls = SessionControls(context, bridge, request, route, settings.stop_on_compaction, settings.fields,
+                               inbox=settings.inbox, handoff_message=settings.handoff_message)
     try:
-        completed = bridge.wait(request, messages)
+        bridge.wait(request, controls)
     except T3Error as error:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"type": "result", "is_error": True, "result": str(error), "backend": "t3", "recoverable_request_id": request["id"]}) + "\n")
@@ -820,46 +799,164 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
             context.journal.emit("wp-blocked", str(error), {"wp": wp_id})
         raise
     finally:
-        quota_slot.release()
+        controls.close()
         if settings.inbox:
             clear_live(settings.inbox)
-    result = completed.get("result", {})
-    text = result.get("text", "")
-    outcome = result.get("outcome") or ("ok" if completed["state"] == "done" else "session_error")
-    violation = None
-    if request["payload"].get("before_tree"):
-        from .commands import worktree_tree_id
-        from .project import git
-        from .wpfile import glob_to_regex
-        after_tree = worktree_tree_id(settings.cwd)
-        changed = git(settings.cwd, "diff", "--name-only", "--no-renames", "-z", request["payload"]["before_tree"], after_tree).stdout.split("\0")
-        patterns = [] if settings.access in ("read", "reviewer") else request["payload"]["write_paths"]
-        outside = [path for path in filter(None, changed) if not any(glob_to_regex(pattern).match(path) for pattern in patterns)]
-        if outside:
-            violation = f"Native {settings.access} task changed paths outside its access contract: {', '.join(outside)}. Changes are preserved for manual review; no automatic rollback or fallback is safe."
-            outcome = "scope_violation"
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
-                                 "backend": "t3", "t3": {"task_id": completed.get("task_id"), "thread_id": completed.get("thread_id"), "link": completed.get("link")}}) + "\n")
-        handle.write(json.dumps({"type": "result", "subtype": "success" if outcome == "ok" else "error", "is_error": outcome != "ok", "result": text + ("\n\n" + violation if violation else ""),
-                                 "session_id": request["id"], "backend": "t3", "usage_available": bool(result.get("usage")), **({"usage": result["usage"]} if result.get("usage") else {})}) + "\n")
-    write_json(receipt, {**read_json(receipt), "consumed": True})
-    # First match wins: a scope violation, an operator's cancel (whatever state the task reached:
-    # its own result may win the race against the native cancel), a staged compaction stop, the
-    # runner's worker cleanup; otherwise the outcome (a quota cut-off's cancel is a session_error).
-    if violation:
-        if wp_id:
-            from . import wpfile
-            wpfile.set_status(context.wp_in_tree(wp_id, settings.cwd), "blocked")
-            context.journal.emit("wp-blocked", violation, {"wp": wp_id})
+    return finish_attempt(context, request, settings.on_finished, handoff_reason=controls.handoff_reason)
+
+
+class SessionControls:
+    """What runs while a native session is waited on: the orchestrator's inbox messages, the staged
+    compaction cancel, the quota cut-off and the handoff request. A recovered session (PR 3b) gets
+    the compaction cancel and the cut-off; inbox delivery and handoff need a live builder."""
+
+    def __init__(self, context: Context, bridge: Bridge, request: dict, route: dict, stop_on_compaction: bool, fields: dict,
+                 inbox: Path | None = None, handoff_message=None) -> None:
+        from .session import QuotaHandoffSlot
+        self.context, self.bridge, self.request, self.route = context, bridge, request, route
+        self.stop_on_compaction, self.fields, self.inbox, self.handoff_message = stop_on_compaction, fields, inbox, handoff_message
+        self.launched_at = time.time()
+        self.next_quota_check = 0.0
+        self.handoff_reason: str | None = None
+        self.cancellation_sent = False
+        self.quota_slot = QuotaHandoffSlot(context.router.state_dir, route["family"], request["payload"]["log_path"])
+
+    def close(self) -> None:
+        self.quota_slot.release()
+
+    def __call__(self, current: dict) -> None:
+        from .inbox import pending_messages
+        bridge, context, route = self.bridge, self.context, self.route
+        if self.inbox and current.get("thread_id"):
+            for message in pending_messages(self.inbox):
+                bridge.submit("message", message.name, {"thread_id": current["thread_id"], "message": message.read_text(encoding="utf-8"), "message_path": str(message)},
+                              current["coordinator_thread_id"])
+        if current.get("task_id") and not self.cancellation_sent and current.get("compacted") and self.stop_on_compaction:
+            bridge.cancel_request(current, "native compaction callback reached staged context boundary", "compaction")
+            self.cancellation_sent = True
+        if current.get("thread_id") and time.time() >= self.next_quota_check and not self.cancellation_sent:
+            from .harness import handoff_limit
+            from .session import quota_running_out
+            self.next_quota_check = time.time() + 60
+            if cut_off := context.router.family_cut_off(route["family"], self.launched_at):
+                bridge.cancel_request(current, cut_off, "cutoff")
+                self.cancellation_sent = True
+                context.journal.emit("session-cut-off", f"T3 cancellation requested: {cut_off}", self.fields)
+            elif self.handoff_message is not None and self.handoff_reason is None:
+                quota_reason = quota_running_out(context, route)
+                self.handoff_reason = quota_reason if quota_reason and self.quota_slot.try_claim() else None
+                if current.get("context_tokens", 0) >= handoff_limit(context.project.config, route["harness"]):
+                    self.handoff_reason = "native callback reached WPO context handoff threshold"
+                if self.handoff_reason:
+                    bridge.submit("message", self.request["id"] + ":handoff", {"thread_id": current["thread_id"],
+                                  "message": self.handoff_message(self.handoff_reason)}, current["coordinator_thread_id"])
+                    context.journal.emit("handoff-requested", f"T3 handoff requested: {self.handoff_reason}", self.fields)
+
+
+def finish_attempt(context: Context, request: dict, on_finished=None, recovery: bool = False, handoff_reason: str | None = None):
+    """Completes a terminal native session: the one path for a live attempt and for recovery.
+
+    Under the request's finish lock: `on_finished(route)` (the caller's writer recording, so it is
+    persisted before anything can fail, stop or consume), the scope check, the disposition (first
+    match wins: scope_violation, cancelled_by_operator, compacted, cancelled_by_cleanup, else the
+    outcome), the session log's result (once per request), then the disposition and `consumed_at`
+    on the request and the receipt marked consumed, the last writes. Every step before them is
+    idempotent, so a finish replayed after a crash gives the same result; a request already consumed
+    only returns what was recorded. Live, it raises or returns per the disposition (T3Error,
+    SessionCancelled, CompactionStop or the SessionOutcome); with `recovery` it returns the
+    disposition and raises nothing."""
+    from .routing import SessionOutcome
+    from .session import CompactionStop, SessionCancelled
+    bridge = Bridge(context)
+    path = bridge.request_path(request["id"])
+    with FileLock(path.with_name(f"{path.stem}.finish.lock"), timeout_seconds=600):
+        completed = read_json(path)
+        payload = completed["payload"]
+        route, log_path, wp_id = payload["route"], Path(payload["log_path"]), payload.get("wp")
+        result = completed.get("result") or {}
+        text = result.get("text", "")
+        outcome = result.get("outcome") or ("ok" if completed["state"] == "done" else "session_error")
+        if completed.get("consumed_at"):
+            disposition, violation = completed.get("disposition") or outcome, completed.get("violation")
+        else:
+            if on_finished is not None:
+                on_finished(route)
+            violation = scope_violation(context, payload)
+            if violation and wp_id:
+                from . import wpfile
+                wp = context.wp_in_tree(wp_id, Path(payload["cwd"]))
+                if wp.status != "blocked":
+                    wpfile.set_status(wp, "blocked")
+                    context.journal.emit("wp-blocked", violation, {"wp": wp_id})
+            if violation:
+                disposition = "scope_violation"
+            elif completed.get("cancel_origin") == "operator":
+                disposition = "cancelled_by_operator"
+            elif (outcome == "compacted" or completed.get("compacted")) and payload.get("stop_on_compaction"):
+                disposition = "compacted"
+            elif completed.get("cancel_origin") == "cleanup":
+                disposition = "cancelled_by_cleanup"
+            else:
+                disposition = outcome
+            logged_outcome = "scope_violation" if violation else outcome
+            if not session_result_logged(log_path, completed["id"]):
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+                                             "backend": "t3", "t3": {"task_id": completed.get("task_id"), "thread_id": completed.get("thread_id"), "link": completed.get("link")}}) + "\n")
+                    handle.write(json.dumps({"type": "result", "subtype": "success" if logged_outcome == "ok" else "error", "is_error": logged_outcome != "ok",
+                                             "result": text + ("\n\n" + violation if violation else ""), "session_id": completed["id"], "backend": "t3",
+                                             "usage_available": bool(result.get("usage")), **({"usage": result["usage"]} if result.get("usage") else {})}) + "\n")
+            with FileLock(path.with_suffix(".lock")):
+                current = read_json(path)
+                current.update(disposition=disposition, violation=violation, consumed_at=time.time())
+                write_json(path, current)
+            receipt = log_path.with_name(log_path.name + ".t3-invocation.json")
+            with FileLock(receipt.with_suffix(".lock")):
+                recorded = read_json(receipt)
+                if recorded is not None and recorded["request_id"] == completed["id"] and not recorded["consumed"]:
+                    write_json(receipt, {**recorded, "consumed": True})
+    if recovery:
+        return disposition
+    detail = completed.get("cancel_detail") or completed.get("detail") or ""
+    if disposition == "scope_violation":
         raise T3Error(violation)
-    from .session import SessionCancelled
-    if completed.get("cancel_origin") == "operator":
-        raise SessionCancelled(route["id"], "operator", completed.get("cancel_detail") or completed.get("detail") or "")
-    if (outcome == "compacted" or completed.get("compacted")) and settings.stop_on_compaction:
-        from .session import CompactionStop
+    if disposition == "cancelled_by_operator":
+        raise SessionCancelled(route["id"], "operator", detail)
+    if disposition == "compacted":
         raise CompactionStop(route["id"], log_path)
-    if completed.get("cancel_origin") == "cleanup":
-        raise SessionCancelled(route["id"], "cleanup", completed.get("cancel_detail") or completed.get("detail") or "")
+    if disposition == "cancelled_by_cleanup":
+        raise SessionCancelled(route["id"], "cleanup", detail)
     return SessionOutcome(outcome, result.get("detail") or completed.get("detail") or "", text,
                           handoff_reason=result.get("handoff_reason") or handoff_reason)
+
+
+def scope_violation(context: Context, payload: dict) -> str | None:
+    """What a read-only or limited-access session changed outside its access contract, if anything."""
+    if not payload.get("before_tree"):
+        return None
+    from .commands import worktree_tree_id
+    from .project import git
+    from .wpfile import glob_to_regex
+    cwd = Path(payload["cwd"])
+    changed = git(cwd, "diff", "--name-only", "--no-renames", "-z", payload["before_tree"], worktree_tree_id(cwd)).stdout.split("\0")
+    patterns = [] if payload["access"] in ("read", "reviewer") else payload["write_paths"]
+    outside = [path for path in filter(None, changed) if not any(glob_to_regex(pattern).match(path) for pattern in patterns)]
+    if not outside:
+        return None
+    return (f"Native {payload['access']} task changed paths outside its access contract: {', '.join(outside)}. "
+            "Changes are preserved for manual review; no automatic rollback or fallback is safe.")
+
+
+def session_result_logged(log_path: Path, request_id: str) -> bool:
+    """Whether the session log already holds this request's result (a finish replayed after a crash)."""
+    if not log_path.is_file():
+        return False
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("{") and '"type": "result"' in line:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("type") == "result" and record.get("session_id") == request_id:
+                return True
+    return False

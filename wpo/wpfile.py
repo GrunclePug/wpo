@@ -7,6 +7,7 @@ a small YAML subset: `key: scalar` and inline lists `key: [a, b]`, with `#` comm
 from __future__ import annotations
 
 import re
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -133,10 +134,13 @@ def read_text(path: Path) -> str:
 
 
 def write_text(path: Path, text: str) -> None:
-    """Writes UTF-8 without a BOM. Python opens files sharing reads, so an editor holding the file
-    open does not block the write."""
-    with path.open("w", encoding="utf-8", newline="") as handle:
+    """Writes UTF-8 without a BOM, atomically: a temporary file beside it replaces it, so a process
+    killed mid-write leaves the previous content, never an empty or partial WP file."""
+    from .platform import replace_file
+    staging = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with staging.open("w", encoding="utf-8", newline="") as handle:
         handle.write(text)
+    replace_file(staging, path)
 
 
 def newline_of(text: str) -> str:
