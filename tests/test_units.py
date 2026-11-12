@@ -832,6 +832,9 @@ class RoundLedgerTests(unittest.TestCase):
         from wpo.session import CompactionStop
         directory = Path(tempfile.mkdtemp())
         ledger = RoundLedger(directory / "attempts.json")
+        continuous_guard = mock.patch("wpo.continuous.checkpoint", return_value=None)
+        continuous_guard.start()
+        self.addCleanup(continuous_guard.stop)
         fake = SimpleNamespace(ledger=ledger, run_dir=directory, tree=directory, families=[], options=SimpleNamespace(idle_minutes=None),
                                wp_id="WP-0001", env={}, context=None, log=lambda message: None, mode="standard", mode_recorder=lambda mode: None)
         fake.record_writer = lambda role, route: WorkPackageRun.record_writer(fake, role, route)
@@ -1015,7 +1018,7 @@ class ResumeTests(unittest.TestCase):
     def test_the_supervisor_of_a_pool_built_lane_skips_builds(self) -> None:
         from types import SimpleNamespace
         from wpo.supervisor import Supervisor
-        lane = SimpleNamespace(context=SimpleNamespace(effective_wps=lambda: self.wps, merged_done_ids=set, parse_errors={}),
+        lane = SimpleNamespace(context=SimpleNamespace(project=self.context.project, effective_wps=lambda: self.wps, merged_done_ids=set, parse_errors={}),
                                project=self.context.project, name="hygiene", is_pool=False, is_lane=True, wp_ids=[], finished={},
                                builds_in_pool=True, report_parse_errors=lambda: None,
                                claim=lambda wp_id: SimpleNamespace(release=lambda: None))

@@ -82,7 +82,7 @@ class RoundLedger:
 
     @staticmethod
     def fresh() -> dict:
-        return {"rounds": 0, "failures": 0, "evaluations": 0, "feedback": "", "guidance": "", "history": [], "escalated_to": None, "open": False,
+        return {"rounds": 0, "failures": 0, "nonprogress_total": 0, "evaluations": 0, "feedback": "", "guidance": "", "history": [], "escalated_to": None, "open": False,
                 "last_builder": None, "interruptions": 0, "handoff": None, "handoffs": 0, "writing": None, "builder_model_family": None}
 
     @property
@@ -99,9 +99,10 @@ class RoundLedger:
     def migrated(cls, state: dict) -> dict:
         """Ledgers written as attempt counts: every counted attempt that left feedback failed."""
         if "rounds" in state:
-            return {**cls.fresh(), **state}
+            return {**cls.fresh(), "nonprogress_total": int(state.get("failures", 0)) + int(state.get("interruptions", 0)), **state}
         attempts = int(state.get("attempts", 0))
         return {**cls.fresh(), "rounds": attempts, "failures": attempts if state.get("feedback") else 0,
+                "nonprogress_total": attempts if state.get("feedback") else 0,
                 "feedback": state.get("feedback", ""), "open": bool(state.get("open"))}
 
     @staticmethod
@@ -113,7 +114,7 @@ class RoundLedger:
         self.path.write_text(json.dumps(self.state, indent=2) + "\n", encoding="utf-8")
 
     def reset(self) -> None:
-        self.state = self.fresh()
+        self.state = {**self.fresh(), "nonprogress_total": self.state["nonprogress_total"]}
         self.save()
 
     def close(self) -> None:
@@ -157,6 +158,7 @@ class RoundLedger:
         self.state["rounds"] = max(0, self.rounds - 1)
         self.state["open"] = False
         self.state["interruptions"] = self.interruptions + 1
+        self.state["nonprogress_total"] += 1
         self.state["feedback"] = feedback
         entry = {"round": self.rounds + 1, "kind": "session interrupted", "at": f"{datetime.now():%Y-%m-%d %H:%M}", "feedback": feedback[:self.HISTORY_CHARACTERS]}
         self.state["history"] = [*self.history, entry][-self.HISTORY_ENTRIES:]
@@ -236,6 +238,7 @@ class RoundLedger:
     def fail(self, kind: str, feedback: str, force_evaluation_after: int | None = None) -> None:
         """Records a failed round; `force_evaluation_after` makes the next round re-evaluate first."""
         self.state["feedback"] = feedback
+        self.state["nonprogress_total"] += 1
         self.state["interruptions"] = 0
         self.state["handoffs"] = 0
         self.state["failures"] = max(self.failures + 1, force_evaluation_after or 0)
@@ -527,7 +530,8 @@ def builder_prompt(context: Context, wp: wpfile.WorkPackage, tree: Path, round_n
                    handoff: dict | None = None, recovery: str = "") -> str:
     config = context.project.config
     files = wp_files(context, wp, tree, config["builder_reading"])
-    rules = "\n".join(config["prompt_rules"])
+    from .continuous import prompt as milestone_prompt
+    rules = "\n".join(config["prompt_rules"]) + milestone_prompt(context, wp.id)
     rejected = f"\nThe previous round did not pass. Fix these problems first:\n{feedback}\n" if feedback else ""
     lead = lead_instructions(context, wp, delegate_tier) if delegate_tier else ""
     continued = (f"\nThe previous builder session of this work package handed off to you ({handoff['why']}). Continue from its handoff; "
@@ -567,7 +571,8 @@ def recovery_section(report: str) -> str:
 def resume_prompt(context: Context, wp: wpfile.WorkPackage, round_number: int, feedback: str, recovery: str = "") -> str:
     """Continues the previous builder session: only what changed since its last turn and what to fix."""
     fixers = ", ".join(fixer.name for fixer in configured_fixers(context.project.config)) or "none"
-    rules = "\n".join(context.project.config["prompt_rules"])
+    from .continuous import prompt as milestone_prompt
+    rules = "\n".join(context.project.config["prompt_rules"]) + milestone_prompt(context, wp.id)
     return f"""Builder round {round_number} for work package {wp.id}. You are continuing your own session from the previous round, which did not pass.
 Fix these problems first:
 {feedback}
@@ -755,6 +760,10 @@ class WorkPackageRun:
         self.context.journal.emit(kind, message, {"wp": self.wp_id})
 
     def session(self, spec: str, role: str, prompt: str, log_stem: Path, status_to_restore: str, **extra) -> object:
+        from .continuous import checkpoint
+        if checkpoint(self.context, self.wp_id):
+            wpfile.set_status(self.wp(), status_to_restore)
+            raise RunPaused(None)
         access = "reviewer" if role == "reviewer" else "builder"
         # A builder session that never started wrote nothing: the writing record goes back to what it was.
         writing_before = extra.pop("writing_before", self.ledger.writing)
@@ -1287,6 +1296,9 @@ class WorkPackageRun:
             self.log("status is review; re-verifying and re-reviewing without a builder session")
         try:
             while True:
+                from .continuous import checkpoint
+                if checkpoint(self.context, self.wp_id):
+                    raise RunPaused(None)
                 if skip_builder:
                     round_number = max(self.ledger.rounds, 1)
                     skip_builder = False

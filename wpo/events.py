@@ -20,6 +20,7 @@ from pathlib import Path
 from .platform import FileLock, pid_alive
 
 ATTENTION_KINDS = frozenset({
+    "progress-intervention",
     "wp-blocked",
     "no-route",
     "integration-failed",

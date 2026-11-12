@@ -87,7 +87,8 @@ def lane_outcome(context: Context, lane: str, wps: list[wpfile.WorkPackage], mer
         return "supervisor still running", None
     if lane in pool_lanes(context):
         return "starting the pool", ids
-    runnable = [wp.id for wp in wps if set(wp.depends_on) <= merged]
+    from .continuous import block_reason
+    runnable = [wp.id for wp in wps if set(wp.depends_on) <= merged and not block_reason(context, wp.id)]
     if not runnable:
         return f"waiting on dependencies ({', '.join(ids)})", None
     if context.project.lane(lane).get("builds_in_pool"):
