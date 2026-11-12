@@ -26,6 +26,21 @@ if TYPE_CHECKING:
 
 # The model option that carries a route's effort, by the name each T3 provider gives it.
 EFFORT_OPTIONS = ("effort", "reasoningEffort", "thinking_level")
+TERMINAL_STATES = ("done", "failed", "cancelled")
+# Kinds asked again once their last request finished: the same attention reason can recur, and a
+# failed or cancelled checkout must be preparable again. Sessions have their own receipts;
+# cancels and messages are one-shot.
+REARMED_KINDS = ("attention", "workspace")
+# `t3 thread send` may take this long; the wake lock covers it, the debounce and a margin.
+WAKE_SEND_TIMEOUT_SECONDS = 45
+
+
+def request_id_for(kind: str, key: str, generation: int = 1) -> str:
+    """A request's id. Generation 1 keeps the original derivation, so existing request files stay
+    valid; later generations hash an encoding no generation-1 input (which starts with a kind name)
+    and no other key's generation can equal."""
+    text = f"{kind}:{key}" if generation == 1 else json.dumps(["generation", generation, kind, key])
+    return hashlib.sha256(text.encode()).hexdigest()[:32]
 
 
 class T3Error(RuntimeError):
@@ -184,15 +199,24 @@ class Bridge:
         return self.directory / "requests" / f"{request_id}.json"
 
     def wake(self, thread_id: str, force: bool = False, created_after: float | None = None) -> None:
+        """Sends the coordinator a control wake. The stamp holds when the last send started: a
+        request created before that is covered by it (the coordinator's `t3 next` runs after the
+        send arrives). A wake for a newer request inside the debounce window waits out the window
+        and sends, rather than being dropped: an attention request has no waiter to wake it again."""
         self.directory.mkdir(parents=True, exist_ok=True)
         key = hashlib.sha256(thread_id.encode()).hexdigest()[:16]
         stamp = self.directory / f"wake-{key}.json"
-        with FileLock(self.directory / f"wake-{key}.lock"):
+        debounce = float(self.settings.get("wake_debounce_seconds", 5))
+        with FileLock(self.directory / f"wake-{key}.lock", timeout_seconds=WAKE_SEND_TIMEOUT_SECONDS + debounce + 10):
             previous = read_json(stamp, {})
             if not force and created_after is not None and previous.get("at", 0) >= created_after:
                 return
-            if not force and time.time() - previous.get("at", 0) < float(self.settings.get("wake_debounce_seconds", 5)):
-                return
+            remaining = debounce - (time.time() - previous.get("at", 0))
+            if not force and remaining > 0:
+                if created_after is None:
+                    return
+                # The lock is held, so no other send can start meanwhile.
+                time.sleep(remaining)
             prompt = (f"WPO T3 backend control: pending native requests for coordinator {thread_id}. "
                       f"Read the wp-orchestration T3 bridge instructions and run wpo --project \"{self.project.root.as_posix()}\" "
                       f"t3 next --coordinator {thread_id}. Execute the returned native tool plan; do not perform the requested worker/review task yourself. "
@@ -200,21 +224,32 @@ class Bridge:
             command = [str(Path(self.settings.get("cli", "t3")).expanduser()), "thread", "send", thread_id, "-", "--json"]
             if self.settings.get("base_dir"):
                 command += ["--base-dir", str(Path(self.settings["base_dir"]).expanduser())]
-            completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=45, check=False)
+            started = time.time()
+            completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                                       timeout=WAKE_SEND_TIMEOUT_SECONDS, check=False)
             if completed.returncode:
                 raise T3Error(f"T3 coordinator wake failed: {(completed.stderr or completed.stdout).strip()[:1000]}")
-            write_json(stamp, {"at": time.time(), "thread_id": thread_id})
+            write_json(stamp, {"at": started, "thread_id": thread_id})
 
     def submit(self, kind: str, key: str, payload: dict, coordinator: str) -> dict:
-        request_id = hashlib.sha256(f"{kind}:{key}".encode()).hexdigest()[:32]
-        path = self.request_path(request_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with FileLock(path.with_suffix(".lock")):
-            request = read_json(path)
-            if request is None:
-                request = {"version": 1, "id": request_id, "kind": kind, "state": "pending", "coordinator_thread_id": coordinator,
-                           "created_at": time.time(), "payload": payload, "task_id": None, "thread_id": None, "link": None}
-                write_json(path, request)
+        generation = 1
+        while True:
+            request_id = request_id_for(kind, key, generation)
+            path = self.request_path(request_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with FileLock(path.with_suffix(".lock")):
+                request = read_json(path)
+                if request is None:
+                    request = {"version": 1, "id": request_id, "kind": kind, "state": "pending", "coordinator_thread_id": coordinator,
+                               "created_at": time.time(), "payload": payload, "task_id": None, "thread_id": None, "link": None}
+                    if generation > 1:
+                        request["generation"] = generation
+                    write_json(path, request)
+                    break
+            if kind in REARMED_KINDS and request["state"] in TERMINAL_STATES:
+                generation += 1
+                continue
+            break
         # Stable keys make restarts reconnect to an existing request instead of launching another child.
         if request["state"] in ("pending", "claimed"):
             self.wake(coordinator, created_after=request["created_at"])
@@ -308,7 +343,8 @@ class Bridge:
     def register_workspace(self, request_id: str, thread_id: str, tree: Path) -> dict:
         from .project import git
 
-        request = read_json(self.request_path(request_id))
+        path = self.request_path(request_id)
+        request = read_json(path)
         if not request or request["kind"] != "workspace":
             raise T3Error("Workspace registration needs a pending workspace request")
         tree = Path(git(tree, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
@@ -320,10 +356,20 @@ class Bridge:
         if git(tree, "merge-base", "--is-ancestor", expected, "HEAD", check=False).returncode:
             raise T3Error("The T3 checkout does not contain WPO's expected local main commit; correct T3's base selection before registering")
         branch = git(tree, "symbolic-ref", "--short", "HEAD").stdout.strip()
-        workspace = {"version": 1, "backend": "t3", "wp": request["payload"]["wp"], "path": str(tree), "branch": branch,
-                     "coordinator_thread_id": thread_id, "request_id": request_id, "registered_at": time.time()}
-        write_json(self.project.wp_run_dir(workspace["wp"]) / "t3-workspace.json", workspace)
-        self.update(request_id, state="done", result=workspace, thread_id=thread_id)
+        with FileLock(path.with_suffix(".lock")):
+            request = read_json(path)
+            if request["state"] in TERMINAL_STATES:
+                recorded = request.get("result") or {}
+                if request["state"] == "done" and (recorded.get("path"), recorded.get("branch"), recorded.get("coordinator_thread_id")) == (str(tree), branch, thread_id):
+                    return recorded  # a repeated callback is idempotent
+                request["late_result"] = {"path": str(tree), "branch": branch, "thread_id": thread_id, "at": time.time()}
+                write_json(path, request)
+                raise T3Error(f"Workspace request {request_id} is already {request['state']}; this registration was recorded but not applied")
+            workspace = {"version": 1, "backend": "t3", "wp": request["payload"]["wp"], "path": str(tree), "branch": branch,
+                         "coordinator_thread_id": thread_id, "request_id": request_id, "registered_at": time.time()}
+            write_json(self.project.wp_run_dir(workspace["wp"]) / "t3-workspace.json", workspace)
+            request.update(state="done", result=workspace, thread_id=thread_id, updated_at=time.time())
+            write_json(path, request)
         return workspace
 
     def ensure_workspace(self, wp_id: str) -> Path:
