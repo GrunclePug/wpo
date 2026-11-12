@@ -7,6 +7,7 @@ their callbacks here. No provider credentials are copied and no model CLI is lau
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -245,7 +246,7 @@ class Bridge:
                 raise T3Error(f"T3 coordinator wake failed: {(completed.stderr or completed.stdout).strip()[:1000]}")
             write_json(stamp, {"at": started, "thread_id": thread_id})
 
-    def submit(self, kind: str, key: str, payload: dict, coordinator: str, initial: dict | None = None) -> dict:
+    def submit(self, kind: str, key: str, payload: dict, coordinator: str, initial: dict | None = None, wake: bool = True) -> dict:
         generation = 1
         while True:
             request_id = request_id_for(kind, key, generation)
@@ -266,7 +267,7 @@ class Bridge:
                 continue
             break
         # Stable keys make restarts reconnect to an existing request instead of launching another child.
-        if request["state"] in ("pending", "claimed"):
+        if wake and request["state"] in ("pending", "claimed"):
             self.wake(coordinator, created_after=request["created_at"])
         return request
 
@@ -481,6 +482,18 @@ class Bridge:
         if state not in ("done", "failed", "cancelled"):
             raise T3Error("A completion state must be done, failed or cancelled")
         path = self.request_path(request_id)
+        # What a scope-checked task changed, recorded when it completes: a later finish (the worker
+        # barrier, recovery) then judges it on its own changes, not on whatever the checkout holds
+        # by then. Hashed outside the lock, which a large tree would hold up.
+        snapshot = {}
+        unlocked = read_json(path)
+        if unlocked and unlocked["state"] not in TERMINAL_STATES and unlocked["payload"].get("before_tree"):
+            from .commands import changed_since
+            from .project import ProjectError
+            try:
+                snapshot = {"completed_changes": changed_since(Path(unlocked["payload"]["cwd"]), unlocked["payload"]["before_tree"])}
+            except (OSError, RuntimeError, ProjectError) as error:
+                snapshot = {"completed_changes": None, "completed_changes_error": str(error)}
         with FileLock(path.with_suffix(".lock")):
             request = read_json(path)
             if request is None:
@@ -503,7 +516,7 @@ class Bridge:
                 return request
             request.update(state=state, result=result, detail=result.get("detail"), updated_at=time.time(),
                            task_id=result.get("task_id", request.get("task_id")), thread_id=result.get("thread_id", request.get("thread_id")),
-                           link=result.get("link", request.get("link")))
+                           link=result.get("link", request.get("link")), **snapshot)
             write_json(path, request)
             return request
 
@@ -527,28 +540,38 @@ class Bridge:
                                 request.get("cancel_origin") or "operator")
         return request
 
-    def begin_session(self, log_path: Path, payload: dict, coordinator: str) -> tuple[dict, Path]:
+    def begin_session(self, log_path: Path, payload: dict, coordinator: str, guard=None) -> tuple[dict, Path]:
+        """The session's request: the unconsumed one its receipt names, or a new generation. The
+        submit (and a reconnect) runs inside `guard(request_id)`, a context manager, so what the
+        guard writes or checks happens before the request is published; the coordinator is woken
+        only after the guard has exited."""
+        guard = guard or contextlib.nullcontext
         receipt = log_path.with_name(log_path.name + ".t3-invocation.json")
         with FileLock(receipt.with_suffix(".lock")):
             previous = read_json(receipt)
             if previous is not None and not previous["consumed"]:
                 current = read_json(self.request_path(previous["request_id"]))
                 if current is not None and not current.get("consumed_at"):
-                    return current, receipt
+                    with guard(current["id"]):
+                        return current, receipt
                 # No request (a start interrupted before its submit) or one already finished whose
                 # receipt write was lost: the request's `consumed_at` is authoritative.
                 previous = {**previous, "consumed": True}
                 write_json(receipt, previous)
             generation = previous["generation"] + 1 if previous else 1
             key = f"{log_path}:{generation}"
+            request_id = request_id_for("session", key)
             # The receipt names the request before it is submitted (and may wake a coordinator), so a
             # crash in between never leaves a launched request without a receipt.
-            write_json(receipt, {"version": 1, "generation": generation, "request_id": request_id_for("session", key), "consumed": False})
+            write_json(receipt, {"version": 1, "generation": generation, "request_id": request_id, "consumed": False})
             if log_path.is_file():
                 archived = log_path.with_name(f"{log_path.stem}.generation-{generation - 1}{log_path.suffix}")
                 log_path.replace(archived)
-            request = self.submit("session", key, payload, coordinator, initial={"consumed_at": None})
-            return request, receipt
+            with guard(request_id):
+                request = self.submit("session", key, payload, coordinator, initial={"consumed_at": None}, wake=False)
+        if request["state"] in ("pending", "claimed"):
+            self.wake(coordinator, created_after=request["created_at"])
+        return request, receipt
 
     def outstanding_sessions(self, wp_id: str) -> list[dict]:
         """The WP's native sessions no runner has finished, oldest first, read from the request store
@@ -761,13 +784,16 @@ def cli_command(context: Context, arguments) -> int:
 
 def run_attempt(context: Context, route: dict, prompt: str, log_path: Path, settings, resume_session=None):
     if settings.access != "builder":
-        key = hashlib.sha256(str(settings.cwd.resolve()).encode()).hexdigest()[:16]
+        key = scope_key(settings.cwd)
         with NamedMutex(context.project.mutex_name("t3-scope", key)):
             bridge = Bridge(context)
             lease = read_json(bridge.directory / "scope" / f"{key}.json")
-            if lease and lease["log_path"] != str(log_path):
+            receipt = read_json(log_path.with_name(log_path.name + ".t3-invocation.json"))
+            # Our own reconnect, to the request the lease names, is admitted; a reused log path
+            # with a new generation is checked like any other task.
+            if lease and not (receipt and not receipt["consumed"] and receipt["request_id"] == lease["request_id"]):
                 previous = read_json(bridge.request_path(lease["request_id"]))
-                if previous and previous["state"] not in ("done", "failed", "cancelled"):
+                if previous and previous["state"] not in TERMINAL_STATES:
                     raise T3Error("A previous native scope-checked task has no terminal callback; reconcile it before starting another worker in this checkout")
             return _run_attempt(context, route, prompt, log_path, settings, resume_session)
     return _run_attempt(context, route, prompt, log_path, settings, resume_session)
@@ -837,6 +863,13 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
         before_tree = worktree_tree_id(settings.cwd)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.with_name(log_path.name + ".prompt.md").write_text(prompt_text, encoding="utf-8")
+
+    @contextlib.contextmanager
+    def lease(request_id: str):
+        # The scope lease names the request before it is published, so the next task in this
+        # checkout can never start while it runs unseen.
+        write_json(bridge.directory / "scope" / f"{scope_key(settings.cwd)}.json", {"request_id": request_id, "log_path": str(log_path)})
+        yield
     request, receipt = bridge.begin_session(log_path, {"wp": wp_id, "role": role, "title": f"{wp_id or context.project.name}: {role}",
                             "native_role": {"reviewer": "review", "read": "research", "docs": "research", "evaluator": "general", "worker": "implementation", "builder": "implementation"}[settings.access],
                             "prompt": prompt_text, "target": target, "route": route, "log_path": str(log_path),
@@ -844,11 +877,8 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
                             "resume_session": resume_session, "stop_on_compaction": settings.stop_on_compaction,
                             "idle_minutes": settings.idle_minutes, "heartbeat_file": str(log_path.parent / "heartbeat"),
                             "progress_file": str(context.wp_in_tree(wp_id, settings.cwd).path) if wp_id else None},
-                            bridge.coordinator_for(wp_id))
+                            bridge.coordinator_for(wp_id), lease if settings.access != "builder" else None)
     write_json(identity_path, {"version": 1, "env": {**identity, "WPO_T3_REQUEST_ID": request["id"]}, "project": str(context.project.root)})
-    if settings.access != "builder":
-        key = hashlib.sha256(str(settings.cwd.resolve()).encode()).hexdigest()[:16]
-        write_json(bridge.directory / "scope" / f"{key}.json", {"request_id": request["id"], "log_path": str(log_path)})
     if not log_path.exists():
         log_path.write_text(json.dumps({"type": "system", "subtype": "init", "session_id": request["id"], "backend": "t3",
                                        "t3": {"request_id": request["id"], "target": target}}) + "\n", encoding="utf-8")
@@ -871,6 +901,11 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
         if settings.inbox:
             clear_live(settings.inbox)
     return finish_attempt(context, request, settings.on_finished, handoff_reason=controls.handoff_reason)
+
+
+def scope_key(cwd: Path) -> str:
+    """Names a checkout's scope mutex and lease file."""
+    return hashlib.sha256(str(cwd.resolve()).encode()).hexdigest()[:16]
 
 
 def with_session_prefix(text: str, prefix: str) -> str:
@@ -961,7 +996,11 @@ def finish_attempt(context: Context, request: dict, on_finished=None, recovery: 
         else:
             if on_finished is not None:
                 on_finished(route)
-            violation = scope_violation(context, payload)
+            changes = completed.get("completed_changes")
+            violation = scope_violation(context, payload, changes)
+            if violation and completed.get("completed_changes_error"):
+                violation += (f" Its completion snapshot failed ({completed.get('completed_changes_error')}); "
+                              "checked against the checkout as it is now.")
             if violation and wp_id:
                 from . import wpfile
                 wp = context.wp_in_tree(wp_id, Path(payload["cwd"]))
@@ -1010,15 +1049,15 @@ def finish_attempt(context: Context, request: dict, on_finished=None, recovery: 
                           handoff_reason=result.get("handoff_reason") or handoff_reason)
 
 
-def scope_violation(context: Context, payload: dict) -> str | None:
-    """What a read-only or limited-access session changed outside its access contract, if anything."""
+def scope_violation(context: Context, payload: dict, changed: list[str] | None = None) -> str | None:
+    """What a read-only or limited-access session changed outside its access contract, if anything:
+    among `changed` (its completion snapshot) when given, else the checkout as it is now."""
     if not payload.get("before_tree"):
         return None
-    from .commands import worktree_tree_id
-    from .project import git
+    from .commands import changed_since
     from .wpfile import glob_to_regex
-    cwd = Path(payload["cwd"])
-    changed = git(cwd, "diff", "--name-only", "--no-renames", "-z", payload["before_tree"], worktree_tree_id(cwd)).stdout.split("\0")
+    if changed is None:
+        changed = changed_since(Path(payload["cwd"]), payload["before_tree"])
     patterns = [] if payload["access"] in ("read", "reviewer") else payload["write_paths"]
     outside = [path for path in filter(None, changed) if not any(glob_to_regex(pattern).match(path) for pattern in patterns)]
     if not outside:
