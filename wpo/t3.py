@@ -31,6 +31,10 @@ TERMINAL_STATES = ("done", "failed", "cancelled")
 # failed or cancelled checkout must be preparable again. Sessions have their own receipts;
 # cancels and messages are one-shot.
 REARMED_KINDS = ("attention", "workspace")
+# Who asked for a cancellation. `operator` and `cleanup` end the session without a fallback route
+# (SessionCancelled); `cutoff` (quota) keeps the failure path; `compaction` is decided by the
+# request's `compacted` flag. A stronger origin replaces a weaker one on the original request.
+CANCEL_ORIGIN_RANK = {"compaction": 0, "cutoff": 1, "cleanup": 2, "operator": 3}
 # `t3 thread send` may take this long; the wake lock covers it, the debounce and a margin.
 WAKE_SEND_TIMEOUT_SECONDS = 45
 
@@ -444,6 +448,12 @@ class Bridge:
                 raise T3Error("Unknown bridge request")
             if request.get("task_id") and result.get("task_id") and request["task_id"] != result["task_id"]:
                 raise T3Error("Completion task ID does not match the recorded native task")
+            if result.get("outcome") is not None:
+                from .routing import OUTCOMES
+                # A staged session handles compaction; for any other, `Router.mark` would reject it.
+                allowed = ("ok", *OUTCOMES, *(("compacted",) if request["payload"].get("stop_on_compaction") else ()))
+                if result["outcome"] not in allowed:
+                    raise T3Error(f"Completion outcome {result['outcome']!r} is not one of: {', '.join(allowed)}")
             if request["state"] == "cancelled":
                 request["late_result"] = result
                 write_json(path, request)
@@ -472,9 +482,10 @@ class Bridge:
             request.update(state=state, task_id=response.get("taskId"), thread_id=response.get("childThreadId"),
                            link=response.get("link"), native_response=response, updated_at=time.time())
             write_json(path, request)
-        if state == "cancelled" and request.get("task_id"):
+        if request.get("task_id") and (state == "cancelled" or request.get("cancel_requested")):
             # Cancellation can win before delegate_task returns. The late task still must be stopped.
-            self.cancel_request(request, "request was cancelled before the native launch callback arrived")
+            self.cancel_request(request, request.get("cancel_detail") or "request was cancelled before the native launch callback arrived",
+                                request.get("cancel_origin") or "operator")
         return request
 
     def begin_session(self, log_path: Path, payload: dict, coordinator: str) -> tuple[dict, Path]:
@@ -491,19 +502,38 @@ class Bridge:
                 log_path.replace(archived)
             return request, receipt
 
-    def cancel_request(self, request: dict, why: str) -> dict:
-        if request.get("task_id"):
-            return self.submit("cancel", request["id"], {"task_id": request["task_id"], "reason": why,
-                                                       "original_request_id": request["id"]}, request["coordinator_thread_id"])
-        return self.update(request["id"], state="cancelled", detail=why)
+    def cancel_request(self, request: dict, why: str, origin: str) -> dict:
+        """Asks for a request to be cancelled; `origin` is one of CANCEL_ORIGIN_RANK. The origin is
+        recorded on the request itself, under its lock (cancel requests keep their first payload,
+        so a later, stronger origin could not be carried there). A request not launched yet stays
+        pending with `cancel_requested`: only the coordinator can say whether it launched it, so it
+        is settled by the coordinator's completion (or by its launch callback, which then queues
+        the native cancel), never locally."""
+        if origin not in CANCEL_ORIGIN_RANK:
+            raise ValueError(f"unknown cancel origin {origin!r}")
+        path = self.request_path(request["id"])
+        with FileLock(path.with_suffix(".lock")):
+            current = read_json(path)
+            if current["state"] in TERMINAL_STATES:
+                return current
+            if CANCEL_ORIGIN_RANK[origin] > CANCEL_ORIGIN_RANK.get(current.get("cancel_origin"), -1):
+                current["cancel_origin"] = origin
+            if not current.get("task_id"):
+                current.update(cancel_requested=True, cancel_detail=why)
+            write_json(path, current)
+        if current.get("task_id"):
+            return self.submit("cancel", current["id"], {"task_id": current["task_id"], "reason": why,
+                                                       "original_request_id": current["id"]}, current["coordinator_thread_id"])
+        self.wake(current["coordinator_thread_id"], created_after=time.time())
+        return current
 
-    def cancel_wp(self, wp_id: str, why: str, role: str | None = None) -> None:
+    def cancel_wp(self, wp_id: str, why: str, origin: str, role: str | None = None) -> None:
         for path in (self.directory / "requests").glob("*.json"):
             request = read_json(path)
             if request["state"] in ("done", "failed", "cancelled"):
                 continue
             if request["payload"].get("wp") == wp_id and (role is None or request["payload"].get("role") == role):
-                self.cancel_request(request, why)
+                self.cancel_request(request, why, origin)
 
     def recover(self, coordinator: str | None = None) -> int:
         requests = [read_json(path) for path in (self.directory / "requests").glob("*.json")]
@@ -576,7 +606,15 @@ def cli_command(context: Context, arguments) -> int:
         plans = []
         for request in bridge.pending(arguments.coordinator):
             entry = {"request": {key: request.get(key) for key in ("id", "kind", "state", "task_id", "thread_id", "link")}}
-            if request["state"] in ("pending", "claimed"):
+            if request["state"] in ("pending", "claimed") and request.get("cancel_requested"):
+                result_file = bridge.directory / "requests" / f"{request['id']}.cancelled-before-launch"
+                write_json(result_file, {"state": "cancelled", "detail": request.get("cancel_detail")})
+                entry["cancelled_before_launch"] = (
+                    f"Do not launch this request: it was cancelled ({request.get('cancel_origin')}: {request.get('cancel_detail')}). "
+                    f"If you never launched it, record that with wpo --project \"{context.project.root.as_posix()}\" "
+                    f"t3 complete --request {request['id']} --result-file \"{result_file.as_posix()}\". If you already launched it, "
+                    "record the launch with t3 started as usual; WPO then queues its native cancel.")
+            elif request["state"] in ("pending", "claimed"):
                 if request["kind"] == "attention":
                     entry["attention"] = request["payload"]["event"]
                 else:
@@ -613,7 +651,7 @@ def cli_command(context: Context, arguments) -> int:
         request = read_json(bridge.request_path(arguments.request))
         if request is None:
             raise T3Error("Unknown request")
-        bridge.cancel_request(request, arguments.reason)
+        bridge.cancel_request(request, arguments.reason, "operator")
         print("Cancellation queued for the native coordinator.")
     elif command == "event":
         event = read_json(arguments.event_file)
@@ -752,14 +790,14 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
                 bridge.submit("message", message.name, {"thread_id": current["thread_id"], "message": message.read_text(encoding="utf-8"), "message_path": str(message)},
                               current["coordinator_thread_id"])
         if current.get("task_id") and not cancellation_sent and current.get("compacted") and settings.stop_on_compaction:
-            bridge.cancel_request(current, "native compaction callback reached staged context boundary")
+            bridge.cancel_request(current, "native compaction callback reached staged context boundary", "compaction")
             cancellation_sent = True
         if current.get("thread_id") and time.time() >= next_quota_check and not cancellation_sent:
             from .harness import handoff_limit
             from .session import quota_running_out
             next_quota_check = time.time() + 60
             if cut_off := context.router.family_cut_off(route["family"], launched_at):
-                bridge.cancel_request(current, cut_off)
+                bridge.cancel_request(current, cut_off, "cutoff")
                 cancellation_sent = True
                 context.journal.emit("session-cut-off", f"T3 cancellation requested: {cut_off}", settings.fields)
             elif settings.handoff_message is not None and handoff_reason is None:
@@ -805,16 +843,23 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
                                  "backend": "t3", "t3": {"task_id": completed.get("task_id"), "thread_id": completed.get("thread_id"), "link": completed.get("link")}}) + "\n")
         handle.write(json.dumps({"type": "result", "subtype": "success" if outcome == "ok" else "error", "is_error": outcome != "ok", "result": text + ("\n\n" + violation if violation else ""),
                                  "session_id": request["id"], "backend": "t3", "usage_available": bool(result.get("usage")), **({"usage": result["usage"]} if result.get("usage") else {})}) + "\n")
-    if (outcome == "compacted" or completed.get("compacted")) and settings.stop_on_compaction:
-        from .session import CompactionStop
-        write_json(receipt, {**read_json(receipt), "consumed": True})
-        raise CompactionStop(route["id"], log_path)
     write_json(receipt, {**read_json(receipt), "consumed": True})
+    # First match wins: a scope violation, an operator's cancel (whatever state the task reached:
+    # its own result may win the race against the native cancel), a staged compaction stop, the
+    # runner's worker cleanup; otherwise the outcome (a quota cut-off's cancel is a session_error).
     if violation:
         if wp_id:
             from . import wpfile
             wpfile.set_status(context.wp_in_tree(wp_id, settings.cwd), "blocked")
             context.journal.emit("wp-blocked", violation, {"wp": wp_id})
         raise T3Error(violation)
+    from .session import SessionCancelled
+    if completed.get("cancel_origin") == "operator":
+        raise SessionCancelled(route["id"], "operator", completed.get("cancel_detail") or completed.get("detail") or "")
+    if (outcome == "compacted" or completed.get("compacted")) and settings.stop_on_compaction:
+        from .session import CompactionStop
+        raise CompactionStop(route["id"], log_path)
+    if completed.get("cancel_origin") == "cleanup":
+        raise SessionCancelled(route["id"], "cleanup", completed.get("cancel_detail") or completed.get("detail") or "")
     return SessionOutcome(outcome, result.get("detail") or completed.get("detail") or "", text,
                           handoff_reason=result.get("handoff_reason") or handoff_reason)

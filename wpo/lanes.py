@@ -201,7 +201,7 @@ def stop(context: Context, lane: str) -> None:
         bridge = Bridge(context)
         for wp in context.effective_wps():
             if wp.lane == lane:
-                bridge.cancel_wp(wp.id, f"lane {lane} stopped by the operator")
+                bridge.cancel_wp(wp.id, f"lane {lane} stopped by the operator", "operator")
     pid = supervisor_pid(context, lane)
     if pid is None:
         print(f"{lane}: no live supervisor")

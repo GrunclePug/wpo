@@ -1096,9 +1096,8 @@ class CatchUpWithMainTests(unittest.TestCase):
         self.assertEqual((self.worktree / "edited.txt").read_text(encoding="utf-8"), "builder work\n")
 
 
-class RecoveryIntegrationTests(unittest.TestCase):
-    """A supervisor's pass merges WPs done in their checkout but not on main, and never a WP main
-    already holds as done, though under T3 its checkout outlives the merge; such a WP is read from main."""
+class ScratchT3ProjectCase(unittest.TestCase):
+    """A scratch repository with a real Context and Project under T3, and a lane supervisor."""
 
     def setUp(self) -> None:
         from wpo.context import Context
@@ -1141,6 +1140,10 @@ class RecoveryIntegrationTests(unittest.TestCase):
         supervisor = Supervisor(self.context, "life", True, [], {})
         supervisor.integrate = mock.Mock(return_value=True)
         return supervisor
+
+class RecoveryIntegrationTests(ScratchT3ProjectCase):
+    """A supervisor's pass merges WPs done in their checkout but not on main, and never a WP main
+    already holds as done, though under T3 its checkout outlives the merge; such a WP is read from main."""
 
     def test_a_wp_done_on_main_is_not_merged_again_though_its_checkout_remains(self) -> None:
         self.commit_main("done")
@@ -1204,6 +1207,65 @@ class RecoveryIntegrationTests(unittest.TestCase):
         self.assertEqual((wp.status, wp.path.parent), ("done", self.project.wp_dir(self.checkout)))
         wp, in_worktree = effective_wp(self.context, "WP-0042")
         self.assertEqual((wp.status, in_worktree), ("done", True))
+
+
+class BackendExitTests(ScratchT3ProjectCase):
+    """A failed T3 backend is a failed run, not a route shortage; an operator's cancel is a pause."""
+
+    def test_a_supervisor_reports_a_backend_failure_as_runner_failed(self) -> None:
+        from wpo.runner import EXIT_BACKEND
+        self.commit_main("todo")
+        supervisor = self.supervisor()
+        (wp,) = self.context.effective_wps()
+        events = []
+        supervisor.emit = lambda kind, message, **fields: events.append(kind)
+        supervisor.session_spec = lambda wp: "none"
+        supervisor.run_wp = lambda wp: EXIT_BACKEND
+        supervisor.status_of = lambda wp_id: "in_progress"
+        supervisor.route_wait = mock.Mock()
+        self.assertIsNone(supervisor.run_claimed(wp))
+        self.assertEqual(events, ["runner-failed"])
+        supervisor.route_wait.assert_not_called()
+
+    def test_an_operator_cancel_ends_the_run_paused_and_records_the_writer(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo.runner import RunPaused, WorkPackageRun
+        from wpo.session import SessionCancelled
+        run = object.__new__(WorkPackageRun)
+        run.run_dir = Path(tempfile.mkdtemp())
+        run.context = SimpleNamespace(project=self.project, router=SimpleNamespace(find_route=lambda route_id: {"id": route_id}))
+        run.ledger = SimpleNamespace(writing=None)
+        run.options = SimpleNamespace(idle_minutes=None)
+        run.wp_id, run.families, run.tree, run.env = "WP-0042", None, self.root, {}
+        writers = []
+        run.record_writer = lambda role, route: writers.append((role, route["id"]))
+        with mock.patch("wpo.runner.run_session", side_effect=SessionCancelled("gpt-sol-high", "operator", "lane stopped")), \
+                self.assertRaises(RunPaused) as raised:
+            run.session("code", "builder", "Task", run.run_dir / "attempt-1-builder", "in_progress")
+        self.assertIsNone(raised.exception.result)
+        self.assertIn("cancelled by operator", raised.exception.reason)
+        self.assertEqual(writers, [("builder", "gpt-sol-high")])
+
+    def test_an_operator_cancel_of_a_repair_session_ends_the_run_paused(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo.runner import RunPaused, WorkPackageRun
+        from wpo.session import SessionCancelled
+        run = object.__new__(WorkPackageRun)
+        run.run_dir = Path(tempfile.mkdtemp())
+        run.context = SimpleNamespace(project=self.project)
+        run.config = {"repair_spec": "code"}
+        run.options = SimpleNamespace(idle_minutes=None)
+        run.wp_id, run.families, run.tree, run.env = "WP-0042", None, self.root, {}
+        run.wp = lambda: SimpleNamespace(owns=["src/**"], skills=[])
+        run.emit = lambda *arguments: None
+        failure = SimpleNamespace(command="cargo fmt --check")
+        with mock.patch("wpo.runner.run_session", side_effect=SessionCancelled("gpt-sol-high", "operator", "lane stopped")), \
+                mock.patch("wpo.runner.repair_prompt", return_value="Fix it"), mock.patch("wpo.runner.builder_skills", return_value=[]), \
+                self.assertRaises(RunPaused) as raised:
+            run.repair(1, [failure])
+        self.assertIn("repair session was", raised.exception.reason)
 
 
 class IntegrationChecksTests(unittest.TestCase):

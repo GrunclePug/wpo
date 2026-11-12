@@ -82,6 +82,17 @@ class CompactionStop(Exception):
         self.log_path = log_path
 
 
+class SessionCancelled(RuntimeError):
+    """A native session was cancelled on purpose: by the operator (`wpo t3 cancel`, `wpo lanes
+    stop`) or by the runner's worker cleanup. Unlike a failure, it marks no route and starts no
+    other one."""
+
+    def __init__(self, route_id: str, origin: str, detail: str = "") -> None:
+        super().__init__(f"session on {route_id} cancelled by {origin}{f': {detail}' if detail else ''}")
+        self.route_id = route_id
+        self.origin = origin
+
+
 @dataclass
 class SessionResult:
     route: dict

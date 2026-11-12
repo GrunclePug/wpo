@@ -55,6 +55,15 @@ only; running/stalled entries are not new launch requests.
   separate thread. When the user asks for a report back, deliver it to that user-facing thread.
 - **Cancel request:** call the provided `task_cancel` plan. Do not interrupt a delegated child using
   `t3_thread_interrupt`. Record the cancellation callback; Python keeps its task IDs and files.
+- **Cancelled before launch:** an entry with `cancelled_before_launch` instead of a tool plan was
+  cancelled before WPO saw its launch. Do not launch it. If you never launched it, run the command
+  it gives (a `t3 complete` with `state: cancelled`). If you did launch it, record the launch with
+  `t3 started` as usual; WPO then queues its native cancel. Only your callback settles it.
+- An operator's cancel (`wpo t3 cancel`, `wpo lanes stop`) or the runner's worker cleanup ends the
+  session with no fallback to another route, whatever state the task reaches; a quota cut-off's
+  cancel is a failed session, and the next route is tried. `completion outcome` values are
+  validated: `ok`, `rate_limited`, `api_error`, `hang`, `session_error`, and `compacted` only for a
+  staged session.
 - **Attention event:** inspect the reported WPO event and relevant artifacts, take authorized action
   or report the decision needed, then acknowledge the request with a completion callback. Identical
   attention reasons are deduplicated while one is still pending; once it is acknowledged, the same

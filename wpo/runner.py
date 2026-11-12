@@ -34,12 +34,14 @@ from .platform import kill_tree, pid_alive
 from .project import TASKS_RELATIVE_PATH, git
 from .review_brief import ReviewBrief, build_review_brief
 from .routing import Route, RoutingError, model_family_of, record_wp_mode, resolve_work_spec, spec_mode, with_mode, wp_mode
-from .session import CompactionStop, NoRouteError, ResumeFailed, ResumeTarget, SessionResult, run_session, session_facts
+from .session import CompactionStop, NoRouteError, ResumeFailed, ResumeTarget, SessionCancelled, SessionResult, run_session, session_facts
 from .session_brief import builder_skills, included_files, reviewer_skills
 from .session_commands import HANDOFF_FILE, SESSION_VERIFIED_TREE_FILE
 from .whats_new import NOTHING_TO_TRY, TRY_IT_SECTION, try_it_problem
 
 EXIT_NO_ROUTE = 4
+# The T3 backend or the boot fence failed: not a route shortage, so a supervisor reports the run as failed.
+EXIT_BACKEND = 8
 # The file keeps its historical name so ledgers written before rounds replaced attempts still load.
 LEDGER_FILE = "attempts.json"
 VERDICT = re.compile(r"VERDICT:\s*(PASS|CHANGES_REQUESTED)")
@@ -380,9 +382,11 @@ class RunPaused(Exception):
     """The orchestrator asked to pause the WP (`wpo wrap-up`); `result` is the session that just
     ended, None when the pause came before a session started."""
 
-    def __init__(self, result: SessionResult | None) -> None:
-        super().__init__("paused at the orchestrator's request")
+    def __init__(self, result: SessionResult | None, reason: str | None = None) -> None:
+        super().__init__(reason or "paused at the orchestrator's request")
         self.result = result
+        # Why, when it was not a `wpo wrap-up` pause request: the operator cancelled the session.
+        self.reason = reason
 
 
 @dataclass
@@ -708,7 +712,7 @@ def stop_delegated_workers(context: Context, wp: wpfile.WorkPackage) -> None:
     if context.machine.execution_mode == "t3":
         from .t3 import Bridge
         bridge = Bridge(context)
-        bridge.cancel_wp(wp.id, "builder session ended; collect its remaining native workers", role="worker")
+        bridge.cancel_wp(wp.id, "builder session ended; collect its remaining native workers", "cleanup", role="worker")
         # Verification must not race a native task after its local bridge worker is stopped.
         for path in (bridge.directory / "requests").glob("*.json"):
             request = json.loads(path.read_text(encoding="utf-8"))
@@ -787,6 +791,15 @@ class WorkPackageRun:
             # whose verify passed): it counts as the latest writer.
             self.record_writer(role, self.context.router.find_route(stopped.route_id))
             raise
+        except SessionCancelled as cancelled:
+            # The operator stopped the session: it may have written (a builder that ran `wpo verify`
+            # and left review), so it counts as the writer, and the run ends as a pause, without a
+            # fallback route.
+            try:
+                self.record_writer(role, self.context.router.find_route(cancelled.route_id))
+            except RoutingError:
+                pass
+            raise RunPaused(None, f"the {role} session was {cancelled}") from cancelled
         self.log(f"{role} session ran on {result.route['id']}{result.fallback_note}")
         self.record_writer(role, result.route)
         if pause_requested(self.run_dir) is not None:
@@ -1082,6 +1095,9 @@ class WorkPackageRun:
         except NoRouteError as error:
             self.log(f"no route for a repair session ({spec}): {error}; the builder gets the failure")
             return False
+        except SessionCancelled as cancelled:
+            # As in `session`: the operator stopped it, so the run ends as a pause, not a failure.
+            raise RunPaused(None, f"the repair session was {cancelled}") from cancelled
         self.log(f"repair session ran on {result.route['id']}{result.fallback_note} for {commands}")
         return True
 
@@ -1324,10 +1340,11 @@ class WorkPackageRun:
         if self.counting_round:
             self.ledger.uncount()
             self.counting_round = False
-        reason = pause_requested(self.run_dir) or ""
+        reason = pause_requested(self.run_dir) or paused.reason or ""
         clear_pause(self.run_dir)
         status = self.wp().status
-        ended = f"after its {paused.result.route['id']} session" if paused.result is not None else "before its next session"
+        ended = (f"after its {paused.result.route['id']} session" if paused.result is not None
+                 else "when its session was cancelled" if paused.reason else "before its next session")
         self.log(f"paused at the orchestrator's request {ended}; round not counted; status {status}")
         self.context.journal.emit("wp-paused", f"{self.wp_id} paused {ended} (status {status}){f': {reason}' if reason else ''}", {"wp": self.wp_id})
 
