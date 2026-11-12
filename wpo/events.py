@@ -53,8 +53,13 @@ ATTENTION_KINDS = frozenset({
     # A native T3 session has been quiet for `idle_minutes` (no callback, heartbeat or file write);
     # wpo keeps waiting until `t3.hard_idle_minutes`, then marks it stalled.
     "t3-session-quiet",
+    # A lead's delegated worker stalled; its WP is blocked once the lead's workers are stopped.
+    "delegate-worker-stalled",
 })
 INFO_KINDS = frozenset({
+    # The worker barrier stopped a lead's workers but could not check them yet (a session of the WP
+    # still runs); the next settle checks and reports them.
+    "delegate-worker-stopped",
     "boot-changed",
     "wp-done",
     "wp-merged",

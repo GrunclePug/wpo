@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -31,13 +33,14 @@ from .commands import CommandFailure, build_slot, changed_paths, matches_main, i
 from .context import Context
 from .harness import SESSION_WORKER_AGENT, SHELL_CHAINING, CLAUDE_CLI_HARNESSES, command_prefixes, handoff_limit
 from .inbox import clear_pause, inbox_of, pause_requested
-from .platform import kill_tree, pid_alive, replace_file
+from .platform import FileLock, kill_tree, pid_alive, python_process_runs, replace_file
 from .project import TASKS_RELATIVE_PATH, git
 from .review_brief import ReviewBrief, build_review_brief
 from .routing import Route, RoutingError, model_family_of, record_wp_mode, resolve_work_spec, spec_mode, with_mode, wp_mode
 from .session import CompactionStop, NoRouteError, ResumeFailed, ResumeTarget, SessionCancelled, SessionResult, run_session, session_facts
 from .session_brief import builder_skills, included_files, reviewer_skills
 from .session_commands import HANDOFF_FILE, SESSION_VERIFIED_TREE_FILE, checks_fingerprint, outside_owns
+from .t3 import TERMINAL_STATES, Bridge, T3Error, finish_attempt, is_legacy, read_json, write_json
 from .whats_new import NOTHING_TO_TRY, TRY_IT_SECTION, try_it_problem
 
 EXIT_NO_ROUTE = 4
@@ -726,14 +729,15 @@ def settle_native_sessions(context: Context, wp: wpfile.WorkPackage, record_writ
     in recovery mode: its writer recorded through `record_writer(role, route)` (the caller's own
     ledger), its scope checked, its result consumed. Recovery restores safety, not the session's
     control flow: an operator's cancel, a failure or a compaction is logged and consumed, and the
-    run goes on. Then today's worker barrier stops any surviving workers, also when settling failed.
-    Returns the requests whose scope check failed (their WP is blocked). T3 only."""
+    run goes on. Then the worker barrier stops any surviving workers, also when settling failed.
+    Returns the requests whose scope check failed (their WP is blocked). Standalone mode has only
+    the barrier, for workers a dead runner left."""
     if context.machine.execution_mode != "t3":
-        return []
-    from .t3 import Bridge, SessionControls, T3Error, finish_attempt
+        return (stop_delegated_workers(context, wp) or []) if delegation_unsettled(context, wp.id) else []
+    from .t3 import SessionControls
     bridge = Bridge(context)
     outstanding = bridge.outstanding_sessions(wp.id)
-    if not outstanding:
+    if not outstanding and not delegation_unsettled(context, wp.id):
         return []
     violations, notes = [], []
     try:
@@ -752,35 +756,153 @@ def settle_native_sessions(context: Context, wp: wpfile.WorkPackage, record_writ
             notes.append(f"settled a {role} session that outlived its runner ({payload['route']['id']}): {disposition}")
             if disposition == "scope_violation":
                 violations.append(request["id"])
-        # Written only once every survivor is checked: a note in the WP file would read as the next
-        # survivor's own edit in its scope check.
-        for note in notes:
-            wpfile.log_progress(wpfile.parse(wp.path), note, "runner")
     finally:
-        stop_delegated_workers(context, wp)
+        violations += stop_delegated_workers(context, wp) or []
+    # Written only after every survivor and worker is checked: a note in the WP file would read as
+    # a later one's own edit in its scope check.
+    for note in notes:
+        wpfile.log_progress(wpfile.parse(wp.path), note, "runner")
     return violations
 
 
-def stop_delegated_workers(context: Context, wp: wpfile.WorkPackage) -> None:
-    """A worker still editing after its lead's session ended would race verification and review."""
-    if context.machine.execution_mode == "t3":
-        from .t3 import Bridge
+def delegate_lock(context: Context, wp_id: str) -> FileLock:
+    """Serializes a WP's worker records and its delegation gate (`delegate.py`, the barrier). It
+    lives outside every task directory, so nothing removes it while it is held."""
+    return FileLock(context.project.runs_dir / wp_id / "delegate.lock")
+
+
+def gate_path(context: Context, wp_id: str) -> Path:
+    """The WP's delegation gate: `open` while a lead may start workers (a missing gate is closed),
+    and `report_since`, where unreported worker scope violations begin, kept until a barrier has
+    reported them."""
+    return context.project.runs_dir / wp_id / "delegate" / "gate.json"
+
+
+def open_delegation(context: Context, wp_id: str) -> None:
+    with delegate_lock(context, wp_id):
+        gate = read_json(gate_path(context, wp_id), {})
+        write_json(gate_path(context, wp_id), {"open": True, "report_since": gate.get("report_since") or time.time()})
+
+
+def delegation_unsettled(context: Context, wp_id: str) -> bool:
+    """Whether the WP's delegation still needs a barrier: its gate is open, a report is pending, or
+    a worker record is still running (whether or not its process is alive)."""
+    gate = read_json(gate_path(context, wp_id), {})
+    return (bool(gate.get("open")) or gate.get("report_since") is not None
+            or any(read_json(path, {}).get("state") == "running" for path in gate_path(context, wp_id).parent.glob("*/state.json")))
+
+
+def delegation_open(context: Context, wp_id: str) -> bool:
+    return bool(read_json(gate_path(context, wp_id), {}).get("open"))
+
+
+def worker_pid(task_dir: Path, state: dict) -> int | None:
+    """A worker's process: its own pid once it has recorded it, until then the one `start` spawned."""
+    spawn_pid = task_dir / "spawn.pid"
+    pid = state.get("worker_pid") or (spawn_pid.read_text(encoding="utf-8").strip() if spawn_pid.exists() else None)
+    return int(pid) if pid else None
+
+
+def worker_runs(pid: int | None, token: str | None) -> bool:
+    """Whether `pid` is still the worker's process; a pid reused by another process is not. A task
+    started before tokens is recognised by its process name only."""
+    return bool(pid) and (python_process_runs(pid, token) if token else pid_alive(pid, ("python", "python3")))
+
+
+def worker_requests(context: Context, wp_id: str) -> list[dict]:
+    """The WP's native worker requests, oldest first."""
+    requests = (read_json(path) for path in (Bridge(context).directory / "requests").glob("*.json"))
+    return sorted((request for request in requests if request and request["kind"] == "session" and request["payload"].get("wp") == wp_id
+                   and request["payload"].get("role") == "worker"), key=lambda request: request["created_at"])
+
+
+def stop_delegated_workers(context: Context, wp: wpfile.WorkPackage, wait: bool = True) -> list[str]:
+    """The worker barrier: a worker still editing after its lead's session ended would race
+    verification and review. It closes the WP's delegation gate (a worker not yet published is then
+    refused at admission), kills the local worker processes, cancels and (with `wait`) waits for the
+    native worker requests, and then, once nothing of the WP can still be running, finishes the
+    stopped workers, scope check included. Returns the worker requests whose check failed (the WP
+    is blocked, by the barrier itself, so no caller can lose it); raises T3Error when cleanup is
+    incomplete. Until a barrier has reported them, violations stay pending (the gate's
+    `report_since`), so the next one (a settle) reports them."""
+    t3 = context.machine.execution_mode == "t3"
+    directory = gate_path(context, wp.id).parent
+    stopping: dict[Path, tuple[int | None, str | None]] = {}
+    with delegate_lock(context, wp.id):
+        gate = read_json(gate_path(context, wp.id), {})
+        if gate.get("open"):
+            write_json(gate_path(context, wp.id), {**gate, "open": False})
+        for state_path in directory.glob("*/state.json"):
+            state = read_json(state_path, {})
+            if state.get("state") != "running":
+                continue
+            write_json(state_path, {**state, "stop_requested": True})
+            stopping[state_path.parent] = (worker_pid(state_path.parent, state), state.get("token"))
+    errors, killed, survivors = [], [], []
+    for task_dir, (pid, token) in stopping.items():
+        # Only the worker's own process is killed; `kill_tree` gives up on one that outlives it.
+        if worker_runs(pid, token):
+            try:
+                kill_tree(pid)
+            except OSError as error:
+                errors.append(f"stopping worker '{task_dir.name}' failed: {error}")
+            (survivors if worker_runs(pid, token) else killed).append(task_dir.name)
+    with delegate_lock(context, wp.id):
+        for task_dir, (_, token) in stopping.items():
+            state = read_json(task_dir / "state.json", {})
+            if task_dir.name not in survivors and state.get("state") == "running" and state.get("token") == token:
+                write_json(task_dir / "state.json", {**state, "state": "failed", "detail": "stopped: builder session ended"})
+    if survivors:
+        errors.append(f"local worker cleanup of {wp.id} failed: worker(s) {', '.join(survivors)} survived being stopped")
+    requests: list[dict] = []
+    quiet = True  # no session of the WP can still be running
+    if t3:
         bridge = Bridge(context)
-        bridge.cancel_wp(wp.id, "builder session ended; collect its remaining native workers", "cleanup", role="worker")
-        # Verification must not race a native task after its local bridge worker is stopped.
-        for path in (bridge.directory / "requests").glob("*.json"):
-            request = json.loads(path.read_text(encoding="utf-8"))
-            if request["payload"].get("wp") == wp.id and request["payload"].get("role") == "worker" and request["state"] not in ("done", "failed", "cancelled"):
-                bridge.wait(request)
-    delegate_dir = context.project.runs_dir / wp.id / "delegate"
-    for state_path in delegate_dir.glob("*/state.json") if delegate_dir.exists() else ():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        spawn_pid = state_path.parent / "spawn.pid"
-        pid = state.get("worker_pid") or (spawn_pid.read_text(encoding="utf-8").strip() if spawn_pid.exists() else None)
-        if state.get("state") != "running" or not pid or not pid_alive(int(pid), ("python", "python3")):
-            continue
-        kill_tree(int(pid))
-        wpfile.log_progress(wpfile.parse(wp.path), f"stopped worker '{state_path.parent.name}', still running when the builder session ended")
+        try:
+            bridge.cancel_wp(wp.id, "builder session ended; collect its remaining native workers", "cleanup", role="worker")
+        except T3Error as error:
+            errors.append(str(error))
+        # Admission is closed, so no worker request can be published after this scan.
+        for request in worker_requests(context, wp.id) if wait else ():
+            if request["state"] not in TERMINAL_STATES:
+                try:
+                    bridge.wait(request)
+                except (T3Error, OSError, subprocess.TimeoutExpired) as error:
+                    errors.append(f"worker request {request['id']}: {error}")
+        requests = worker_requests(context, wp.id)
+        quiet = all(request["state"] in TERMINAL_STATES for request in [*requests, *bridge.outstanding_sessions(wp.id)])
+    # The only step that writes the checkout. A worker request still running would take these writes
+    # into its completion snapshot, and a live lead could edit the WP's status after it.
+    violations: list[str] = []
+    if wait and not survivors and quiet:
+        since, finished = gate.get("report_since"), set()
+        for request in requests:
+            # Unconsumed, and finished after completions recorded their changes.
+            if "consumed_at" in request and request["consumed_at"] is None and not is_legacy(request):
+                finish_attempt(context, request, recovery=True)
+                finished.add(request["id"])
+        for request in (read_json(bridge.request_path(request["id"])) for request in requests):
+            if request.get("disposition") == "scope_violation" and (request["id"] in finished or (since is not None and request["created_at"] >= since)):
+                violations.append(request["id"])
+        if violations and (current := wpfile.parse(wp.path)).status != "blocked":
+            wpfile.set_status(current, "blocked")
+            context.journal.emit("wp-blocked", f"delegated worker(s) of {wp.id} changed paths outside their task ({', '.join(violations)})", {"wp": wp.id})
+        for name in killed:
+            wpfile.log_progress(wpfile.parse(wp.path), f"stopped worker '{name}', still running when the builder session ended")
+        with delegate_lock(context, wp.id):
+            gate = read_json(gate_path(context, wp.id), {})
+            if gate.get("report_since") is not None:
+                write_json(gate_path(context, wp.id), {**gate, "report_since": None})
+    elif stopping or requests:
+        context.journal.emit("delegate-worker-stopped", f"stopped {wp.id}'s delegated workers ({', '.join(task_dir.name for task_dir in stopping) or 'native only'}); "
+                             "they are checked and reported once nothing of the WP is still running", {"wp": wp.id})
+    if errors:
+        raise T3Error("; ".join(errors))
+    return violations
+
+
+def worker_violation(wp_id: str, violations: list[str]) -> str:
+    return f"{wp_id}: delegated worker(s) changed paths outside their task ({', '.join(violations)}); the WP is blocked"
 
 
 class WorkPackageRun:
@@ -824,10 +946,16 @@ class WorkPackageRun:
         mode = spec_mode(spec) or self.mode
         spec = with_mode(spec, mode)
         try:
-            result = run_session(self.context, spec, extra.pop("access", access), prompt, log_stem, self.tree, families=extra.pop("families", self.families),
-                                 idle_minutes=self.options.idle_minutes, event_fields={"wp": self.wp_id, "role": role}, extra_env=self.env,
-                                 inbox=inbox_of(self.run_dir), on_attempt=self.mode_recorder(mode),
-                                 on_finished=lambda route: self.record_writer(role, route), **extra)
+            try:
+                result = run_session(self.context, spec, extra.pop("access", access), prompt, log_stem, self.tree, families=extra.pop("families", self.families),
+                                     idle_minutes=self.options.idle_minutes, event_fields={"wp": self.wp_id, "role": role}, extra_env=self.env,
+                                     inbox=inbox_of(self.run_dir), on_attempt=self.mode_recorder(mode),
+                                     on_finished=lambda route: self.record_writer(role, route), **extra)
+            finally:
+                if extra.get("lead"):
+                    # Before any handler or note writes the WP file: a stopped worker's own check
+                    # must not take the runner's writes as its edits.
+                    self.stop_workers(sys.exc_info()[1])
         except NoRouteError as error:
             if role == "builder" and not error.failures:
                 self.ledger.state["writing"] = writing_before
@@ -860,6 +988,18 @@ class WorkPackageRun:
         if pause_requested(self.run_dir) is not None:
             raise RunPaused(result)
         return result
+
+    def stop_workers(self, in_flight: BaseException | None) -> None:
+        """The lead's worker barrier. A lead that stalled left the WP's status alone, since a worker
+        still running would take that write into its snapshot: it is blocked here, once none is."""
+        try:
+            violations = stop_delegated_workers(self.context, self.wp()) or []
+        finally:
+            if getattr(in_flight, "stalled_wp", None) and all(request["state"] in TERMINAL_STATES for request in worker_requests(self.context, self.wp_id)):
+                wpfile.set_status(self.wp(), "blocked")
+                self.emit("wp-blocked", str(in_flight))
+        if violations:
+            raise T3Error(worker_violation(self.wp_id, violations))
 
     def record_writer(self, role: str, route: dict | Route) -> None:
         """Remembers who made the model of the latest session that built the WP (a builder, or a
@@ -917,6 +1057,8 @@ class WorkPackageRun:
             self.ledger.writing_started(time.time(), [path.removesuffix(" (deleted)") for path in changed_paths(self.tree, self.context.project.main_branch)
                                                       if path.endswith(" (deleted)")])
             try:
+                if delegate_tier is not None:
+                    open_delegation(self.context, self.wp_id)
                 # A continued interrupted session and a session continuing a handoff get their own
                 # logs, so no session's log is overwritten.
                 stem = (f"attempt-{round_number}-builder" + (f"-continued-{self.ledger.interruptions}" if self.ledger.interruptions else "")
@@ -930,7 +1072,8 @@ class WorkPackageRun:
                     self.record_builder_session(paused.result)
                 raise
             finally:
-                stop_delegated_workers(self.context, self.wp())
+                # Also when `session` raised before its own barrier ran; then it finds nothing.
+                self.stop_workers(None)
             self.record_builder_session(result)
             if handoff is not None:
                 self.ledger.handoff_delivered()
