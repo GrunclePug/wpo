@@ -627,6 +627,19 @@ class T3BackendTests(unittest.TestCase):
             self.assertEqual(settle_native_sessions(self.context, SimpleNamespace(id="WP-0001", path=self.root / "x.md"), lambda role, route: None), [])
         barrier.assert_not_called()
 
+    def test_only_wpo_commands_get_the_session_identity(self) -> None:
+        from wpo.t3 import with_session_prefix
+        prefix = 'wpo --project "/p" --session abc'
+        prose = ("## In a wpo session\n- wpo commits, reviews and merges your work.\n"
+                 "See wpo-orchestration and the wpo docs; wpo's own rules apply.")
+        self.assertEqual(with_session_prefix(prose, prefix), prose)
+        commands = "Run `wpo log \"done\"` and then run wpo verify.\nwpo finding fixed R1-F1 'x'\n(wpo handoff 'y')"
+        rewritten = with_session_prefix(commands, prefix)
+        self.assertEqual(rewritten, commands.replace("wpo log", f"{prefix} log").replace("wpo verify", f"{prefix} verify")
+                         .replace("wpo finding", f"{prefix} finding").replace("wpo handoff", f"{prefix} handoff"))
+        self.assertEqual(with_session_prefix(rewritten, prefix), rewritten, "rewriting twice equals rewriting once")
+        self.assertEqual(with_session_prefix("wpo statusbar and wpo status", prefix), f"wpo statusbar and {prefix} status")
+
     def test_terminal_and_wrong_task_callbacks_cannot_replace_results(self) -> None:
         request = self.submit()
         self.bridge.record_started(request["id"], {"taskId": "native", "childThreadId": "child"})

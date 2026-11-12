@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -757,7 +758,7 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
     identity_path = bridge.directory / "sessions" / f"{identity_key}.json"
     write_json(identity_path, {"version": 1, "env": identity, "project": str(context.project.root)})
     prefix = f'wpo --project "{context.project.root.as_posix()}" --session {identity_key}'
-    prompt_text = prompt_text.replace("wpo ", prefix + " ")
+    prompt_text = with_session_prefix(prompt_text, prefix)
     if resume_session:
         prompt_text += (f"\n\nContinuation of recorded WPO session {resume_session}. This is a fresh native task; "
                         "read the WP progress, handoff, and current diff to continue the same round. Do not assume provider context was resumed.")
@@ -833,6 +834,18 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
         if settings.inbox:
             clear_live(settings.inbox)
     return finish_attempt(context, request, settings.on_finished, handoff_reason=controls.handoff_reason)
+
+
+def with_session_prefix(text: str, prefix: str) -> str:
+    """Gives every wpo command in a session's prompt the session's identity: `wpo` at a token
+    boundary (the start of a line, whitespace, a backtick, a quote or an opening parenthesis before
+    it) followed by one of wpo's subcommands becomes `prefix`. Prose ("wpo commits", "in a wpo
+    session", "wpo-orchestration") is left alone, and text already prefixed is not prefixed again.
+    A diff that holds a literal `wpo verify` command line is still rewritten; that matters only when
+    reviewing wpo itself, and is harmless there."""
+    from .cli import command_names
+    names = "|".join(re.escape(name) for name in sorted(command_names(), key=len, reverse=True))
+    return re.sub(rf"(?<![^\s`'\"(])wpo (?=(?:{names})(?![\w-]))", lambda _match: prefix + " ", text)
 
 
 class SessionControls:

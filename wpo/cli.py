@@ -36,6 +36,12 @@ def split_list(values: list[str] | None) -> list[str]:
     return [part.strip() for value in values or [] for part in value.split(",") if part.strip()]
 
 
+def command_names() -> frozenset[str]:
+    """wpo's own subcommand names, read from the parser so other code cannot drift from it."""
+    return frozenset(name for action in build_parser()._actions if isinstance(action, argparse._SubParsersAction)
+                     for name in action.choices)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wpo", description="Parallel work-package orchestration on git worktrees (SKILL.md).")
     parser.add_argument("--project", type=Path, help="any directory inside the project's repository (default: the working directory)")
