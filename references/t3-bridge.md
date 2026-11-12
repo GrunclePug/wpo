@@ -99,7 +99,7 @@ Callbacks enforce native task identity and terminal state. A cancellation before
 callback still queues cancellation of the late native task. A late success cannot resurrect a
 cancelled request. Repeated callbacks are idempotent. Stable invocation receipts reconnect a crashed
 Python process to its existing task; a consumed continuation creates a new task generation and
-archives the old log rather than replaying its result.
+archives the old log rather than replaying its result. A receipt names its request before the request is submitted, and a finished session's request records when its result was consumed (`consumed_at`); that record wins over the receipt. One completion path finishes every session: the writer is recorded, then the scope check, then the result is logged and consumed, each step safe to repeat after a crash.
 
 ## Activity, permissions and recovery
 

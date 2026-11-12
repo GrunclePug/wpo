@@ -269,10 +269,10 @@ class T3BackendTests(unittest.TestCase):
     def test_native_result_preserves_existing_jsonl_and_session_identity(self) -> None:
         settings = session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "builder"})
         log = self.root / "session.log"
-        def complete(_bridge, request, callback=None):
+        def complete(bridge, request, callback=None):
             self.assertIn("--session", request["payload"]["prompt"])
             self.assertEqual(request["payload"]["target"]["options"], {"reasoningEffort": "high"})
-            return {**request, "state": "done", "task_id": "native-task", "thread_id": "native-child", "result": {"text": "Done", "outcome": "ok"}}
+            return bridge.update(request["id"], state="done", task_id="native-task", thread_id="native-child", result={"text": "Done", "outcome": "ok"})
         with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", complete):
             outcome = run_attempt(self.context, ROUTE, "Run wpo verify", log, settings)
         self.assertEqual(outcome.result_text, "Done")
@@ -285,9 +285,9 @@ class T3BackendTests(unittest.TestCase):
         brief = SessionBrief(None, "", "full rules", native_text="native rules")
         settings = session.SessionSettings("builder", ["src/**"], self.root, brief, {}, False, False, 30, {"role": "builder"})
         prompts = []
-        def complete(_bridge, request, callback=None):
+        def complete(bridge, request, callback=None):
             prompts.append(request["payload"]["prompt"])
-            return {**request, "state": "done", "task_id": f"native-{len(prompts)}", "thread_id": "child", "result": {"text": "Done", "outcome": "ok"}}
+            return bridge.update(request["id"], state="done", task_id=f"native-{len(prompts)}", thread_id="child", result={"text": "Done", "outcome": "ok"})
         with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", complete):
             run_attempt(self.context, ROUTE, "Task", self.root / "full.log", settings)
             self.machine.raw["t3"]["native_instructions"] = {"families": ["gpt"], "names": ["CLAUDE.md"], "files": []}
@@ -334,7 +334,7 @@ class T3BackendTests(unittest.TestCase):
     def finished_attempt(self, completed: dict, settings=None):
         """Runs a native attempt whose request comes back as `completed` (merged over the request)."""
         settings = settings or session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "builder"})
-        with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", lambda _bridge, request, callback=None: {**request, "task_id": "t", **completed}):
+        with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", lambda bridge, request, callback=None: bridge.update(request["id"], task_id="t", **completed)):
             return run_attempt(self.context, ROUTE, "Task", self.root / f"attempt-{uuid.uuid4().hex}.log", settings)
 
     def test_an_operator_cancel_ends_the_session_whatever_state_the_task_reached(self) -> None:
@@ -402,6 +402,116 @@ class T3BackendTests(unittest.TestCase):
         staged = self.submit(key="staged", payload={**builder["payload"], "stop_on_compaction": True})
         self.assertEqual(self.bridge.complete(staged["id"], {"state": "done", "outcome": "compacted"})["state"], "done")
 
+    def native_session(self, log: Path, access: str = "builder", before_tree: str | None = None, **completion) -> dict:
+        """A session request begun under `log` and completed with `completion`, as the bridge records it."""
+        payload = {**self.submit()["payload"], "route": ROUTE, "log_path": str(log), "cwd": str(self.root), "access": access,
+                   "write_paths": [], "before_tree": before_tree, "wp": None, "stop_on_compaction": False}
+        with mock.patch.object(Bridge, "wake"):
+            request, _ = self.bridge.begin_session(log, payload, "coordinator")
+        return self.bridge.update(request["id"], state="done", task_id="native", result={"text": "Done", "outcome": "ok"}, **completion)
+
+    def test_two_finishes_of_one_request_consume_it_once(self) -> None:
+        from wpo.t3 import finish_attempt
+        log = self.root / "twice.log"
+        request = self.native_session(log)
+        self.assertEqual(finish_attempt(self.context, request, recovery=True), "ok")
+        first = read_json(self.bridge.request_path(request["id"]))["consumed_at"]
+        writers = []
+        self.assertEqual(finish_attempt(self.context, request, writers.append, recovery=True), "ok")
+        self.assertEqual(read_json(self.bridge.request_path(request["id"]))["consumed_at"], first)
+        self.assertEqual(writers, [], "an already consumed request only returns what was recorded")
+        self.assertEqual(sum('"type": "result"' in line for line in log.read_text().splitlines()), 1)
+        self.assertTrue(read_json(log.with_name(log.name + ".t3-invocation.json"))["consumed"])
+
+    def test_a_finish_interrupted_before_consumption_is_replayed_once(self) -> None:
+        from wpo import t3
+        log = self.root / "replay.log"
+        request = self.native_session(log)
+        writers = []
+
+        def crash(route):
+            writers.append(route["id"])
+            raise RuntimeError("killed")
+        with self.assertRaises(RuntimeError):
+            t3.finish_attempt(self.context, request, crash, recovery=True)
+        self.assertIsNone(read_json(self.bridge.request_path(request["id"]))["consumed_at"])
+        real = t3.write_json
+        def crash_on_request(path, value):
+            if path == self.bridge.request_path(request["id"]) and value.get("consumed_at"):
+                raise RuntimeError("killed after the log write")
+            real(path, value)
+        with mock.patch("wpo.t3.write_json", side_effect=crash_on_request), self.assertRaises(RuntimeError):
+            t3.finish_attempt(self.context, request, lambda route: writers.append(route["id"]), recovery=True)
+        self.assertEqual(t3.finish_attempt(self.context, request, lambda route: writers.append(route["id"]), recovery=True), "ok")
+        self.assertEqual(writers, [ROUTE["id"]] * 3, "the writer is recorded first on every attempt")
+        self.assertEqual(sum('"type": "result"' in line for line in log.read_text().splitlines()), 1, "the result is logged once")
+        self.assertIsNotNone(read_json(self.bridge.request_path(request["id"]))["consumed_at"])
+
+    def test_a_scope_violation_is_logged_as_an_error_live_and_in_recovery(self) -> None:
+        from wpo.commands import worktree_tree_id
+        from wpo.t3 import finish_attempt
+        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            git(self.root, *arguments)
+        code = self.root / "code.txt"
+        code.write_text("original\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "base")
+        before = worktree_tree_id(self.root)
+        code.write_text("a reviewer's edit\n")
+        for recovery in (False, True):
+            log = self.root / f"review-{recovery}.log"
+            request = self.native_session(log, access="reviewer", before_tree=before)
+            if recovery:
+                self.assertEqual(finish_attempt(self.context, request, recovery=True), "scope_violation")
+            else:
+                with self.assertRaisesRegex(T3Error, "outside its access contract"):
+                    finish_attempt(self.context, request)
+            result = [json.loads(line) for line in log.read_text().splitlines() if '"type": "result"' in line][-1]
+            self.assertTrue(result["is_error"])
+            self.assertIn("outside its access contract", result["result"])
+
+    def test_a_cancelled_builder_is_recorded_as_the_writer_before_the_stop(self) -> None:
+        settings = session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "builder"})
+        seen = []
+
+        def record(route):
+            requests = [read_json(path) for path in (self.bridge.directory / "requests").glob("*.json")]
+            seen.append((route["id"], [r.get("consumed_at") for r in requests if r["kind"] == "session"]))
+        settings = dataclasses.replace(settings, on_finished=record)
+        with self.assertRaises(session.SessionCancelled):
+            self.finished_attempt({"state": "cancelled", "cancel_origin": "operator"}, settings)
+        self.assertEqual(seen, [(ROUTE["id"], [None])], "recorded before the request was consumed")
+
+    def test_a_receipt_names_its_request_before_the_submit(self) -> None:
+        log = self.root / "interrupted.log"
+        payload = self.submit()["payload"]
+        with mock.patch.object(Bridge, "submit", side_effect=RuntimeError("killed before the submit")), self.assertRaises(RuntimeError):
+            self.bridge.begin_session(log, payload, "coordinator")
+        receipt = read_json(log.with_name(log.name + ".t3-invocation.json"))
+        self.assertFalse(receipt["consumed"])
+        self.assertIsNone(read_json(self.bridge.request_path(receipt["request_id"])), "nothing was submitted")
+        with mock.patch.object(Bridge, "wake"):
+            request, _ = self.bridge.begin_session(log, payload, "coordinator")
+        self.assertNotEqual(request["id"], receipt["request_id"], "an interrupted start is not reconnected to")
+        self.assertEqual(read_json(log.with_name(log.name + ".t3-invocation.json"))["generation"], 2)
+
+    def test_a_consumed_request_wins_over_its_stale_receipt(self) -> None:
+        log = self.root / "stale.log"
+        request = self.native_session(log)
+        self.bridge.update(request["id"], consumed_at=time.time())  # the receipt write after it was lost
+        with mock.patch.object(Bridge, "wake"):
+            again, receipt = self.bridge.begin_session(log, request["payload"], "coordinator")
+        self.assertNotEqual(again["id"], request["id"], "a new generation, not a replayed result")
+        self.assertEqual(read_json(receipt)["generation"], 2)
+
+    def test_a_wp_file_write_killed_midway_keeps_the_previous_content(self) -> None:
+        from wpo import wpfile
+        path = self.root / "WP-0001-x.md"
+        path.write_text("---\nid: WP-0001\n---\nprevious\n", encoding="utf-8")
+        with mock.patch("wpo.platform.replace_file", side_effect=OSError("killed")), self.assertRaises(OSError):
+            wpfile.write_text(path, "---\nid: WP-0001\n---\nnew\n")
+        self.assertEqual(path.read_text(encoding="utf-8"), "---\nid: WP-0001\n---\nprevious\n")
+
     def test_terminal_and_wrong_task_callbacks_cannot_replace_results(self) -> None:
         request = self.submit()
         self.bridge.record_started(request["id"], {"taskId": "native", "childThreadId": "child"})
@@ -441,11 +551,11 @@ class T3BackendTests(unittest.TestCase):
         git(self.root, "add", ".")
         git(self.root, "commit", "-qm", "base")
         settings = session.SessionSettings("read", [], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "read"})
-        def complete(_bridge, request, callback=None):
+        def complete(bridge, request, callback=None):
             self.assertEqual(request["payload"]["native_role"], "research")
             self.assertEqual(request["payload"]["access"], "read")
             code.write_text("unauthorized native edit\n")
-            return {**request, "state": "done", "result": {"text": "finished"}}
+            return bridge.update(request["id"], state="done", result={"text": "finished"})
         with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", complete), self.assertRaisesRegex(T3Error, "outside its access contract"):
             run_attempt(self.context, ROUTE, "Read only", self.project.runs_dir / "read.log", settings)
         self.assertEqual(code.read_text(), "unauthorized native edit\n")
