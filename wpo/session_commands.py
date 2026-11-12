@@ -6,6 +6,8 @@ printing only what failed. The session's environment names its WP, tree, role an
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import time
@@ -96,13 +98,44 @@ def verify(context: Context) -> tuple[bool, str]:
     if waiting:
         return False, ("Answer every open BLOCKING review finding first, with `wpo finding fixed <id> '<what changed>'` or "
                        "`wpo finding veto <id> <ground> '<evidence>'`. Unanswered: " + ", ".join(finding["id"] for finding in waiting))
+    # Taken before the checks run: a check that rewrites the WP's Verify cannot change what passed.
+    fingerprint = checks_fingerprint(context, wp, tree)
     passed, report = run_checks(context, wp, tree)
     if passed and wp.status in ("in_progress", "changes_requested"):
         wpfile.set_status(wp, "review")
         report += "\nStatus set to review."
     if passed:
-        record.write_text(worktree_tree_id(tree), encoding="utf-8")
+        # The fingerprint ties the pass to the checks it ran: editing the WP's Verify or Try it, or
+        # the project's check settings, voids it even when the tree is unchanged.
+        record.write_text(json.dumps({"tree": worktree_tree_id(tree), "checks": fingerprint}), encoding="utf-8")
     return passed, report
+
+
+def checks_fingerprint(context: Context, wp: wpfile.WorkPackage, tree: Path) -> str:
+    """What decides whether `run_checks` passes on a given tree, besides the tree and ownership
+    (which `outside_owns` checks again): the WP's round checks, the Try it section when required,
+    and every project setting the checks read (shell, timeout, fixers, environment, scoping)."""
+    from .runner import session_env
+    from .whats_new import try_it_text
+    config = context.project.config
+    inputs = {"round_checks": wp.round_checks(config["verify_round"], config["verify_workspace"]),
+              "try_it": try_it_text(wp) if config["require_try_it"] else None,
+              "env": session_env(context, wp.id, tree.resolve()),
+              # Fixers run in their configured order, which the sorted dump below would otherwise lose.
+              "autofix": list(config["autofix"].items()),
+              **{key: config[key] for key in ("shell", "command_timeout_minutes", "verify_round", "verify_workspace",
+                                              "check_scope", "verify_neutral_paths", "require_try_it")}}
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def outside_owns(context: Context, wp: wpfile.WorkPackage, tree: Path) -> list[str]:
+    """Paths the tree changed outside the WP's owns (its shared files and WP file aside), unless
+    they are as main has them now. Git only, so cheap to run again."""
+    config = context.project.config
+    wp_dir, main = context.project.wp_dir_relative, context.project.main_branch
+    shared = [entry["path"] for entry in config["shared_files"]]
+    return [path for path in changed_paths(tree, main) if not wpfile.path_owned(path.removesuffix(" (deleted)"), wp, wp_dir, shared)
+            and not wpfile.is_wp_file(path, wp_dir) and not matches_main(tree, main, path)]
 
 
 def run_checks(context: Context, wp: wpfile.WorkPackage, tree: Path) -> tuple[bool, str]:
@@ -130,9 +163,7 @@ def run_checks(context: Context, wp: wpfile.WorkPackage, tree: Path) -> tuple[bo
     limit = int(config["repair_output_chars"])
     for failure in failures:
         lines.append(f"\n### {failure.command} (exit {failure.exit_code})\n{clipped(failure.output, limit)}")
-    shared = [entry["path"] for entry in config["shared_files"]]
-    outside = [path for path in changed_paths(tree, main) if not wpfile.path_owned(path.removesuffix(" (deleted)"), wp, wp_dir, shared)
-               and not wpfile.is_wp_file(path, wp_dir) and not matches_main(tree, main, path)]
+    outside = outside_owns(context, wp, tree)
     if outside:
         # Said in full, so a builder restores rather than spending a session investigating the gate.
         lines.append("\nChanged outside the WP's owns: " + ", ".join(outside)

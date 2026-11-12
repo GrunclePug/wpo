@@ -1344,6 +1344,90 @@ class SurvivingSessionTests(ScratchT3ProjectCase):
         self.assertEqual(order, ["settle", "phase"])
 
 
+class SessionVerifiedTests(ScratchT3ProjectCase):
+    """A builder's `wpo verify` pass stands only for the checks it ran and the ownership it saw."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from wpo.runner import WorkPackageRun
+        (self.root / "shared.txt").write_text("base\n", encoding="utf-8")
+        self.commit_main("in_progress")
+        self.retain_checkout()
+        (self.checkout / "src" / "core").mkdir(parents=True)
+        (self.checkout / "src" / "core" / "lib.rs").write_text("fn main() {}\n", encoding="utf-8")
+        self.run = object.__new__(WorkPackageRun)
+        self.run.context, self.run.tree = self.context, self.checkout
+        self.run.run_dir = self.project.wp_run_dir("WP-0042")
+        self.run.wp = lambda: self.context.wp_in_tree("WP-0042", self.checkout)
+        self.record()
+
+    def record(self) -> None:
+        """What `wpo verify` writes after a pass on the checkout as it is now."""
+        from wpo.commands import worktree_tree_id
+        from wpo.session_commands import SESSION_VERIFIED_TREE_FILE, checks_fingerprint
+        record = {"tree": worktree_tree_id(self.checkout), "checks": checks_fingerprint(self.context, self.run.wp(), self.checkout)}
+        (self.run.run_dir / SESSION_VERIFIED_TREE_FILE).write_text(json.dumps(record), encoding="utf-8")
+
+    def edit_wp(self, old: str, new: str) -> None:
+        path = self.run.wp().path
+        path.write_text(path.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+
+    def test_a_pass_stands_for_an_unchanged_tree_and_progress_notes(self) -> None:
+        self.assertTrue(self.run.session_verified())
+        self.edit_wp("- 2026-10-22 10:00 [runner] first", "- 2026-10-22 10:00 [runner] first\n- 2026-10-22 11:00 [runner] second")
+        self.assertTrue(self.run.session_verified(), "only the Progress log changed")
+
+    def test_editing_the_verify_commands_voids_the_pass(self) -> None:
+        self.edit_wp("cargo test -p core", "cargo test -p core --release")
+        self.assertFalse(self.run.session_verified())
+
+    def test_narrowing_owns_voids_the_pass(self) -> None:
+        self.edit_wp("owns: [src/core/**, docs/core.md]", "owns: [docs/core.md]")
+        self.assertFalse(self.run.session_verified())
+
+    def test_changing_a_check_setting_voids_the_pass(self) -> None:
+        config = self.project.config
+        for key, value in (("verify_neutral_paths", ["docs/**"]), ("verify_round", ["true"]), ("env", {"RUSTFLAGS": "-D warnings"}),
+                           ("shell", ["sh", "-c"]), ("command_timeout_minutes", 1),
+                           ("autofix", {**config["autofix"], "rustfmt": {"globs": ["*.rs"], "command": ["rustfmt", "--edition", "2024"]}})):
+            saved = config[key]
+            config[key] = value
+            try:
+                self.assertFalse(self.run.session_verified(), key)
+            finally:
+                config[key] = saved
+            self.assertTrue(self.run.session_verified(), f"{key} restored")
+
+    def test_reordering_the_fixers_voids_the_pass(self) -> None:
+        config = self.project.config
+        saved = config["autofix"]
+        fixers = {"first": {"globs": ["*.rs"], "command": ["rustfmt"]}, "second": {"globs": ["*.rs"], "builtin": "trailing-whitespace"}}
+        try:
+            config["autofix"] = fixers
+            self.record()
+            self.assertTrue(self.run.session_verified())
+            config["autofix"] = dict(reversed(list(fixers.items())))
+            self.assertFalse(self.run.session_verified(), "fixers run in order, and the order can change the result")
+        finally:
+            config["autofix"] = saved
+
+    def test_main_moving_under_an_unchanged_tree_reruns_the_ownership_gate(self) -> None:
+        (self.root / "shared.txt").write_text("main moved\n", encoding="utf-8")
+        self.git(self.root, "commit", "-qam", "main changes shared.txt")
+        (self.checkout / "shared.txt").write_text("main moved\n", encoding="utf-8")  # as main has it: not the WP's change
+        self.record()
+        self.assertTrue(self.run.session_verified())
+        (self.root / "shared.txt").write_text("main moved again\n", encoding="utf-8")
+        self.git(self.root, "commit", "-qam", "main changes it again")
+        self.assertFalse(self.run.session_verified(), "the checkout's copy is now a change outside owns")
+
+    def test_a_record_from_before_fingerprints_is_verified_again(self) -> None:
+        from wpo.commands import worktree_tree_id
+        from wpo.session_commands import SESSION_VERIFIED_TREE_FILE
+        (self.run.run_dir / SESSION_VERIFIED_TREE_FILE).write_text(worktree_tree_id(self.checkout), encoding="utf-8")
+        self.assertFalse(self.run.session_verified())
+
+
 class IntegrationChecksTests(unittest.TestCase):
     """The full checks run only on the merge, and a check that writes into the tree fails it."""
 
