@@ -220,9 +220,21 @@ class Bridge:
             self.wake(coordinator, created_after=request["created_at"])
         return request
 
+    def requests(self) -> list[dict]:
+        """Read canonical request records; auxiliary response files are not requests."""
+        requests = []
+        for path in sorted((self.directory / "requests").glob("*.json")):
+            if len(path.stem) != 32 or any(character not in "0123456789abcdef" for character in path.stem):
+                continue
+            request = read_json(path)
+            if (not isinstance(request, dict) or request.get("id") != path.stem
+                    or not {"kind", "state", "coordinator_thread_id", "payload"} <= request.keys()):
+                raise T3Error(f"Malformed native request record: {path}")
+            requests.append(request)
+        return requests
+
     def pending(self, coordinator: str) -> list[dict]:
-        return [request for path in sorted((self.directory / "requests").glob("*.json"))
-                if (request := read_json(path)) and request["coordinator_thread_id"] == coordinator
+        return [request for request in self.requests() if request["coordinator_thread_id"] == coordinator
                 and request["state"] in ("pending", "claimed", "running", "waiting", "stalled")]
 
     def update(self, request_id: str, **fields) -> dict:
@@ -452,15 +464,14 @@ class Bridge:
         return self.update(request["id"], state="cancelled", detail=why)
 
     def cancel_wp(self, wp_id: str, why: str, role: str | None = None) -> None:
-        for path in (self.directory / "requests").glob("*.json"):
-            request = read_json(path)
+        for request in self.requests():
             if request["state"] in ("done", "failed", "cancelled"):
                 continue
             if request["payload"].get("wp") == wp_id and (role is None or request["payload"].get("role") == role):
                 self.cancel_request(request, why)
 
     def recover(self, coordinator: str | None = None) -> int:
-        requests = [read_json(path) for path in (self.directory / "requests").glob("*.json")]
+        requests = self.requests()
         outstanding = [request for request in requests if request["state"] not in ("done", "failed", "cancelled")
                        and (coordinator is None or request["coordinator_thread_id"] == coordinator)]
         for target in sorted({request["coordinator_thread_id"] for request in outstanding}):
@@ -521,7 +532,7 @@ def cli_command(context: Context, arguments) -> int:
         bridge.attach(arguments.thread, unwrap_result(read_json(arguments.capabilities_file)), unwrap_result(read_json(arguments.workspace_file)))
         print("Attached T3 coordinator; existing WP statuses, holds, and supervisors were not resumed.")
     elif command == "status":
-        requests = [read_json(path) for path in (bridge.directory / "requests").glob("*.json")]
+        requests = bridge.requests()
         print(json.dumps({"backend": context.machine.execution_mode, "coordinator_thread_id": bridge.coordinator,
                           "capabilities_recorded": (bridge.directory / "capabilities.json").is_file(),
                           "requests": {state: sum(r["state"] == state for r in requests) for state in ("pending", "running", "waiting", "stalled", "done", "failed", "cancelled")},
