@@ -198,8 +198,11 @@ DEFAULTS: dict = {
     "commit_footer": "",
     # Optional generated board, relative to the main checkout (keep it gitignored).
     "status_board": None,
-    # Claude 5h usage must be under this before a supervisor reports "finished"; null disables.
+    # The orchestrator's 5h usage must be under this before a supervisor reports "finished"; null disables.
     "orchestrator_room_percent": 70,
+    # The model family the orchestrator runs on, whose room that is. Null: under T3, the family of the
+    # provider its coordinator was attached from (`wpo t3 attach`), else claude.
+    "orchestrator_family": None,
     # Overrides merged over the skill's routing policy (models/tiers.json).
     "routing": {},
     # Staged mode for small-context models (SKILL.md, "Staged mode").

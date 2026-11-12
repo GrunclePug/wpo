@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import os
+import stat
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -150,13 +152,33 @@ def run_command(tree: Path, fixer: Fixer, files: list[str], env: Mapping[str, st
     return None
 
 
+def reached_without_links(tree: Path, file: str) -> bool:
+    """Whether `file` is a regular file reached from the tree root through no link: neither it nor
+    any directory between the root and it is a symlink or (Windows) a junction or other reparse
+    point. A fixer writes where the path leads, and the ownership checks see only the tree."""
+    path = tree
+    for part in Path(file).parts:
+        path = path / part
+        try:
+            status = os.lstat(path)
+        except OSError:
+            return False
+        if stat.S_ISLNK(status.st_mode) or getattr(status, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+            return False
+    return stat.S_ISREG(status.st_mode)
+
+
 def run_fixers(tree: Path, files: Iterable[str], fixers: list[Fixer], env: Mapping[str, str], timeout_minutes: float) -> list[str]:
     """Applies each fixer to the files it covers; returns one report line per fixer that changed
-    files or failed (nothing for a fixer with no work)."""
+    files or failed (nothing for a fixer with no work). A file reached through a link is never
+    handed to a fixer, and is named in the fixer's report line."""
     files = sorted(set(files))
     reports = []
     for fixer in fixers:
-        targets = [file for file in files if fixer.applies_to(file) and (tree / file).is_file()]
+        covered = [file for file in files if fixer.applies_to(file) and (tree / file).is_file()]
+        targets = [file for file in covered if reached_without_links(tree, file)]
+        if skipped := [file for file in covered if file not in targets]:
+            reports.append(f"{fixer.name} skipped {len(skipped)} file(s) reached through a link: {', '.join(skipped)}")
         if not targets:
             continue
         before = {file: digest(tree / file) for file in targets}

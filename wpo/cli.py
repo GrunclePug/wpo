@@ -20,18 +20,26 @@ def entrypoint() -> int:
     from .boot import BootError
     from .t3 import T3Error
 
+    from .runner import EXIT_BACKEND
+
     try:
         return main()
     except T3Error as error:
         print(f"T3 backend: {error}", file=sys.stderr)
-        return 4
+        return EXIT_BACKEND
     except BootError as error:
         print(f"Boot safety: {error}", file=sys.stderr)
-        return 4
+        return EXIT_BACKEND
 
 
 def split_list(values: list[str] | None) -> list[str]:
     return [part.strip() for value in values or [] for part in value.split(",") if part.strip()]
+
+
+def command_names() -> frozenset[str]:
+    """wpo's own subcommand names, read from the parser so other code cannot drift from it."""
+    return frozenset(name for action in build_parser()._actions if isinstance(action, argparse._SubParsersAction)
+                     for name in action.choices)
 
 
 def build_parser() -> argparse.ArgumentParser:

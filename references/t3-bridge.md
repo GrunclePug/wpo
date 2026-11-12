@@ -37,6 +37,9 @@ only; running/stalled entries are not new launch requests.
   checkout. The child is a lightweight WP coordinator, not a builder. It registers its actual T3
   checkout/thread using `register-workspace`. Registration verifies repository identity, branch,
   and the expected local-main ancestor. Do not precreate or rebind a checkout with shell commands.
+  A repeated identical registration returns the recorded workspace; one for a request that already
+  failed, was cancelled, or recorded another checkout is kept on the request and refused. A failed
+  or cancelled workspace request is asked again, as a new request, the next time the WP needs it.
 - **Session request:** call its `delegate_task` plan exactly. Every builder, reviewer, re-evaluation,
   repair, staged executor, assembler, worker, audit and placement is a fresh native task. Sessions
   use `isolation: shared` inside the WP coordinator's assigned checkout. Execute the returned target
@@ -52,9 +55,19 @@ only; running/stalled entries are not new launch requests.
   separate thread. When the user asks for a report back, deliver it to that user-facing thread.
 - **Cancel request:** call the provided `task_cancel` plan. Do not interrupt a delegated child using
   `t3_thread_interrupt`. Record the cancellation callback; Python keeps its task IDs and files.
+- **Cancelled before launch:** an entry with `cancelled_before_launch` instead of a tool plan was
+  cancelled before WPO saw its launch. Do not launch it. If you never launched it, run the command
+  it gives (a `t3 complete` with `state: cancelled`). If you did launch it, record the launch with
+  `t3 started` as usual; WPO then queues its native cancel. Only your callback settles it.
+- An operator's cancel (`wpo t3 cancel`, `wpo lanes stop`) or the runner's worker cleanup ends the
+  session with no fallback to another route, whatever state the task reaches; a quota cut-off's
+  cancel is a failed session, and the next route is tried. `completion outcome` values are
+  validated: `ok`, `rate_limited`, `api_error`, `hang`, `session_error`, and `compacted` only for a
+  staged session.
 - **Attention event:** inspect the reported WPO event and relevant artifacts, take authorized action
   or report the decision needed, then acknowledge the request with a completion callback. Identical
-  repeated attention reasons are deduplicated for model wakes; the original journal keeps every row.
+  attention reasons are deduplicated while one is still pending; once it is acknowledged, the same
+  reason recurring is a new request and wakes the coordinator again. The original journal keeps every row.
 
 Before the first `delegate_task` in each thread, call `orchestrator_capabilities` as required by T3.
 Save auxiliary response/callback JSON outside `<runs>/t3/requests/`, for example
@@ -91,7 +104,9 @@ Callbacks enforce native task identity and terminal state. A cancellation before
 callback still queues cancellation of the late native task. A late success cannot resurrect a
 cancelled request. Repeated callbacks are idempotent. Stable invocation receipts reconnect a crashed
 Python process to its existing task; a consumed continuation creates a new task generation and
-archives the old log rather than replaying its result.
+archives the old log rather than replaying its result. A receipt names its request before the request is submitted, and a finished session's request records when its result was consumed (`consumed_at`); that record wins over the receipt. One completion path finishes every session: the writer is recorded, then the scope check, then the result is logged and consumed, each step safe to repeat after a crash.
+
+A native task can outlive its runner (a T3 restart, a killed supervisor). When the WP runs again, its runner first settles every such session, oldest first, before it chooses a phase from the WP's status: it waits for the task, records its writer, checks its scope and consumes its result. No route is chosen and main is not merged into the checkout until then, and the supervisor's automatic integration settles them first too; `wpo integrate` refuses a WP that still has one. Recovery restores safety, not the session's control flow: an operator's cancel, a failure or a compaction is logged and the run continues; only a scope violation (the WP is blocked) ends it. A survivor that stalled stops the run until it is reconciled. Surviving workers are stopped by the worker barrier as at the end of a builder session.
 
 ## Activity, permissions and recovery
 
@@ -104,7 +119,11 @@ Do not fabricate token counts, context progress, compactions or tool events.
 
 WPO verifies scoped mutations after read/reviewer/evaluator/docs/worker sessions. Read/reviewer
 sessions must leave repository files unchanged; the others may change only their listed paths.
-Within a checkout, these sessions serialize so the mutation check has a clear boundary. A lead
+Within a checkout, these sessions serialize so the mutation check has a clear boundary: a scope
+lease names each one's request before it is published, and the next may start once that request has
+finished. `t3 complete` records the paths such a session changed, and the check judges it on those,
+not on later edits; recording them writes nothing into the repository, so a coordinator needs no
+write access to `.git`. A lead
 must stop writing while delegated workers run; lanes in different checkouts remain parallel.
 A scope violation preserves the changes, blocks the WP, and requires inspection. T3's native
 permission mode still governs tools, external files, network access and approval prompts; WPO's
@@ -113,8 +132,8 @@ post-run gate is not an OS sandbox or a replacement for native approval.
 Native permission requests are answered in T3. WPO command approvals keep their existing dashboard
 queue and file formats; approving one does not grant permission to a separate native T3 prompt.
 
-An idle request without callbacks or WP progress becomes **stalled**. Its native task may still
-be running: WPO starts no replacement and does not silently fall back to a CLI model. A persistent
+A launched session with no callback, heartbeat or WP progress for its idle limit (`idle_minutes`) raises one `t3-session-quiet` attention event per quiet period and is still waited for: a long review writes nothing. Only after `t3.hard_idle_minutes` (240) without real activity does it become **stalled**. A request never launched is woken once more at its idle limit, and becomes **stalled** if it is still unlaunched one idle period later. A stalled task may still be running: WPO starts no
+replacement and does not silently fall back to a CLI model. A persistent
 scope lease prevents another worker from writing in that checkout until the outstanding task is
 reconciled. `wpo t3 recover`, or the dashboard's **Recover coordinator** button, wakes outstanding
 coordinators once. It never resumes held lanes, polls running tasks, or blindly relaunches them.

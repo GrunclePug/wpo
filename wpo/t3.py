@@ -7,9 +7,11 @@ their callbacks here. No provider credentials are copied and no model CLI is lau
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -26,6 +28,25 @@ if TYPE_CHECKING:
 
 # The model option that carries a route's effort, by the name each T3 provider gives it.
 EFFORT_OPTIONS = ("effort", "reasoningEffort", "thinking_level")
+TERMINAL_STATES = ("done", "failed", "cancelled")
+# Kinds asked again once their last request finished: the same attention reason can recur, and a
+# failed or cancelled checkout must be preparable again. Sessions have their own receipts;
+# cancels and messages are one-shot.
+REARMED_KINDS = ("attention", "workspace")
+# Who asked for a cancellation. `operator` and `cleanup` end the session without a fallback route
+# (SessionCancelled); `cutoff` (quota) keeps the failure path; `compaction` is decided by the
+# request's `compacted` flag. A stronger origin replaces a weaker one on the original request.
+CANCEL_ORIGIN_RANK = {"compaction": 0, "cutoff": 1, "cleanup": 2, "operator": 3}
+# `t3 thread send` may take this long; the wake lock covers it, the debounce and a margin.
+WAKE_SEND_TIMEOUT_SECONDS = 45
+
+
+def request_id_for(kind: str, key: str, generation: int = 1) -> str:
+    """A request's id. Generation 1 keeps the original derivation, so existing request files stay
+    valid; later generations hash an encoding no generation-1 input (which starts with a kind name)
+    and no other key's generation can equal."""
+    text = f"{kind}:{key}" if generation == 1 else json.dumps(["generation", generation, kind, key])
+    return hashlib.sha256(text.encode()).hexdigest()[:32]
 
 
 class T3Error(RuntimeError):
@@ -88,6 +109,15 @@ class Bridge:
         if not thread:
             raise T3Error("No T3 coordinator is attached. In a T3 thread for this repository, load wp-orchestration and run wpo t3 attach with its live capability result. No CLI fallback is permitted.")
         return thread
+
+    def coordinator_family(self) -> str | None:
+        """The route family of the provider the coordinator was attached from (the capability
+        result's inheritedProviderInstanceId mapped back through `t3.providers`), or None."""
+        inherited = (read_json(self.directory / "capabilities.json") or {}).get("inheritedProviderInstanceId")
+        for family, provider in self.settings.get("providers", {}).items():
+            if inherited and (provider.get("providerInstanceId") if isinstance(provider, dict) else provider) == inherited:
+                return family
+        return None
 
     def capabilities(self) -> dict:
         cached = read_json(self.directory / "capabilities.json")
@@ -184,15 +214,24 @@ class Bridge:
         return self.directory / "requests" / f"{request_id}.json"
 
     def wake(self, thread_id: str, force: bool = False, created_after: float | None = None) -> None:
+        """Sends the coordinator a control wake. The stamp holds when the last send started: a
+        request created before that is covered by it (the coordinator's `t3 next` runs after the
+        send arrives). A wake for a newer request inside the debounce window waits out the window
+        and sends, rather than being dropped: an attention request has no waiter to wake it again."""
         self.directory.mkdir(parents=True, exist_ok=True)
         key = hashlib.sha256(thread_id.encode()).hexdigest()[:16]
         stamp = self.directory / f"wake-{key}.json"
-        with FileLock(self.directory / f"wake-{key}.lock"):
+        debounce = float(self.settings.get("wake_debounce_seconds", 5))
+        with FileLock(self.directory / f"wake-{key}.lock", timeout_seconds=WAKE_SEND_TIMEOUT_SECONDS + debounce + 10):
             previous = read_json(stamp, {})
             if not force and created_after is not None and previous.get("at", 0) >= created_after:
                 return
-            if not force and time.time() - previous.get("at", 0) < float(self.settings.get("wake_debounce_seconds", 5)):
-                return
+            remaining = debounce - (time.time() - previous.get("at", 0))
+            if not force and remaining > 0:
+                if created_after is None:
+                    return
+                # The lock is held, so no other send can start meanwhile.
+                time.sleep(remaining)
             prompt = (f"WPO T3 backend control: pending native requests for coordinator {thread_id}. "
                       f"Read the wp-orchestration T3 bridge instructions and run wpo --project \"{self.project.root.as_posix()}\" "
                       f"t3 next --coordinator {thread_id}. Execute the returned native tool plan; do not perform the requested worker/review task yourself. "
@@ -200,23 +239,35 @@ class Bridge:
             command = [str(Path(self.settings.get("cli", "t3")).expanduser()), "thread", "send", thread_id, "-", "--json"]
             if self.settings.get("base_dir"):
                 command += ["--base-dir", str(Path(self.settings["base_dir"]).expanduser())]
-            completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=45, check=False)
+            started = time.time()
+            completed = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                                       timeout=WAKE_SEND_TIMEOUT_SECONDS, check=False)
             if completed.returncode:
                 raise T3Error(f"T3 coordinator wake failed: {(completed.stderr or completed.stdout).strip()[:1000]}")
-            write_json(stamp, {"at": time.time(), "thread_id": thread_id})
+            write_json(stamp, {"at": started, "thread_id": thread_id})
 
-    def submit(self, kind: str, key: str, payload: dict, coordinator: str) -> dict:
-        request_id = hashlib.sha256(f"{kind}:{key}".encode()).hexdigest()[:32]
-        path = self.request_path(request_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with FileLock(path.with_suffix(".lock")):
-            request = read_json(path)
-            if request is None:
-                request = {"version": 1, "id": request_id, "kind": kind, "state": "pending", "coordinator_thread_id": coordinator,
-                           "created_at": time.time(), "payload": payload, "task_id": None, "thread_id": None, "link": None}
-                write_json(path, request)
+    def submit(self, kind: str, key: str, payload: dict, coordinator: str, initial: dict | None = None, wake: bool = True) -> dict:
+        generation = 1
+        while True:
+            request_id = request_id_for(kind, key, generation)
+            path = self.request_path(request_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with FileLock(path.with_suffix(".lock")):
+                request = read_json(path)
+                if request is None:
+                    request = {"version": 1, "id": request_id, "kind": kind, "state": "pending", "coordinator_thread_id": coordinator,
+                               "created_at": time.time(), "payload": payload, "task_id": None, "thread_id": None, "link": None,
+                               **(initial or {})}
+                    if generation > 1:
+                        request["generation"] = generation
+                    write_json(path, request)
+                    break
+            if kind in REARMED_KINDS and request["state"] in TERMINAL_STATES:
+                generation += 1
+                continue
+            break
         # Stable keys make restarts reconnect to an existing request instead of launching another child.
-        if request["state"] in ("pending", "claimed"):
+        if wake and request["state"] in ("pending", "claimed"):
             self.wake(coordinator, created_after=request["created_at"])
         return request
 
@@ -257,20 +308,48 @@ class Bridge:
             if current["state"] == "stalled":
                 raise T3Error(current["detail"])
             limit = float(current["payload"].get("idle_minutes", self.settings.get("coordinator_idle_minutes", 30))) * 60
-            activity = max(current.get("updated_at", current["created_at"]), current.get("last_activity_at", 0))
+            hard_limit = float(self.settings.get("hard_idle_minutes", 240)) * 60
+            # Only real activity counts: creation, the launch, callbacks and heartbeats, and the
+            # session's own files. Bookkeeping (`update` moves updated_at) never resets the clock.
+            # A request launched before `started_at` existed falls back to its last update, pinned
+            # once below so the notice's own write cannot move it.
+            started = current.get("started_at") or (current.get("updated_at", 0) if current.get("task_id") else 0)
+            activity = max(current["created_at"], started, current.get("last_activity_at", 0))
             for name in ("heartbeat_file", "progress_file"):
                 if current["payload"].get(name) and Path(current["payload"][name]).is_file():
                     activity = max(activity, Path(current["payload"][name]).stat().st_mtime)
-            if limit > 0 and time.time() - activity >= limit:
-                detail = (f"Native request {current['id']} has no callback/progress for {limit / 60:g} minutes; marked stalled. "
-                          "The native task may still be running. Use wpo t3 recover to reconcile completion; no replacement or CLI fallback was started.")
-                self.update(current["id"], state="stalled", detail=detail)
-                raise T3Error(detail)
+            idle = time.time() - activity
+            if not current.get("task_id"):
+                if limit > 0 and idle >= limit:
+                    # Never launched: a wake may have been lost. Ask once more, then give up.
+                    if not current.get("rewoken_at"):
+                        self.wake(current["coordinator_thread_id"], force=True)
+                        self.update(current["id"], rewoken_at=time.time())
+                    elif time.time() - current["rewoken_at"] >= limit:
+                        self.stall(current, f"was never launched, though the coordinator was woken again {limit / 60:g} minutes ago")
+            elif hard_limit > 0 and idle >= hard_limit:
+                # The hard deadline stands on its own: a shorter one than the idle limit, or no
+                # quiet notices at all (idle_minutes 0), still stalls on time.
+                self.stall(current, f"has had no callback or progress for {hard_limit / 60:g} minutes")
+            elif limit > 0 and idle >= limit and current.get("quiet_reported_for") != activity:
+                # A long session that writes nothing (a review) is not a failure: say so once per
+                # quiet period, and keep waiting.
+                self.update(current["id"], quiet_reported_for=activity, started_at=started or None)
+                wp = current["payload"].get("wp")
+                self.context.journal.emit("t3-session-quiet", f"native {current['payload'].get('role', current['kind'])} session {current['id']}"
+                                          f"{f' of {wp}' if wp else ''} has been quiet for {idle / 60:.0f} minutes; still waiting "
+                                          f"(stalled after {hard_limit / 60:g})", {"wp": wp} if wp else {})
             if current["state"] == "pending":
                 self.wake(current["coordinator_thread_id"], created_after=current["created_at"])
             if callback:
                 callback(current)
             time.sleep(float(self.settings.get("callback_interval_seconds", 0.5)))
+
+    def stall(self, request: dict, why: str) -> None:
+        detail = (f"Native request {request['id']} {why}; marked stalled. The native task may still be running. "
+                  "Use wpo t3 recover to reconcile completion; no replacement or CLI fallback was started.")
+        self.update(request["id"], state="stalled", detail=detail)
+        raise T3Error(detail)
 
     def tool_plan(self, request: dict) -> dict:
         payload = request["payload"]
@@ -320,7 +399,8 @@ class Bridge:
     def register_workspace(self, request_id: str, thread_id: str, tree: Path) -> dict:
         from .project import git
 
-        request = read_json(self.request_path(request_id))
+        path = self.request_path(request_id)
+        request = read_json(path)
         if not request or request["kind"] != "workspace":
             raise T3Error("Workspace registration needs a pending workspace request")
         tree = Path(git(tree, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
@@ -332,10 +412,20 @@ class Bridge:
         if git(tree, "merge-base", "--is-ancestor", expected, "HEAD", check=False).returncode:
             raise T3Error("The T3 checkout does not contain WPO's expected local main commit; correct T3's base selection before registering")
         branch = git(tree, "symbolic-ref", "--short", "HEAD").stdout.strip()
-        workspace = {"version": 1, "backend": "t3", "wp": request["payload"]["wp"], "path": str(tree), "branch": branch,
-                     "coordinator_thread_id": thread_id, "request_id": request_id, "registered_at": time.time()}
-        write_json(self.project.wp_run_dir(workspace["wp"]) / "t3-workspace.json", workspace)
-        self.update(request_id, state="done", result=workspace, thread_id=thread_id)
+        with FileLock(path.with_suffix(".lock")):
+            request = read_json(path)
+            if request["state"] in TERMINAL_STATES:
+                recorded = request.get("result") or {}
+                if request["state"] == "done" and (recorded.get("path"), recorded.get("branch"), recorded.get("coordinator_thread_id")) == (str(tree), branch, thread_id):
+                    return recorded  # a repeated callback is idempotent
+                request["late_result"] = {"path": str(tree), "branch": branch, "thread_id": thread_id, "at": time.time()}
+                write_json(path, request)
+                raise T3Error(f"Workspace request {request_id} is already {request['state']}; this registration was recorded but not applied")
+            workspace = {"version": 1, "backend": "t3", "wp": request["payload"]["wp"], "path": str(tree), "branch": branch,
+                         "coordinator_thread_id": thread_id, "request_id": request_id, "registered_at": time.time()}
+            write_json(self.project.wp_run_dir(workspace["wp"]) / "t3-workspace.json", workspace)
+            request.update(state="done", result=workspace, thread_id=thread_id, updated_at=time.time())
+            write_json(path, request)
         return workspace
 
     def ensure_workspace(self, wp_id: str) -> Path:
@@ -404,12 +494,30 @@ class Bridge:
         if state not in ("done", "failed", "cancelled"):
             raise T3Error("A completion state must be done, failed or cancelled")
         path = self.request_path(request_id)
+        # What a scope-checked task changed, recorded when it completes: a later finish (the worker
+        # barrier, recovery) then judges it on its own changes, not on whatever the checkout holds
+        # by then. Hashed outside the lock, which a large tree would hold up.
+        snapshot = {}
+        unlocked = read_json(path)
+        if unlocked and unlocked["state"] not in TERMINAL_STATES and unlocked["payload"].get("before_tree"):
+            from .commands import changed_since
+            from .project import ProjectError
+            try:
+                snapshot = {"completed_changes": changed_since(Path(unlocked["payload"]["cwd"]), unlocked["payload"]["before_tree"])}
+            except (OSError, RuntimeError, ProjectError) as error:
+                snapshot = {"completed_changes": None, "completed_changes_error": str(error)}
         with FileLock(path.with_suffix(".lock")):
             request = read_json(path)
             if request is None:
                 raise T3Error("Unknown bridge request")
             if request.get("task_id") and result.get("task_id") and request["task_id"] != result["task_id"]:
                 raise T3Error("Completion task ID does not match the recorded native task")
+            if result.get("outcome") is not None:
+                from .routing import OUTCOMES
+                # A staged session handles compaction; for any other, `Router.mark` would reject it.
+                allowed = ("ok", *OUTCOMES, *(("compacted",) if request["payload"].get("stop_on_compaction") else ()))
+                if result["outcome"] not in allowed:
+                    raise T3Error(f"Completion outcome {result['outcome']!r} is not one of: {', '.join(allowed)}")
             if request["state"] == "cancelled":
                 request["late_result"] = result
                 write_json(path, request)
@@ -420,7 +528,7 @@ class Bridge:
                 return request
             request.update(state=state, result=result, detail=result.get("detail"), updated_at=time.time(),
                            task_id=result.get("task_id", request.get("task_id")), thread_id=result.get("thread_id", request.get("thread_id")),
-                           link=result.get("link", request.get("link")))
+                           link=result.get("link", request.get("link")), **snapshot)
             write_json(path, request)
             return request
 
@@ -435,40 +543,108 @@ class Bridge:
             if request.get("task_id") and request["task_id"] != response.get("taskId"):
                 raise T3Error("A second native task was returned for one request; cancel the duplicate explicitly")
             state = request["state"] if request["state"] in ("done", "failed", "cancelled") else "running"
-            request.update(state=state, task_id=response.get("taskId"), thread_id=response.get("childThreadId"),
+            request.update(state=state, task_id=response.get("taskId"), thread_id=response.get("childThreadId"), started_at=time.time(),
                            link=response.get("link"), native_response=response, updated_at=time.time())
             write_json(path, request)
-        if state == "cancelled" and request.get("task_id"):
+        if request.get("task_id") and (state == "cancelled" or request.get("cancel_requested")):
             # Cancellation can win before delegate_task returns. The late task still must be stopped.
-            self.cancel_request(request, "request was cancelled before the native launch callback arrived")
+            self.cancel_request(request, request.get("cancel_detail") or "request was cancelled before the native launch callback arrived",
+                                request.get("cancel_origin") or "operator")
         return request
 
-    def begin_session(self, log_path: Path, payload: dict, coordinator: str) -> tuple[dict, Path]:
+    def begin_session(self, log_path: Path, payload: dict, coordinator: str, guard=None) -> tuple[dict, Path]:
+        """The session's request: the unconsumed one its receipt names, or a new generation. The
+        submit (and a reconnect) runs inside `guard(request_id)`, a context manager, so what the
+        guard writes or checks happens before the request is published; the coordinator is woken
+        only after the guard has exited."""
+        guard = guard or contextlib.nullcontext
         receipt = log_path.with_name(log_path.name + ".t3-invocation.json")
         with FileLock(receipt.with_suffix(".lock")):
             previous = read_json(receipt)
             if previous is not None and not previous["consumed"]:
-                return read_json(self.request_path(previous["request_id"])), receipt
+                current = read_json(self.request_path(previous["request_id"]))
+                if current is not None and not current.get("consumed_at"):
+                    with guard(current["id"]):
+                        return current, receipt
+                # No request (a start interrupted before its submit) or one already finished whose
+                # receipt write was lost: the request's `consumed_at` is authoritative.
+                previous = {**previous, "consumed": True}
+                write_json(receipt, previous)
             generation = previous["generation"] + 1 if previous else 1
-            request = self.submit("session", f"{log_path}:{generation}", payload, coordinator)
-            write_json(receipt, {"version": 1, "generation": generation, "request_id": request["id"], "consumed": False})
+            key = f"{log_path}:{generation}"
+            request_id = request_id_for("session", key)
+            # The receipt names the request before it is submitted (and may wake a coordinator), so a
+            # crash in between never leaves a launched request without a receipt.
+            write_json(receipt, {"version": 1, "generation": generation, "request_id": request_id, "consumed": False})
             if log_path.is_file():
                 archived = log_path.with_name(f"{log_path.stem}.generation-{generation - 1}{log_path.suffix}")
                 log_path.replace(archived)
-            return request, receipt
+            with guard(request_id):
+                request = self.submit("session", key, payload, coordinator, initial={"consumed_at": None}, wake=False)
+        if request["state"] in ("pending", "claimed"):
+            self.wake(coordinator, created_after=request["created_at"])
+        return request, receipt
 
-    def cancel_request(self, request: dict, why: str) -> dict:
-        if request.get("task_id"):
-            return self.submit("cancel", request["id"], {"task_id": request["task_id"], "reason": why,
-                                                       "original_request_id": request["id"]}, request["coordinator_thread_id"])
-        return self.update(request["id"], state="cancelled", detail=why)
+    def outstanding_sessions(self, wp_id: str) -> list[dict]:
+        """The WP's native sessions no runner has finished, oldest first, read from the request store
+        (a request made before receipts were written first can lack one): every non-worker session
+        not consumed, and every worker session not terminal (today's worker barrier stops those).
+        A request with `consumed_at` is consumed exactly when it is set. One from before that field
+        is consumed when its receipt is, or names a later request; without a receipt it counts only
+        while it is not terminal: finishing a long-ended one now would scope-check it against a
+        checkout that has moved on since."""
+        found = []
+        for request in self.requests():
+            if not request or request.get("kind") != "session" or request["payload"].get("wp") != wp_id:
+                continue
+            if request["payload"].get("role") == "worker":
+                if request["state"] not in TERMINAL_STATES:
+                    found.append(request)
+                continue
+            if "consumed_at" in request:
+                if not request["consumed_at"]:
+                    found.append(request)
+                continue
+            log_path = request["payload"].get("log_path")
+            receipt = read_json(Path(log_path).with_name(Path(log_path).name + ".t3-invocation.json")) if log_path else None
+            if receipt is None:
+                if request["state"] not in TERMINAL_STATES:
+                    found.append(request)
+            elif receipt["request_id"] == request["id"] and not receipt["consumed"]:
+                found.append(request)
+        return sorted(found, key=lambda request: request["created_at"])
 
-    def cancel_wp(self, wp_id: str, why: str, role: str | None = None) -> None:
+    def cancel_request(self, request: dict, why: str, origin: str) -> dict:
+        """Asks for a request to be cancelled; `origin` is one of CANCEL_ORIGIN_RANK. The origin is
+        recorded on the request itself, under its lock (cancel requests keep their first payload,
+        so a later, stronger origin could not be carried there). A request not launched yet stays
+        pending with `cancel_requested`: only the coordinator can say whether it launched it, so it
+        is settled by the coordinator's completion (or by its launch callback, which then queues
+        the native cancel), never locally."""
+        if origin not in CANCEL_ORIGIN_RANK:
+            raise ValueError(f"unknown cancel origin {origin!r}")
+        path = self.request_path(request["id"])
+        with FileLock(path.with_suffix(".lock")):
+            current = read_json(path)
+            if current["state"] in TERMINAL_STATES:
+                return current
+            if CANCEL_ORIGIN_RANK[origin] > CANCEL_ORIGIN_RANK.get(current.get("cancel_origin"), -1):
+                current["cancel_origin"] = origin
+            if not current.get("task_id"):
+                current.update(cancel_requested=True, cancel_detail=why)
+            write_json(path, current)
+        if current.get("task_id"):
+            return self.submit("cancel", current["id"], {"task_id": current["task_id"], "reason": why,
+                                                       "original_request_id": current["id"]}, current["coordinator_thread_id"])
+        self.wake(current["coordinator_thread_id"], created_after=time.time())
+        return current
+
+    def cancel_wp(self, wp_id: str, why: str, origin: str, role: str | None = None) -> None:
         for request in self.requests():
             if request["state"] in ("done", "failed", "cancelled"):
                 continue
             if request["payload"].get("wp") == wp_id and (role is None or request["payload"].get("role") == role):
-                self.cancel_request(request, why)
+                self.cancel_request(request, why, origin)
 
     def recover(self, coordinator: str | None = None) -> int:
         requests = self.requests()
@@ -541,7 +717,15 @@ def cli_command(context: Context, arguments) -> int:
         plans = []
         for request in bridge.pending(arguments.coordinator):
             entry = {"request": {key: request.get(key) for key in ("id", "kind", "state", "task_id", "thread_id", "link")}}
-            if request["state"] in ("pending", "claimed"):
+            if request["state"] in ("pending", "claimed") and request.get("cancel_requested"):
+                result_file = bridge.directory / "requests" / f"{request['id']}.cancelled-before-launch"
+                write_json(result_file, {"state": "cancelled", "detail": request.get("cancel_detail")})
+                entry["cancelled_before_launch"] = (
+                    f"Do not launch this request: it was cancelled ({request.get('cancel_origin')}: {request.get('cancel_detail')}). "
+                    f"If you never launched it, record that with wpo --project \"{context.project.root.as_posix()}\" "
+                    f"t3 complete --request {request['id']} --result-file \"{result_file.as_posix()}\". If you already launched it, "
+                    "record the launch with t3 started as usual; WPO then queues its native cancel.")
+            elif request["state"] in ("pending", "claimed"):
                 if request["kind"] == "attention":
                     entry["attention"] = request["payload"]["event"]
                 else:
@@ -578,7 +762,7 @@ def cli_command(context: Context, arguments) -> int:
         request = read_json(bridge.request_path(arguments.request))
         if request is None:
             raise T3Error("Unknown request")
-        bridge.cancel_request(request, arguments.reason)
+        bridge.cancel_request(request, arguments.reason, "operator")
         print("Cancellation queued for the native coordinator.")
     elif command == "event":
         event = read_json(arguments.event_file)
@@ -610,21 +794,23 @@ def cli_command(context: Context, arguments) -> int:
 
 def run_attempt(context: Context, route: dict, prompt: str, log_path: Path, settings, resume_session=None):
     if settings.access != "builder":
-        key = hashlib.sha256(str(settings.cwd.resolve()).encode()).hexdigest()[:16]
+        key = scope_key(settings.cwd)
         with NamedMutex(context.project.mutex_name("t3-scope", key)):
             bridge = Bridge(context)
             lease = read_json(bridge.directory / "scope" / f"{key}.json")
-            if lease and lease["log_path"] != str(log_path):
+            receipt = read_json(log_path.with_name(log_path.name + ".t3-invocation.json"))
+            # Our own reconnect, to the request the lease names, is admitted; a reused log path
+            # with a new generation is checked like any other task.
+            if lease and not (receipt and not receipt["consumed"] and receipt["request_id"] == lease["request_id"]):
                 previous = read_json(bridge.request_path(lease["request_id"]))
-                if previous and previous["state"] not in ("done", "failed", "cancelled"):
+                if previous and previous["state"] not in TERMINAL_STATES:
                     raise T3Error("A previous native scope-checked task has no terminal callback; reconcile it before starting another worker in this checkout")
             return _run_attempt(context, route, prompt, log_path, settings, resume_session)
     return _run_attempt(context, route, prompt, log_path, settings, resume_session)
 
 
 def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, settings, resume_session=None):
-    from .inbox import clear_live, pending_messages, write_live
-    from .routing import SessionOutcome
+    from .inbox import clear_live, write_live
     from .session_brief import loads_instructions_natively
 
     bridge = Bridge(context)
@@ -645,7 +831,7 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
     identity_path = bridge.directory / "sessions" / f"{identity_key}.json"
     write_json(identity_path, {"version": 1, "env": identity, "project": str(context.project.root)})
     prefix = f'wpo --project "{context.project.root.as_posix()}" --session {identity_key}'
-    prompt_text = prompt_text.replace("wpo ", prefix + " ")
+    prompt_text = with_session_prefix(prompt_text, prefix)
     if resume_session:
         prompt_text += (f"\n\nContinuation of recorded WPO session {resume_session}. This is a fresh native task; "
                         "read the WP progress, handoff, and current diff to continue the same round. Do not assume provider context was resumed.")
@@ -687,6 +873,13 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
         before_tree = worktree_tree_id(settings.cwd)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.with_name(log_path.name + ".prompt.md").write_text(prompt_text, encoding="utf-8")
+
+    @contextlib.contextmanager
+    def lease(request_id: str):
+        # The scope lease names the request before it is published, so the next task in this
+        # checkout can never start while it runs unseen.
+        write_json(bridge.directory / "scope" / f"{scope_key(settings.cwd)}.json", {"request_id": request_id, "log_path": str(log_path)})
+        yield
     request, receipt = bridge.begin_session(log_path, {"wp": wp_id, "role": role, "title": f"{wp_id or context.project.name}: {role}",
                             "native_role": {"reviewer": "review", "read": "research", "docs": "research", "evaluator": "general", "worker": "implementation", "builder": "implementation"}[settings.access],
                             "prompt": prompt_text, "target": target, "route": route, "log_path": str(log_path),
@@ -694,50 +887,17 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
                             "resume_session": resume_session, "stop_on_compaction": settings.stop_on_compaction,
                             "idle_minutes": settings.idle_minutes, "heartbeat_file": str(log_path.parent / "heartbeat"),
                             "progress_file": str(context.wp_in_tree(wp_id, settings.cwd).path) if wp_id else None},
-                            bridge.coordinator_for(wp_id))
+                            bridge.coordinator_for(wp_id), lease if settings.access != "builder" else None)
     write_json(identity_path, {"version": 1, "env": {**identity, "WPO_T3_REQUEST_ID": request["id"]}, "project": str(context.project.root)})
-    if settings.access != "builder":
-        key = hashlib.sha256(str(settings.cwd.resolve()).encode()).hexdigest()[:16]
-        write_json(bridge.directory / "scope" / f"{key}.json", {"request_id": request["id"], "log_path": str(log_path)})
     if not log_path.exists():
         log_path.write_text(json.dumps({"type": "system", "subtype": "init", "session_id": request["id"], "backend": "t3",
                                        "t3": {"request_id": request["id"], "target": target}}) + "\n", encoding="utf-8")
     if settings.inbox:
         write_live(settings.inbox, log_path, os.getpid())
-    launched_at = time.time()
-    next_quota_check = 0.0
-    handoff_reason = None
-    cancellation_sent = False
-    from .session import QuotaHandoffSlot
-    quota_slot = QuotaHandoffSlot(context.router.state_dir, route["family"], str(log_path))
-    def messages(current):
-        nonlocal next_quota_check, handoff_reason, cancellation_sent
-        if settings.inbox and current.get("thread_id"):
-            for message in pending_messages(settings.inbox):
-                bridge.submit("message", message.name, {"thread_id": current["thread_id"], "message": message.read_text(encoding="utf-8"), "message_path": str(message)},
-                              current["coordinator_thread_id"])
-        if current.get("task_id") and not cancellation_sent and current.get("compacted") and settings.stop_on_compaction:
-            bridge.cancel_request(current, "native compaction callback reached staged context boundary")
-            cancellation_sent = True
-        if current.get("thread_id") and time.time() >= next_quota_check and not cancellation_sent:
-            from .harness import handoff_limit
-            from .session import quota_running_out
-            next_quota_check = time.time() + 60
-            if cut_off := context.router.family_cut_off(route["family"], launched_at):
-                bridge.cancel_request(current, cut_off)
-                cancellation_sent = True
-                context.journal.emit("session-cut-off", f"T3 cancellation requested: {cut_off}", settings.fields)
-            elif settings.handoff_message is not None and handoff_reason is None:
-                quota_reason = quota_running_out(context, route)
-                handoff_reason = quota_reason if quota_reason and quota_slot.try_claim() else None
-                if current.get("context_tokens", 0) >= handoff_limit(context.project.config, route["harness"]):
-                    handoff_reason = "native callback reached WPO context handoff threshold"
-                if handoff_reason:
-                    bridge.submit("message", request["id"] + ":handoff", {"thread_id": current["thread_id"],
-                                  "message": settings.handoff_message(handoff_reason)}, current["coordinator_thread_id"])
-                    context.journal.emit("handoff-requested", f"T3 handoff requested: {handoff_reason}", settings.fields)
+    controls = SessionControls(context, bridge, request, route, settings.stop_on_compaction, settings.fields,
+                               inbox=settings.inbox, handoff_message=settings.handoff_message)
     try:
-        completed = bridge.wait(request, messages)
+        bridge.wait(request, controls)
     except T3Error as error:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"type": "result", "is_error": True, "result": str(error), "backend": "t3", "recoverable_request_id": request["id"]}) + "\n")
@@ -747,39 +907,185 @@ def _run_attempt(context: Context, route: dict, prompt: str, log_path: Path, set
             context.journal.emit("wp-blocked", str(error), {"wp": wp_id})
         raise
     finally:
-        quota_slot.release()
+        controls.close()
         if settings.inbox:
             clear_live(settings.inbox)
-    result = completed.get("result", {})
-    text = result.get("text", "")
-    outcome = result.get("outcome") or ("ok" if completed["state"] == "done" else "session_error")
-    violation = None
-    if request["payload"].get("before_tree"):
-        from .commands import worktree_tree_id
-        from .project import git
-        from .wpfile import glob_to_regex
-        after_tree = worktree_tree_id(settings.cwd)
-        changed = git(settings.cwd, "diff", "--name-only", "--no-renames", "-z", request["payload"]["before_tree"], after_tree).stdout.split("\0")
-        patterns = [] if settings.access in ("read", "reviewer") else request["payload"]["write_paths"]
-        outside = [path for path in filter(None, changed) if not any(glob_to_regex(pattern).match(path) for pattern in patterns)]
-        if outside:
-            violation = f"Native {settings.access} task changed paths outside its access contract: {', '.join(outside)}. Changes are preserved for manual review; no automatic rollback or fallback is safe."
-            outcome = "scope_violation"
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
-                                 "backend": "t3", "t3": {"task_id": completed.get("task_id"), "thread_id": completed.get("thread_id"), "link": completed.get("link")}}) + "\n")
-        handle.write(json.dumps({"type": "result", "subtype": "success" if outcome == "ok" else "error", "is_error": outcome != "ok", "result": text + ("\n\n" + violation if violation else ""),
-                                 "session_id": request["id"], "backend": "t3", "usage_available": bool(result.get("usage")), **({"usage": result["usage"]} if result.get("usage") else {})}) + "\n")
-    if (outcome == "compacted" or completed.get("compacted")) and settings.stop_on_compaction:
-        from .session import CompactionStop
-        write_json(receipt, {**read_json(receipt), "consumed": True})
-        raise CompactionStop(route["id"], log_path)
-    write_json(receipt, {**read_json(receipt), "consumed": True})
-    if violation:
-        if wp_id:
-            from . import wpfile
-            wpfile.set_status(context.wp_in_tree(wp_id, settings.cwd), "blocked")
-            context.journal.emit("wp-blocked", violation, {"wp": wp_id})
+    return finish_attempt(context, request, settings.on_finished, handoff_reason=controls.handoff_reason)
+
+
+def scope_key(cwd: Path) -> str:
+    """Names a checkout's scope mutex and lease file."""
+    return hashlib.sha256(str(cwd.resolve()).encode()).hexdigest()[:16]
+
+
+def with_session_prefix(text: str, prefix: str) -> str:
+    """Gives every wpo command in a session's prompt the session's identity: `wpo` at a token
+    boundary (the start of a line, whitespace, a backtick, a quote or an opening parenthesis before
+    it) followed by one of wpo's subcommands becomes `prefix`. Prose ("wpo commits", "in a wpo
+    session", "wpo-orchestration") is left alone, and text already prefixed is not prefixed again.
+    A diff that holds a literal `wpo verify` command line is still rewritten; that matters only when
+    reviewing wpo itself, and is harmless there."""
+    from .cli import command_names
+    names = "|".join(re.escape(name) for name in sorted(command_names(), key=len, reverse=True))
+    return re.sub(rf"(?<![^\s`'\"(])wpo (?=(?:{names})(?![\w-]))", lambda _match: prefix + " ", text)
+
+
+class SessionControls:
+    """What runs while a native session is waited on: the orchestrator's inbox messages, the staged
+    compaction cancel, the quota cut-off and the handoff request. A recovered session (PR 3b) gets
+    the compaction cancel and the cut-off; inbox delivery and handoff need a live builder."""
+
+    def __init__(self, context: Context, bridge: Bridge, request: dict, route: dict, stop_on_compaction: bool, fields: dict,
+                 inbox: Path | None = None, handoff_message=None) -> None:
+        from .session import QuotaHandoffSlot
+        self.context, self.bridge, self.request, self.route = context, bridge, request, route
+        self.stop_on_compaction, self.fields, self.inbox, self.handoff_message = stop_on_compaction, fields, inbox, handoff_message
+        self.launched_at = time.time()
+        self.next_quota_check = 0.0
+        self.handoff_reason: str | None = None
+        self.cancellation_sent = False
+        self.quota_slot = QuotaHandoffSlot(context.router.state_dir, route["family"], request["payload"]["log_path"])
+
+    def close(self) -> None:
+        self.quota_slot.release()
+
+    def __call__(self, current: dict) -> None:
+        from .inbox import pending_messages
+        bridge, context, route = self.bridge, self.context, self.route
+        if self.inbox and current.get("thread_id"):
+            for message in pending_messages(self.inbox):
+                bridge.submit("message", message.name, {"thread_id": current["thread_id"], "message": message.read_text(encoding="utf-8"), "message_path": str(message)},
+                              current["coordinator_thread_id"])
+        if current.get("task_id") and not self.cancellation_sent and current.get("compacted") and self.stop_on_compaction:
+            bridge.cancel_request(current, "native compaction callback reached staged context boundary", "compaction")
+            self.cancellation_sent = True
+        if current.get("thread_id") and time.time() >= self.next_quota_check and not self.cancellation_sent:
+            from .harness import handoff_limit
+            from .session import quota_running_out
+            self.next_quota_check = time.time() + 60
+            if cut_off := context.router.family_cut_off(route["family"], self.launched_at):
+                bridge.cancel_request(current, cut_off, "cutoff")
+                self.cancellation_sent = True
+                context.journal.emit("session-cut-off", f"T3 cancellation requested: {cut_off}", self.fields)
+            elif self.handoff_message is not None and self.handoff_reason is None:
+                quota_reason = quota_running_out(context, route)
+                self.handoff_reason = quota_reason if quota_reason and self.quota_slot.try_claim() else None
+                if current.get("context_tokens", 0) >= handoff_limit(context.project.config, route["harness"]):
+                    self.handoff_reason = "native callback reached WPO context handoff threshold"
+                if self.handoff_reason:
+                    bridge.submit("message", self.request["id"] + ":handoff", {"thread_id": current["thread_id"],
+                                  "message": self.handoff_message(self.handoff_reason)}, current["coordinator_thread_id"])
+                    context.journal.emit("handoff-requested", f"T3 handoff requested: {self.handoff_reason}", self.fields)
+
+
+def finish_attempt(context: Context, request: dict, on_finished=None, recovery: bool = False, handoff_reason: str | None = None):
+    """Completes a terminal native session: the one path for a live attempt and for recovery.
+
+    Under the request's finish lock: `on_finished(route)` (the caller's writer recording, so it is
+    persisted before anything can fail, stop or consume), the scope check, the disposition (first
+    match wins: scope_violation, cancelled_by_operator, compacted, cancelled_by_cleanup, else the
+    outcome), the session log's result (once per request), then the disposition and `consumed_at`
+    on the request and the receipt marked consumed, the last writes. Every step before them is
+    idempotent, so a finish replayed after a crash gives the same result; a request already consumed
+    only returns what was recorded. Live, it raises or returns per the disposition (T3Error,
+    SessionCancelled, CompactionStop or the SessionOutcome); with `recovery` it returns the
+    disposition and raises nothing."""
+    from .routing import SessionOutcome
+    from .session import CompactionStop, SessionCancelled
+    bridge = Bridge(context)
+    path = bridge.request_path(request["id"])
+    with FileLock(path.with_name(f"{path.stem}.finish.lock"), timeout_seconds=600):
+        completed = read_json(path)
+        payload = completed["payload"]
+        route, log_path, wp_id = payload["route"], Path(payload["log_path"]), payload.get("wp")
+        result = completed.get("result") or {}
+        text = result.get("text", "")
+        outcome = result.get("outcome") or ("ok" if completed["state"] == "done" else "session_error")
+        if completed.get("consumed_at"):
+            disposition, violation = completed.get("disposition") or outcome, completed.get("violation")
+        else:
+            if on_finished is not None:
+                on_finished(route)
+            changes = completed.get("completed_changes")
+            violation = scope_violation(context, payload, changes)
+            if violation and completed.get("completed_changes_error"):
+                violation += (f" Its completion snapshot failed ({completed.get('completed_changes_error')}); "
+                              "checked against the checkout as it is now.")
+            if violation and wp_id:
+                from . import wpfile
+                wp = context.wp_in_tree(wp_id, Path(payload["cwd"]))
+                if wp.status != "blocked":
+                    wpfile.set_status(wp, "blocked")
+                    context.journal.emit("wp-blocked", violation, {"wp": wp_id})
+            if violation:
+                disposition = "scope_violation"
+            elif completed.get("cancel_origin") == "operator":
+                disposition = "cancelled_by_operator"
+            elif (outcome == "compacted" or completed.get("compacted")) and payload.get("stop_on_compaction"):
+                disposition = "compacted"
+            elif completed.get("cancel_origin") == "cleanup":
+                disposition = "cancelled_by_cleanup"
+            else:
+                disposition = outcome
+            logged_outcome = "scope_violation" if violation else outcome
+            if not session_result_logged(log_path, completed["id"]):
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+                                             "backend": "t3", "t3": {"task_id": completed.get("task_id"), "thread_id": completed.get("thread_id"), "link": completed.get("link")}}) + "\n")
+                    handle.write(json.dumps({"type": "result", "subtype": "success" if logged_outcome == "ok" else "error", "is_error": logged_outcome != "ok",
+                                             "result": text + ("\n\n" + violation if violation else ""), "session_id": completed["id"], "backend": "t3",
+                                             "usage_available": bool(result.get("usage")), **({"usage": result["usage"]} if result.get("usage") else {})}) + "\n")
+            with FileLock(path.with_suffix(".lock")):
+                current = read_json(path)
+                current.update(disposition=disposition, violation=violation, consumed_at=time.time())
+                write_json(path, current)
+            receipt = log_path.with_name(log_path.name + ".t3-invocation.json")
+            with FileLock(receipt.with_suffix(".lock")):
+                recorded = read_json(receipt)
+                if recorded is not None and recorded["request_id"] == completed["id"] and not recorded["consumed"]:
+                    write_json(receipt, {**recorded, "consumed": True})
+    if recovery:
+        return disposition
+    detail = completed.get("cancel_detail") or completed.get("detail") or ""
+    if disposition == "scope_violation":
         raise T3Error(violation)
+    if disposition == "cancelled_by_operator":
+        raise SessionCancelled(route["id"], "operator", detail)
+    if disposition == "compacted":
+        raise CompactionStop(route["id"], log_path)
+    if disposition == "cancelled_by_cleanup":
+        raise SessionCancelled(route["id"], "cleanup", detail)
     return SessionOutcome(outcome, result.get("detail") or completed.get("detail") or "", text,
                           handoff_reason=result.get("handoff_reason") or handoff_reason)
+
+
+def scope_violation(context: Context, payload: dict, changed: list[str] | None = None) -> str | None:
+    """What a read-only or limited-access session changed outside its access contract, if anything:
+    among `changed` (its completion snapshot) when given, else the checkout as it is now."""
+    if not payload.get("before_tree"):
+        return None
+    from .commands import changed_since
+    from .wpfile import glob_to_regex
+    if changed is None:
+        changed = changed_since(Path(payload["cwd"]), payload["before_tree"])
+    patterns = [] if payload["access"] in ("read", "reviewer") else payload["write_paths"]
+    outside = [path for path in filter(None, changed) if not any(glob_to_regex(pattern).match(path) for pattern in patterns)]
+    if not outside:
+        return None
+    return (f"Native {payload['access']} task changed paths outside its access contract: {', '.join(outside)}. "
+            "Changes are preserved for manual review; no automatic rollback or fallback is safe.")
+
+
+def session_result_logged(log_path: Path, request_id: str) -> bool:
+    """Whether the session log already holds this request's result (a finish replayed after a crash)."""
+    if not log_path.is_file():
+        return False
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("{") and '"type": "result"' in line:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("type") == "result" and record.get("session_id") == request_id:
+                return True
+    return False

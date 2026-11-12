@@ -34,6 +34,9 @@ DEFAULTS: dict = {
         "wake_debounce_seconds": 5,
         "callback_interval_seconds": 0.5,
         "coordinator_idle_minutes": 30,
+        # A launched native session quiet past its idle limit raises `t3-session-quiet` and is waited
+        # for; only after this many minutes without real activity is it marked stalled.
+        "hard_idle_minutes": 240,
         # Route families whose native sessions load instruction files themselves: files named
         # `names` in their checkout and every directory above it, and `files`. Their briefs leave
         # those out (session_brief.native_instruction_files).
@@ -64,6 +67,9 @@ DEFAULTS: dict = {
         # Every reading usage_budget.py fetched, one JSON row per window: the burn-rate source.
         "history": "~/.local/state/wp-orchestration/usage-budget-history.jsonl",
         "max_age_seconds": 300,
+        # A family's reading older than this (its own fetched_at, else the snapshot's) is unknown for
+        # routing, which blocks Claude and GPT routes safely; the dashboard still shows it.
+        "max_reading_age_seconds": 1800,
     },
     "keys": {
         "openrouter": "~/.config/wp-orchestration/keys/openrouter",
@@ -190,6 +196,10 @@ class MachineConfig:
     @property
     def usage_max_age_seconds(self) -> float:
         return float(self.raw["usage"]["max_age_seconds"])
+
+    @property
+    def usage_max_reading_age_seconds(self) -> float:
+        return float(self.raw["usage"].get("max_reading_age_seconds", 1800))
 
     def key_file(self, name: str) -> Path:
         return _expand(self.raw["keys"][name])

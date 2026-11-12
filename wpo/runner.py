@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,16 +31,18 @@ from .commands import CommandFailure, build_slot, changed_paths, matches_main, i
 from .context import Context
 from .harness import SESSION_WORKER_AGENT, SHELL_CHAINING, CLAUDE_CLI_HARNESSES, command_prefixes, handoff_limit
 from .inbox import clear_pause, inbox_of, pause_requested
-from .platform import kill_tree, pid_alive
+from .platform import kill_tree, pid_alive, replace_file
 from .project import TASKS_RELATIVE_PATH, git
 from .review_brief import ReviewBrief, build_review_brief
 from .routing import Route, RoutingError, model_family_of, record_wp_mode, resolve_work_spec, spec_mode, with_mode, wp_mode
-from .session import CompactionStop, NoRouteError, ResumeFailed, ResumeTarget, SessionResult, run_session, session_facts
+from .session import CompactionStop, NoRouteError, ResumeFailed, ResumeTarget, SessionCancelled, SessionResult, run_session, session_facts
 from .session_brief import builder_skills, included_files, reviewer_skills
-from .session_commands import HANDOFF_FILE, SESSION_VERIFIED_TREE_FILE
+from .session_commands import HANDOFF_FILE, SESSION_VERIFIED_TREE_FILE, checks_fingerprint, outside_owns
 from .whats_new import NOTHING_TO_TRY, TRY_IT_SECTION, try_it_problem
 
 EXIT_NO_ROUTE = 4
+# The T3 backend or the boot fence failed: not a route shortage, so a supervisor reports the run as failed.
+EXIT_BACKEND = 8
 # The file keeps its historical name so ledgers written before rounds replaced attempts still load.
 LEDGER_FILE = "attempts.json"
 VERDICT = re.compile(r"VERDICT:\s*(PASS|CHANGES_REQUESTED)")
@@ -111,7 +114,10 @@ class RoundLedger:
         return json.loads(path.read_text(encoding="utf-8")).get("escalated_to") if path.exists() else None
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(self.state, indent=2) + "\n", encoding="utf-8")
+        # Atomic: a finish replayed after a kill must never find a half-written ledger.
+        staging = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        staging.write_text(json.dumps(self.state, indent=2) + "\n", encoding="utf-8")
+        replace_file(staging, self.path)
 
     def reset(self) -> None:
         self.state = {**self.fresh(), "nonprogress_total": self.state["nonprogress_total"]}
@@ -383,9 +389,11 @@ class RunPaused(Exception):
     """The orchestrator asked to pause the WP (`wpo wrap-up`); `result` is the session that just
     ended, None when the pause came before a session started."""
 
-    def __init__(self, result: SessionResult | None) -> None:
-        super().__init__("paused at the orchestrator's request")
+    def __init__(self, result: SessionResult | None, reason: str | None = None) -> None:
+        super().__init__(reason or "paused at the orchestrator's request")
         self.result = result
+        # Why, when it was not a `wpo wrap-up` pause request: the operator cancelled the session.
+        self.reason = reason
 
 
 @dataclass
@@ -708,12 +716,62 @@ or 'DECISION: needs-user <question>'.
 """
 
 
+def record_writer_in(ledger: RoundLedger, role: str, route: dict | Route) -> None:
+    """`WorkPackageRun.record_writer` for a given ledger (also used where no runner is active)."""
+    if role in WRITER_ROLES:
+        ledger.state["builder_model_family"] = model_family_of(route)
+        ledger.save()
+
+
+def settle_native_sessions(context: Context, wp: wpfile.WorkPackage, record_writer) -> list[str]:
+    """Finishes the WP's native sessions that outlived their runner (a T3 restart, a killed
+    supervisor), before anything else touches the WP: no route is chosen, nothing is merged in, no
+    phase starts while one may still be writing. Each non-worker survivor, oldest first, is waited
+    for with its running controls (a staged session still gets its compaction cancel) and finished
+    in recovery mode: its writer recorded through `record_writer(role, route)` (the caller's own
+    ledger), its scope checked, its result consumed. Recovery restores safety, not the session's
+    control flow: an operator's cancel, a failure or a compaction is logged and consumed, and the
+    run goes on. Then today's worker barrier stops any surviving workers, also when settling failed.
+    Returns the requests whose scope check failed (their WP is blocked). T3 only."""
+    if context.machine.execution_mode != "t3":
+        return []
+    from .t3 import Bridge, SessionControls, T3Error, finish_attempt
+    bridge = Bridge(context)
+    outstanding = bridge.outstanding_sessions(wp.id)
+    if not outstanding:
+        return []
+    violations, notes = [], []
+    try:
+        for request in (request for request in outstanding if request["payload"].get("role") != "worker"):
+            payload = request["payload"]
+            role = payload.get("role") or payload.get("access")
+            controls = SessionControls(context, bridge, request, payload["route"], bool(payload.get("stop_on_compaction")), {"wp": wp.id, "role": role})
+            try:
+                bridge.wait(request, controls)
+            except T3Error as error:
+                raise T3Error(f"{wp.id} has a native {role} session ({request['id']}) that outlived its runner and stalled: {error} "
+                              "Reconcile it (wpo t3 recover, or record its completion) before the WP runs again.") from error
+            finally:
+                controls.close()
+            disposition = finish_attempt(context, request, lambda route, role=role: record_writer(role, route), recovery=True)
+            notes.append(f"settled a {role} session that outlived its runner ({payload['route']['id']}): {disposition}")
+            if disposition == "scope_violation":
+                violations.append(request["id"])
+        # Written only once every survivor is checked: a note in the WP file would read as the next
+        # survivor's own edit in its scope check.
+        for note in notes:
+            wpfile.log_progress(wpfile.parse(wp.path), note, "runner")
+    finally:
+        stop_delegated_workers(context, wp)
+    return violations
+
+
 def stop_delegated_workers(context: Context, wp: wpfile.WorkPackage) -> None:
     """A worker still editing after its lead's session ended would race verification and review."""
     if context.machine.execution_mode == "t3":
         from .t3 import Bridge
         bridge = Bridge(context)
-        bridge.cancel_wp(wp.id, "builder session ended; collect its remaining native workers", role="worker")
+        bridge.cancel_wp(wp.id, "builder session ended; collect its remaining native workers", "cleanup", role="worker")
         # Verification must not race a native task after its local bridge worker is stopped.
         for path in (bridge.directory / "requests").glob("*.json"):
             request = json.loads(path.read_text(encoding="utf-8"))
@@ -777,7 +835,8 @@ class WorkPackageRun:
         try:
             result = run_session(self.context, spec, extra.pop("access", access), prompt, log_stem, self.tree, families=extra.pop("families", self.families),
                                  idle_minutes=self.options.idle_minutes, event_fields={"wp": self.wp_id, "role": role}, extra_env=self.env,
-                                 inbox=inbox_of(self.run_dir), on_attempt=self.mode_recorder(mode), **extra)
+                                 inbox=inbox_of(self.run_dir), on_attempt=self.mode_recorder(mode),
+                                 on_finished=lambda route: self.record_writer(role, route), **extra)
         except NoRouteError as error:
             if role == "builder" and not error.failures:
                 self.ledger.state["writing"] = writing_before
@@ -796,6 +855,15 @@ class WorkPackageRun:
             # whose verify passed): it counts as the latest writer.
             self.record_writer(role, self.context.router.find_route(stopped.route_id))
             raise
+        except SessionCancelled as cancelled:
+            # The operator stopped the session: it may have written (a builder that ran `wpo verify`
+            # and left review), so it counts as the writer, and the run ends as a pause, without a
+            # fallback route.
+            try:
+                self.record_writer(role, self.context.router.find_route(cancelled.route_id))
+            except RoutingError:
+                pass
+            raise RunPaused(None, f"the {role} session was {cancelled}") from cancelled
         self.log(f"{role} session ran on {result.route['id']}{result.fallback_note}")
         self.record_writer(role, result.route)
         if pause_requested(self.run_dir) is not None:
@@ -806,9 +874,7 @@ class WorkPackageRun:
         """Remembers who made the model of the latest session that built the WP (a builder, or a
         staged executor or assembler): an independent review leaves that family out. Planners,
         reviewers, re-evaluations and mechanical repairs build nothing of the WP's design."""
-        if role in WRITER_ROLES:
-            self.ledger.state["builder_model_family"] = model_family_of(route)
-            self.ledger.save()
+        record_writer_in(self.ledger, role, route)
 
     def mode_recorder(self, mode: str):
         return lambda: record_wp_mode(self.context.project.runs_dir, self.wp_id, mode)
@@ -1091,6 +1157,9 @@ class WorkPackageRun:
         except NoRouteError as error:
             self.log(f"no route for a repair session ({spec}): {error}; the builder gets the failure")
             return False
+        except SessionCancelled as cancelled:
+            # As in `session`: the operator stopped it, so the run ends as a pause, not a failure.
+            raise RunPaused(None, f"the repair session was {cancelled}") from cancelled
         self.log(f"repair session ran on {result.route['id']}{result.fallback_note} for {commands}")
         return True
 
@@ -1126,12 +1195,21 @@ class WorkPackageRun:
         record = self.run_dir / SESSION_VERIFIED_TREE_FILE
         if not record.exists():
             return False
-        verified = record.read_text(encoding="utf-8").strip()
-        changed = git(self.tree, "diff", "--name-only", verified, worktree_tree_id(self.tree), check=False)
+        try:
+            saved = json.loads(record.read_text(encoding="utf-8"))
+        except ValueError:
+            return False  # a record from before fingerprints: verify once more
+        wp = self.wp()
+        if not isinstance(saved, dict) or saved.get("checks") != checks_fingerprint(self.context, wp, self.tree):
+            return False
+        changed = git(self.tree, "diff", "--name-only", saved["tree"], worktree_tree_id(self.tree), check=False)
         if changed.returncode != 0:
             return False
-        wp_path = wp_relative(self.context, self.wp())
-        return all(path == wp_path for path in changed.stdout.splitlines() if path)
+        wp_path = wp_relative(self.context, wp)
+        if not all(path == wp_path for path in changed.stdout.splitlines() if path):
+            return False
+        # The owns check reads main's current contents: main moving can fail an unchanged tree.
+        return not outside_owns(self.context, wp, self.tree)
 
     def defer_verification(self, failures: list[CommandFailure]) -> None:
         """Every failed check failed on the machine (killed, out of disk or memory), so the code was
@@ -1174,6 +1252,16 @@ class WorkPackageRun:
             self.log("reviewer gave no verdict; left in review for a human")
             self.emit("wp-blocked", f"{self.wp_id} reviewer gave no verdict; left in review")
             raise WorkPackageEnded
+        if verdict == "PASS":
+            # The protocol allows PASS only when no BLOCKING finding is open after the review's own
+            # rulings; a PASS that raises one or rules one still open requests changes.
+            contradicted = ([finding["id"] for finding in parsed.findings if finding["severity"] == "BLOCKING"]
+                            + [ruling["id"] for ruling in parsed.rulings if ruling["ruling"] in findings.OPEN_RULINGS])
+            if contradicted:
+                verdict = "CHANGES_REQUESTED"
+                note = f"review {review_number} said PASS but left {', '.join(contradicted)} blocking; treated as changes requested"
+                self.log(note)
+                wpfile.append_to_section(self.wp(), "Review", [f"The runner: {note}."])
         still_open = findings.record_review(self.run_dir, review_number, parsed, passed=verdict == "PASS")
         if verdict == "PASS":
             self.finish("verified and review passed; done", f"{self.wp_id} verified and review passed")
@@ -1286,6 +1374,11 @@ class WorkPackageRun:
             raise WorkPackageEnded
 
     def run(self) -> None:
+        # Native sessions an earlier runner left are finished before the phase is chosen from the
+        # WP's status: a surviving builder may have set review while it was still writing.
+        if violations := settle_native_sessions(self.context, self.wp(), self.record_writer):
+            from .t3 import T3Error
+            raise T3Error(f"{self.wp_id}: a session that outlived its runner changed paths outside its access ({', '.join(violations)}); the WP is blocked")
         wp = self.wp()
         if self.ledger.interrupted:
             self.log(f"the previous runner stopped mid-build; that round is not counted ({self.ledger.rounds} rounds so far)")
@@ -1336,10 +1429,11 @@ class WorkPackageRun:
         if self.counting_round:
             self.ledger.uncount()
             self.counting_round = False
-        reason = pause_requested(self.run_dir) or ""
+        reason = pause_requested(self.run_dir) or paused.reason or ""
         clear_pause(self.run_dir)
         status = self.wp().status
-        ended = f"after its {paused.result.route['id']} session" if paused.result is not None else "before its next session"
+        ended = (f"after its {paused.result.route['id']} session" if paused.result is not None
+                 else "when its session was cancelled" if paused.reason else "before its next session")
         self.log(f"paused at the orchestrator's request {ended}; round not counted; status {status}")
         self.context.journal.emit("wp-paused", f"{self.wp_id} paused {ended} (status {status}){f': {reason}' if reason else ''}", {"wp": self.wp_id})
 

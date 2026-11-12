@@ -32,6 +32,7 @@ EXIT_MEANINGS = {
     EXIT_CONFLICT: "merge conflict with main",
     EXIT_VERIFY_FAILED: "verification failed after merging main",
     EXIT_FAST_FORWARD_FAILED: "main could not fast-forward",
+    8: "the T3 backend or the boot fence failed",
 }
 
 
@@ -221,8 +222,14 @@ class Integration:
 
     def run(self) -> int:
         if self.context.machine.execution_mode == "t3":
-            from .t3 import Bridge
-            Bridge(self.context).validate_workspace(self.wp_id)
+            from .t3 import Bridge, T3Error
+            bridge = Bridge(self.context)
+            if outstanding := bridge.outstanding_sessions(self.wp_id):
+                # Integration commits the checkout without a scope check: a session still writing
+                # there, or one never checked, must be settled first (by running the WP).
+                raise T3Error(f"{self.wp_id} has native sessions no runner has finished ({', '.join(r['id'] for r in outstanding)}); "
+                              "run the WP (its runner settles them) or wait, then integrate")
+            bridge.validate_workspace(self.wp_id)
         if not self.worktree.exists():
             raise FileNotFoundError(f"no worktree for {self.wp_id} at {self.worktree}")
         current = git(self.project.root, "symbolic-ref", "--short", "HEAD", check=False).stdout.strip()

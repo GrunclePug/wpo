@@ -739,6 +739,81 @@ class QuotaGroupTests(unittest.TestCase):
         self.assertEqual(target.call_count, 1, "one oracle checks a route's native target once")
 
 
+class FreshUsageTests(unittest.TestCase):
+    """A stale usage reading never makes Claude or GPT available, and can still block a quota group."""
+
+    def router(self, usage: dict, script: str | None = None, machine_routing: dict | None = None) -> routing.Router:
+        directory = Path(tempfile.mkdtemp())
+        machine = machine_in(directory)
+        machine.raw["routing"] = machine_routing or {}
+        cache = directory / "usage.json"
+        cache.write_text(json.dumps(usage), encoding="utf-8")
+        machine.raw["usage"] = {**machine.raw["usage"], "cache": str(cache), "max_age_seconds": 300}
+        if script is not None:
+            (directory / "usage.py").write_text(script, encoding="utf-8")
+            machine.raw["usage"]["script"] = str(directory / "usage.py")
+        return routing.Router(machine)
+
+    @staticmethod
+    def family(name: str, used: float, fetched_at: float | None = None) -> dict:
+        resets = (routing.now_utc() + timedelta(hours=2)).timestamp()
+        windows = [{"label": "5h", "used_percent": used, "resets_at": resets, "window_seconds": 18000},
+                   {"label": "weekly", "used_percent": used, "resets_at": resets + 86400, "window_seconds": 7 * 86400}]
+        return {"family": name, "plan": None, "windows": windows, "notes": [], "error": None, **({"fetched_at": fetched_at} if fetched_at else {})}
+
+    def opus(self) -> routing.Route:
+        return next(route for route in routing.static_routes(routing.load_policy()) if route.family == "claude")
+
+    def test_a_days_old_reading_is_unknown_for_routing(self) -> None:
+        old = time.time() - 48 * 3600
+        stale = self.router({"fetched_at": old, "families": [self.family("claude", 5.0)]})
+        availability = stale.oracle().route(self.opus())
+        self.assertFalse(availability.available)
+        self.assertIn("usage unknown", availability.reason)
+        fresh = self.router({"fetched_at": time.time(), "families": [self.family("claude", 5.0)]})
+        self.assertTrue(fresh.oracle().route(self.opus()).available, "the same reading, fresh, allows it")
+        self.assertIsNotNone(stale.usage_windows(refresh=False)["claude"], "the dashboard still shows the stale reading")
+
+    def test_one_familys_old_reading_under_a_fresh_snapshot(self) -> None:
+        old = time.time() - 48 * 3600
+        router = self.router({"fetched_at": time.time(), "families": [self.family("claude", 5.0, fetched_at=old), self.family("gpt", 5.0)]})
+        windows = router.usage_windows()
+        self.assertIsNone(windows["claude"])
+        self.assertIsNotNone(windows["gpt"])
+
+    def test_a_stale_quota_group_reading_still_blocks_and_never_allows_more(self) -> None:
+        quota = {"groups": {"agy-gemini": {"family": "agy", "buckets": ["5h"]}}, "ceilings": {"five_hour": 70, "weekly": 85}}
+        flash = next(route for route in routing.static_routes(routing.load_policy()) if route.id == "agy-gemini-flash-high")
+        old = time.time() - 48 * 3600
+        over = self.router({"fetched_at": old, "families": [self.family("agy", 95.0)]}, machine_routing={"quota_groups": quota})
+        self.assertFalse(over.oracle().route(flash).available, "a stale reading over the ceiling still blocks the group")
+        under = self.router({"fetched_at": old, "families": [self.family("agy", 10.0)]}, machine_routing={"quota_groups": quota})
+        self.assertTrue(under.oracle().route(flash).available, "under the ceiling it allows, as unknown usage does")
+
+    def test_concurrent_failing_refreshes_neither_crash_nor_repeat(self) -> None:
+        import threading
+        runs = Path(tempfile.mkdtemp()) / "runs"
+        script = f"import pathlib, time\nwith open({str(runs)!r}, 'a') as f: f.write('x')\ntime.sleep(0.6)\n"
+        router = self.router({"fetched_at": time.time() - 3600, "families": [self.family("claude", 5.0)]}, script=script)
+        errors, barrier = [], threading.Barrier(3)
+
+        def call():
+            barrier.wait()
+            try:
+                router.usage_windows()
+            except Exception as error:  # noqa: BLE001 - any exception fails the test
+                errors.append(error)
+        with mock.patch.object(routing, "USAGE_REFRESH_LOCK_SECONDS", 0.1):
+            threads = [threading.Thread(target=call) for _ in range(3)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            router.usage_windows()  # a fourth caller after the failure backs off too
+        self.assertEqual(errors, [])
+        self.assertEqual(runs.read_text(), "x", "the failing script ran once")
+
+
 class EventTests(unittest.TestCase):
     def test_emit_read_cursor_and_quiet_wait(self) -> None:
         journal = Journal(Path(tempfile.mkdtemp()))
@@ -1035,6 +1110,35 @@ class ResumeTests(unittest.TestCase):
             resume_targets(self.context, ["nowhere"])
 
 
+class LaneHoldTests(unittest.TestCase):
+    """Concurrent holds and releases of different lanes all take effect."""
+
+    def test_concurrent_holds_and_a_release_lose_nothing(self) -> None:
+        import threading
+        from types import SimpleNamespace
+
+        from wpo import lanes
+        context = SimpleNamespace(project=SimpleNamespace(runs_dir=Path(tempfile.mkdtemp())))
+        lanes.write_holds(context, {"old": "held before"})
+        names = [f"lane-{n}" for n in range(12)]
+        barrier = threading.Barrier(len(names) + 1)
+
+        def hold(name):
+            barrier.wait()
+            lanes.hold(context, name, f"{name} paused")
+
+        def release():
+            barrier.wait()
+            lanes.release(context, "old")
+        threads = [threading.Thread(target=hold, args=(name,)) for name in names] + [threading.Thread(target=release)]
+        with mock.patch("sys.stdout"):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(lanes.read_holds(context), {name: f"{name} paused" for name in names})
+
+
 class CatchUpWithMainTests(unittest.TestCase):
     """An existing worktree takes main in before its WP's sessions, without touching uncommitted work."""
 
@@ -1099,9 +1203,8 @@ class CatchUpWithMainTests(unittest.TestCase):
         self.assertEqual((self.worktree / "edited.txt").read_text(encoding="utf-8"), "builder work\n")
 
 
-class RecoveryIntegrationTests(unittest.TestCase):
-    """A supervisor's pass merges WPs done in their checkout but not on main, and never a WP main
-    already holds as done, though under T3 its checkout outlives the merge; such a WP is read from main."""
+class ScratchT3ProjectCase(unittest.TestCase):
+    """A scratch repository with a real Context and Project under T3, and a lane supervisor."""
 
     def setUp(self) -> None:
         from wpo.context import Context
@@ -1144,6 +1247,10 @@ class RecoveryIntegrationTests(unittest.TestCase):
         supervisor = Supervisor(self.context, "life", True, [], {})
         supervisor.integrate = mock.Mock(return_value=True)
         return supervisor
+
+class RecoveryIntegrationTests(ScratchT3ProjectCase):
+    """A supervisor's pass merges WPs done in their checkout but not on main, and never a WP main
+    already holds as done, though under T3 its checkout outlives the merge; such a WP is read from main."""
 
     def test_a_wp_done_on_main_is_not_merged_again_though_its_checkout_remains(self) -> None:
         self.commit_main("done")
@@ -1207,6 +1314,314 @@ class RecoveryIntegrationTests(unittest.TestCase):
         self.assertEqual((wp.status, wp.path.parent), ("done", self.project.wp_dir(self.checkout)))
         wp, in_worktree = effective_wp(self.context, "WP-0042")
         self.assertEqual((wp.status, in_worktree), ("done", True))
+
+
+class BackendExitTests(ScratchT3ProjectCase):
+    """A failed T3 backend is a failed run, not a route shortage; an operator's cancel is a pause."""
+
+    def test_a_supervisor_reports_a_backend_failure_as_runner_failed(self) -> None:
+        from wpo.runner import EXIT_BACKEND
+        self.commit_main("todo")
+        supervisor = self.supervisor()
+        (wp,) = self.context.effective_wps()
+        events = []
+        supervisor.emit = lambda kind, message, **fields: events.append(kind)
+        supervisor.session_spec = lambda wp: "none"
+        supervisor.run_wp = lambda wp: EXIT_BACKEND
+        supervisor.status_of = lambda wp_id: "in_progress"
+        supervisor.route_wait = mock.Mock()
+        self.assertIsNone(supervisor.run_claimed(wp))
+        self.assertEqual(events, ["runner-failed"])
+        supervisor.route_wait.assert_not_called()
+
+    def test_an_operator_cancel_ends_the_run_paused_and_records_the_writer(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo.runner import RunPaused, WorkPackageRun
+        from wpo.session import SessionCancelled
+        run = object.__new__(WorkPackageRun)
+        run.run_dir = Path(tempfile.mkdtemp())
+        run.context = SimpleNamespace(project=self.project, router=SimpleNamespace(find_route=lambda route_id: {"id": route_id}))
+        run.ledger = SimpleNamespace(writing=None)
+        run.options = SimpleNamespace(idle_minutes=None)
+        run.wp_id, run.families, run.tree, run.env = "WP-0042", None, self.root, {}
+        writers = []
+        run.record_writer = lambda role, route: writers.append((role, route["id"]))
+        with mock.patch("wpo.runner.run_session", side_effect=SessionCancelled("gpt-sol-high", "operator", "lane stopped")), \
+                self.assertRaises(RunPaused) as raised:
+            run.session("code", "builder", "Task", run.run_dir / "attempt-1-builder", "in_progress")
+        self.assertIsNone(raised.exception.result)
+        self.assertIn("cancelled by operator", raised.exception.reason)
+        self.assertEqual(writers, [("builder", "gpt-sol-high")])
+
+    def test_an_operator_cancel_of_a_repair_session_ends_the_run_paused(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo.runner import RunPaused, WorkPackageRun
+        from wpo.session import SessionCancelled
+        run = object.__new__(WorkPackageRun)
+        run.run_dir = Path(tempfile.mkdtemp())
+        run.context = SimpleNamespace(project=self.project)
+        run.config = {"repair_spec": "code"}
+        run.options = SimpleNamespace(idle_minutes=None)
+        run.wp_id, run.families, run.tree, run.env = "WP-0042", None, self.root, {}
+        run.wp = lambda: SimpleNamespace(owns=["src/**"], skills=[])
+        run.emit = lambda *arguments: None
+        failure = SimpleNamespace(command="cargo fmt --check")
+        with mock.patch("wpo.runner.run_session", side_effect=SessionCancelled("gpt-sol-high", "operator", "lane stopped")), \
+                mock.patch("wpo.runner.repair_prompt", return_value="Fix it"), mock.patch("wpo.runner.builder_skills", return_value=[]), \
+                self.assertRaises(RunPaused) as raised:
+            run.repair(1, [failure])
+        self.assertIn("repair session was", raised.exception.reason)
+
+
+class SurvivingSessionTests(ScratchT3ProjectCase):
+    """A restarted WP settles native sessions that outlived their runner before anything else."""
+
+    def survivor(self) -> dict:
+        from wpo.t3 import Bridge
+        payload = {"wp": "WP-0042", "role": "builder", "route": {"id": "gpt-sol-high", "family": "gpt"}, "log_path": str(self.root / "x.log")}
+        with mock.patch.object(Bridge, "wake"):
+            return Bridge(self.context).submit("session", "survivor", payload, "coordinator", initial={"consumed_at": None})
+
+    def test_the_supervisor_neither_routes_nor_merges_main_before_settling(self) -> None:
+        self.commit_main("review")
+        self.survivor()
+        supervisor = self.supervisor()
+        (wp,) = self.context.effective_wps()
+        calls = []
+        supervisor.run_wp = lambda wp, catch_up=True: calls.append(catch_up) or 0
+        supervisor.status_of = lambda wp_id: "review"
+        with mock.patch.object(self.context.router, "select", side_effect=AssertionError("no route pre-check")):
+            supervisor.run_claimed(wp)
+        self.assertEqual(calls, [False], "run without merging main into the checkout")
+
+    def test_automatic_integration_settles_first_and_skips_a_blocked_wp(self) -> None:
+        self.commit_main("review")
+        self.retain_checkout()
+        self.write_wp(self.checkout, "done")
+        self.survivor()
+        for violations, integrated in ((["request"], False), ([], True)):
+            supervisor = self.supervisor()
+            with mock.patch("wpo.runner.settle_native_sessions", return_value=violations) as settle:
+                supervisor.loop()
+            settle.assert_called_once()
+            self.assertEqual(supervisor.integrate.called, integrated)
+
+    def test_automatic_integration_rereads_the_status_a_survivor_may_have_changed(self) -> None:
+        self.commit_main("review")
+        self.retain_checkout()
+        self.write_wp(self.checkout, "done")
+        self.survivor()
+        supervisor = self.supervisor()
+        with mock.patch("wpo.runner.settle_native_sessions", side_effect=lambda *a: self.write_wp(self.checkout, "blocked") or []):
+            supervisor.loop()
+        supervisor.integrate.assert_not_called()
+
+    def test_wpo_integrate_refuses_a_wp_with_unsettled_sessions(self) -> None:
+        from wpo.integrate import Integration
+        from wpo.t3 import T3Error
+        self.commit_main("done")
+        self.survivor()
+        with self.assertRaisesRegex(T3Error, "no runner has finished"):
+            Integration(self.context, "WP-0042", False).run()
+
+    def test_the_runner_settles_before_choosing_its_phase(self) -> None:
+        from types import SimpleNamespace
+
+        from wpo.runner import WorkPackageRun
+        from wpo.t3 import T3Error
+        order = []
+        run = object.__new__(WorkPackageRun)
+        run.context, run.wp_id = self.context, "WP-0042"
+        run.wp = lambda: SimpleNamespace(id="WP-0042", status="review", path=self.root / "WP.md")
+        run.record_writer = lambda role, route: None
+
+        class Phase(Exception):
+            pass
+        run.ledger = SimpleNamespace(interrupted=False, rounds=1)
+        run.log = lambda message: (order.append("phase"), (_ for _ in ()).throw(Phase()))
+        with mock.patch("wpo.runner.settle_native_sessions", side_effect=lambda *a: order.append("settle") or ["request"]), \
+                self.assertRaisesRegex(T3Error, "outside its access"):
+            run.run()
+        self.assertEqual(order, ["settle"], "a scope violation ends the run before any phase")
+        order.clear()
+        with mock.patch("wpo.runner.settle_native_sessions", side_effect=lambda *a: order.append("settle") or []), self.assertRaises(Phase):
+            run.run()
+        self.assertEqual(order, ["settle", "phase"])
+
+
+class SessionVerifiedTests(ScratchT3ProjectCase):
+    """A builder's `wpo verify` pass stands only for the checks it ran and the ownership it saw."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from wpo.runner import WorkPackageRun
+        (self.root / "shared.txt").write_text("base\n", encoding="utf-8")
+        self.commit_main("in_progress")
+        self.retain_checkout()
+        (self.checkout / "src" / "core").mkdir(parents=True)
+        (self.checkout / "src" / "core" / "lib.rs").write_text("fn main() {}\n", encoding="utf-8")
+        self.run = object.__new__(WorkPackageRun)
+        self.run.context, self.run.tree = self.context, self.checkout
+        self.run.run_dir = self.project.wp_run_dir("WP-0042")
+        self.run.wp = lambda: self.context.wp_in_tree("WP-0042", self.checkout)
+        self.record()
+
+    def record(self) -> None:
+        """What `wpo verify` writes after a pass on the checkout as it is now."""
+        from wpo.commands import worktree_tree_id
+        from wpo.session_commands import SESSION_VERIFIED_TREE_FILE, checks_fingerprint
+        record = {"tree": worktree_tree_id(self.checkout), "checks": checks_fingerprint(self.context, self.run.wp(), self.checkout)}
+        (self.run.run_dir / SESSION_VERIFIED_TREE_FILE).write_text(json.dumps(record), encoding="utf-8")
+
+    def edit_wp(self, old: str, new: str) -> None:
+        path = self.run.wp().path
+        path.write_text(path.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+
+    def test_a_pass_stands_for_an_unchanged_tree_and_progress_notes(self) -> None:
+        self.assertTrue(self.run.session_verified())
+        self.edit_wp("- 2026-10-22 10:00 [runner] first", "- 2026-10-22 10:00 [runner] first\n- 2026-10-22 11:00 [runner] second")
+        self.assertTrue(self.run.session_verified(), "only the Progress log changed")
+
+    def test_editing_the_verify_commands_voids_the_pass(self) -> None:
+        self.edit_wp("cargo test -p core", "cargo test -p core --release")
+        self.assertFalse(self.run.session_verified())
+
+    def test_narrowing_owns_voids_the_pass(self) -> None:
+        self.edit_wp("owns: [src/core/**, docs/core.md]", "owns: [docs/core.md]")
+        self.assertFalse(self.run.session_verified())
+
+    def test_changing_a_check_setting_voids_the_pass(self) -> None:
+        config = self.project.config
+        for key, value in (("verify_neutral_paths", ["docs/**"]), ("verify_round", ["true"]), ("env", {"RUSTFLAGS": "-D warnings"}),
+                           ("shell", ["sh", "-c"]), ("command_timeout_minutes", 1),
+                           ("autofix", {**config["autofix"], "rustfmt": {"globs": ["*.rs"], "command": ["rustfmt", "--edition", "2024"]}})):
+            saved = config[key]
+            config[key] = value
+            try:
+                self.assertFalse(self.run.session_verified(), key)
+            finally:
+                config[key] = saved
+            self.assertTrue(self.run.session_verified(), f"{key} restored")
+
+    def test_reordering_the_fixers_voids_the_pass(self) -> None:
+        config = self.project.config
+        saved = config["autofix"]
+        fixers = {"first": {"globs": ["*.rs"], "command": ["rustfmt"]}, "second": {"globs": ["*.rs"], "builtin": "trailing-whitespace"}}
+        try:
+            config["autofix"] = fixers
+            self.record()
+            self.assertTrue(self.run.session_verified())
+            config["autofix"] = dict(reversed(list(fixers.items())))
+            self.assertFalse(self.run.session_verified(), "fixers run in order, and the order can change the result")
+        finally:
+            config["autofix"] = saved
+
+    def test_main_moving_under_an_unchanged_tree_reruns_the_ownership_gate(self) -> None:
+        (self.root / "shared.txt").write_text("main moved\n", encoding="utf-8")
+        self.git(self.root, "commit", "-qam", "main changes shared.txt")
+        (self.checkout / "shared.txt").write_text("main moved\n", encoding="utf-8")  # as main has it: not the WP's change
+        self.record()
+        self.assertTrue(self.run.session_verified())
+        (self.root / "shared.txt").write_text("main moved again\n", encoding="utf-8")
+        self.git(self.root, "commit", "-qam", "main changes it again")
+        self.assertFalse(self.run.session_verified(), "the checkout's copy is now a change outside owns")
+
+    def test_a_record_from_before_fingerprints_is_verified_again(self) -> None:
+        from wpo.commands import worktree_tree_id
+        from wpo.session_commands import SESSION_VERIFIED_TREE_FILE
+        (self.run.run_dir / SESSION_VERIFIED_TREE_FILE).write_text(worktree_tree_id(self.checkout), encoding="utf-8")
+        self.assertFalse(self.run.session_verified())
+
+
+class ContradictoryReviewTests(ScratchT3ProjectCase):
+    """A review's PASS cannot close the blocking findings it raises or rules open itself."""
+
+    def review(self, body: str) -> str:
+        """Runs the runner's review step on WP-0042 with a reviewer that answers `body`; the WP's status after."""
+        from types import SimpleNamespace
+
+        from wpo.runner import WorkPackageEnded, WorkPackageRun
+
+        class Run(WorkPackageRun):
+            reviewer_spec = "review"
+        self.commit_main("review")
+        run = object.__new__(Run)
+        run.context, run.config, run.tree, run.wp_id = self.context, self.project.config, self.root, "WP-0042"
+        run.run_dir = self.project.wp_run_dir("WP-0042")
+        run.wp = lambda: self.context.wp_in_tree("WP-0042", self.root)
+        run.log, run.emit = (lambda *a: None), (lambda *a, **k: None)
+        run.independent_review_exclusion = list
+        run.session = lambda *a, **k: SimpleNamespace(result_text=body, log_path=self.root / "review.log", route={"id": "gpt-sol-xhigh"})
+        with mock.patch("wpo.runner.build_review_brief", return_value=SimpleNamespace(full_text="brief")), \
+                mock.patch("wpo.runner.review_brief_section", return_value="brief"), \
+                mock.patch("wpo.runner.review_prompt", return_value="prompt"), mock.patch("wpo.runner.reviewer_skills", return_value=[]), \
+                mock.patch("wpo.runner.review_text", side_effect=lambda text, log, number: text):
+            try:
+                run.review(1)
+            except WorkPackageEnded:
+                pass
+        return run.wp().status
+
+    def test_a_pass_with_a_new_blocking_finding_requests_changes(self) -> None:
+        from wpo import findings
+        body = ("FINDING R1-F1 BLOCKING src/core/lib.rs:3\n  Basis: criterion 1\n  Problem: wrong\n  Fix: right\nVERDICT: PASS")
+        self.assertEqual(self.review(body), "changes_requested")
+        self.assertEqual([f["id"] for f in findings.load(self.project.wp_run_dir("WP-0042"))["findings"] if findings.is_open(f)], ["R1-F1"])
+        self.assertIn("said PASS but left R1-F1 blocking", self.context.wp_in_tree("WP-0042", self.root).path.read_text())
+
+    def test_a_pass_with_only_non_blocking_findings_finishes(self) -> None:
+        body = "FINDING R1-F1 NON-BLOCKING src/core/lib.rs:3\n  Basis: style\n  Problem: naming\n  Fix: rename\nVERDICT: PASS"
+        self.assertEqual(self.review(body), "done")
+
+    def test_a_pass_with_a_still_open_ruling_requests_changes(self) -> None:
+        from wpo import findings
+        run_dir = self.project.wp_run_dir("WP-0042")
+        findings.record_review(run_dir, 1, findings.parse_review("FINDING R1-F1 BLOCKING a.rs:1\n  Basis: x\nVERDICT: CHANGES_REQUESTED", 1), passed=False)
+        self.assertEqual(self.review("RULING R1-F1 STILL-OPEN: the fix does not remove the defect\nVERDICT: PASS"), "changes_requested")
+
+
+class OrchestratorRoomTests(ScratchT3ProjectCase):
+    """A finishing lane waits for room on the orchestrator's own model family."""
+
+    def room(self, windows: dict, inherited: str | None = None) -> tuple[bool, list[str]]:
+        from wpo.t3 import write_json
+        capabilities = {"parentThreadId": "coordinator", "providers": []}
+        if inherited:
+            capabilities["inheritedProviderInstanceId"] = inherited
+        write_json(self.project.runs_dir / "t3" / "capabilities.json", capabilities)
+        supervisor = self.supervisor()
+        slept = []
+
+        def sleep(wake_at, reason):
+            slept.append(reason)
+            raise StopIteration
+        supervisor.sleep_until = sleep
+        supervisor.set_state = lambda state: None
+
+        def window(used):
+            return [{"label": "5h", "used_percent": used, "resets_at": time.time() + 3600, "window_seconds": 18000}]
+        with mock.patch.object(self.context.router, "usage_windows", return_value={family: window(used) for family, used in windows.items()}):
+            try:
+                result = supervisor.wait_for_orchestrator_room()
+            except StopIteration:
+                result = False
+        return result, slept
+
+    def test_a_coordinator_attached_from_codex_waits_on_gpt(self) -> None:
+        self.assertEqual(self.room({"gpt": 10, "claude": 99}, inherited="codex"), (True, []))
+        self.assertEqual(self.room({"gpt": 95, "claude": 10}, inherited="codex")[1], ["waiting for gpt room before handing back to the orchestrator"])
+
+    def test_without_the_attach_record_it_is_claude(self) -> None:
+        self.assertEqual(self.room({"gpt": 10, "claude": 99})[1], ["waiting for claude room before handing back to the orchestrator"])
+
+    def test_the_setting_wins(self) -> None:
+        self.project.config["orchestrator_family"] = "gpt"
+        self.assertEqual(self.room({"gpt": 10, "claude": 99}, inherited="claudeAgent"), (True, []))
+
+    def test_unknown_usage_does_not_hold_the_finish(self) -> None:
+        self.assertEqual(self.room({"claude": 99}, inherited="codex"), (True, []))
 
 
 class IntegrationChecksTests(unittest.TestCase):
@@ -1923,6 +2338,46 @@ class AutofixTests(unittest.TestCase):
             self.assertEqual((tree / "b.bin").read_bytes(), b"\0 trailing   ")
             self.assertEqual((tree / "notes.md").read_bytes(), b"keep  \n")
         self.assertEqual(reports, ["trailing-whitespace fixed 1 file(s): a.py", "upper fixed 1 file(s): a.py", "failing exited 3: boom"])
+
+
+class AutofixLinkTests(unittest.TestCase):
+    """A fixer never writes through a link: what it changes must be inside the tree the checks see."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        base = Path(scratch.name)
+        self.tree, outside = base / "tree", base / "outside"
+        (self.tree / "src" / "inner").mkdir(parents=True)
+        outside.mkdir()
+        self.outside_file = outside / "target.rs"
+        self.outside_file.write_bytes(b"outside   \n")
+        (outside / "via_dir.rs").write_bytes(b"outside dir   \n")
+        (self.tree / "src" / "inner" / "real.rs").write_bytes(b"inside dir   \n")
+        (self.tree / "src" / "owned.rs").write_bytes(b"owned   \n")
+        try:
+            (self.tree / "src" / "link.rs").symlink_to(self.outside_file)
+            (self.tree / "src" / "out").symlink_to(outside, target_is_directory=True)
+            (self.tree / "src" / "in").symlink_to(self.tree / "src" / "inner", target_is_directory=True)
+        except OSError:
+            self.skipTest("This account cannot create symlinks")
+        self.files = ["src/owned.rs", "src/link.rs", "src/out/via_dir.rs", "src/in/real.rs"]
+
+    def fixers(self):
+        from wpo.autofix import Fixer
+        upper = (sys.executable, "-c", "import sys,pathlib\nfor f in sys.argv[1:]: p=pathlib.Path(f); p.write_bytes(p.read_bytes().upper())")
+        return [Fixer("trailing-whitespace", ("*.rs",), (), None, "trailing-whitespace"), Fixer("upper", ("*.rs",), (), upper, None)]
+
+    def test_only_files_reached_without_a_link_are_fixed(self) -> None:
+        from wpo.autofix import run_fixers
+        for fixer in self.fixers():
+            reports = run_fixers(self.tree, self.files, [fixer], {}, 1)
+            self.assertIn(f"{fixer.name} skipped 3 file(s) reached through a link: src/in/real.rs, src/link.rs, src/out/via_dir.rs", reports)
+            self.assertIn(f"{fixer.name} fixed 1 file(s): src/owned.rs", reports)
+        self.assertEqual((self.tree / "src" / "owned.rs").read_bytes(), b"OWNED\n")
+        self.assertEqual(self.outside_file.read_bytes(), b"outside   \n", "a symlinked file's target is untouched")
+        self.assertEqual((self.outside_file.parent / "via_dir.rs").read_bytes(), b"outside dir   \n", "nothing under a linked directory")
+        self.assertEqual((self.tree / "src" / "inner" / "real.rs").read_bytes(), b"inside dir   \n", "a link inside the tree is still a link")
 
 
 class ReviewBriefTests(unittest.TestCase):

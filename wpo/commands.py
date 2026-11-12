@@ -116,16 +116,32 @@ def run_commands_detailed(shell: Iterable[str], commands: Iterable[str], cwd: Pa
     return failures
 
 
-def worktree_tree_id(tree: Path) -> str:
+def worktree_tree_id(tree: Path, overrides: Mapping[str, str] | None = None) -> str:
     """The git tree id of the working tree as it would be committed (`git add -A`), computed in a
     scratch index so the real index is untouched. Integration compares it with what it commits."""
     with tempfile.TemporaryDirectory() as scratch:
-        env = environment_with({"GIT_INDEX_FILE": str(Path(scratch) / "index")})
+        env = environment_with({**(overrides or {}), "GIT_INDEX_FILE": str(Path(scratch) / "index")})
         for arguments in (["read-tree", "HEAD"], ["add", "-A"], ["write-tree"]):
             completed = subprocess.run(["git", "-C", str(tree), *arguments], env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if completed.returncode != 0:
                 raise RuntimeError(f"git {' '.join(arguments)} in {tree} failed: {completed.stderr.strip()}")
         return completed.stdout.strip()
+
+
+def changed_since(tree: Path, before_tree: str) -> list[str]:
+    """The paths the working tree changed since `before_tree` (a `worktree_tree_id`). It writes
+    nothing into the repository: the objects it hashes go to a scratch object directory, with the
+    repository's own as an alternate, so a sandboxed coordinator without write access to `.git` can
+    run it."""
+    common = git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    with tempfile.TemporaryDirectory() as objects:
+        overrides = {"GIT_OBJECT_DIRECTORY": objects, "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(Path(common) / "objects")}
+        after = worktree_tree_id(tree, overrides)
+        completed = subprocess.run(["git", "-C", str(tree), "diff", "--name-only", "--no-renames", "-z", before_tree, after], env=environment_with(overrides),
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if completed.returncode != 0:
+            raise RuntimeError(f"git diff in {tree} failed: {completed.stderr.strip()}")
+        return [path for path in completed.stdout.split("\0") if path]
 
 
 def matches_main(tree: Path, main_branch: str, changed_path: str) -> bool:

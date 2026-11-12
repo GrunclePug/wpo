@@ -12,13 +12,15 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 from . import wpfile
 from .context import Context
-from .platform import FileLock, NamedMutex, kill_tree, pid_alive, spawn_detached
+from .platform import FileLock, NamedMutex, kill_tree, pid_alive, replace_file, spawn_detached
 
 SUPERVISOR_PROCESS_NAMES = ("python", "python3")
 STATUS_ORDER = ("in_progress", "review", "changes_requested", "blocked", "todo", "done")
@@ -34,7 +36,21 @@ def read_holds(context: Context) -> dict[str, str]:
 
 
 def write_holds(context: Context, holds: dict[str, str]) -> None:
-    holds_path(context).write_text(json.dumps(holds, indent=2) + "\n", encoding="utf-8")
+    """Replaces the holds file atomically, so a reader never sees it half written."""
+    path = holds_path(context)
+    staging = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    staging.write_text(json.dumps(holds, indent=2) + "\n", encoding="utf-8")
+    replace_file(staging, path)
+
+
+def update_holds(context: Context, change) -> dict[str, str]:
+    """Reads, changes (`change(holds)` edits the dict in place) and writes the lane holds under one
+    lock, so concurrent holds and releases (two coordinators, the dashboard and a CLI) lose nothing."""
+    with FileLock(context.project.runs_dir / "lane-holds.lock"):
+        holds = read_holds(context)
+        change(holds)
+        write_holds(context, holds)
+        return holds
 
 
 def supervisor_pid(context: Context, lane: str) -> int | None:
@@ -202,7 +218,7 @@ def stop(context: Context, lane: str) -> None:
         bridge = Bridge(context)
         for wp in context.effective_wps():
             if wp.lane == lane:
-                bridge.cancel_wp(wp.id, f"lane {lane} stopped by the operator")
+                bridge.cancel_wp(wp.id, f"lane {lane} stopped by the operator", "operator")
     pid = supervisor_pid(context, lane)
     if pid is None:
         print(f"{lane}: no live supervisor")
@@ -221,16 +237,12 @@ def stop(context: Context, lane: str) -> None:
 
 
 def hold(context: Context, lane: str, reason: str) -> None:
-    holds = read_holds(context)
-    holds[lane] = reason
-    write_holds(context, holds)
+    update_holds(context, lambda holds: holds.__setitem__(lane, reason))
     print(f"{lane}: held ({reason}); `wpo lanes release {lane}` lets resume start it again")
 
 
 def release(context: Context, lane: str) -> None:
-    holds = read_holds(context)
-    holds.pop(lane, None)
-    write_holds(context, holds)
+    update_holds(context, lambda holds: holds.pop(lane, None))
     print(f"{lane}: released")
 
 

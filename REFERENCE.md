@@ -131,7 +131,8 @@ its own `tier_routes`, which replace the standard ones tier by tier. `wpo route 
 (`<runs>/<WP>/routing-mode.json`) and keeps it for every role, staged ones, repairs and delegated
 workers included, so a switch reaches only WPs that start afterwards. Its specs then carry the mode (`code-hard@hard`); the dashboard shows both.
 A failed session (cap, API error, crash, no activity for `idle_minutes`) falls back to the next route
-in the same tree; when nothing is left the run stops with exit 4 without counting the round. A
+in the same tree; when nothing is left the run stops with exit 4 without counting the round (a failure
+of the T3 backend or the boot fence exits 8 instead, which a supervisor reports as `runner-failed`). A
 subscription session (claude, gpt) with no first model turn after `first_output_minutes`, or one that
 hangs, cools its whole family down, not just its route: the family's service is stalling.
 When every paid route is capped, paced or cooling down, builders still run on free routes at or

@@ -71,6 +71,10 @@ COOLDOWNS = {
 }
 OUTCOMES = ("rate_limited", "api_error", "hang", "session_error")
 SUBSCRIPTION_FAMILIES = ("claude", "gpt")
+# How long usage_budget.py may run, and how long a caller waits for another's refresh: longer, so a
+# waiter normally reads the result instead of timing out.
+USAGE_SCRIPT_SECONDS = 120
+USAGE_REFRESH_LOCK_SECONDS = 150
 # Routing modes (`wpo route mode`): see project_mode.
 STANDARD_MODE = "standard"
 MODE_SEPARATOR = "@"
@@ -674,29 +678,50 @@ class Router:
     def load_health(self) -> dict:
         return read_json(self.health_path, {"cooldowns": {}})
 
-    def usage_windows(self, refresh: bool = True) -> dict[str, list[dict] | None]:
+    def usage_windows(self, refresh: bool = True, fresh_only: bool = True) -> dict[str, list[dict] | None]:
         """Usage windows per subscription family from usage_budget.py's cache; None = unknown.
         `refresh` False only reads the cache, however old: an observer (the dashboard) must neither
-        fetch usage nor take the refresh lock the supervisors wait on."""
+        fetch usage nor take the refresh lock the supervisors wait on. With `refresh` and
+        `fresh_only`, a family whose reading is older than `usage.max_reading_age_seconds` reads as
+        unknown, so a stale low reading never makes a family available; quota groups pass
+        `fresh_only=False`, since there a stale reading can only block, and unknown would allow."""
         cache = self.machine.usage_cache
+        failed_stamp = self.state_dir / "usage-refresh-failed.json"
 
         def stale(snapshot: dict | None) -> bool:
             return snapshot is None or time.time() - float(snapshot["fetched_at"]) > self.machine.usage_max_age_seconds
 
+        def backing_off() -> bool:
+            # A refresh that just failed is not retried by every waiter in turn.
+            return time.time() - float(read_json(failed_stamp, {}).get("at", 0)) < self.machine.usage_max_age_seconds
+
         snapshot = read_json(cache, None)
-        if refresh and stale(snapshot) and self.machine.usage_script.exists():
+        if refresh and stale(snapshot) and self.machine.usage_script.exists() and not backing_off():
             # Every supervisor finds the cache stale at the same moment; one fetches, the others read
             # its result, so the usage endpoints see one request per refresh, not one per lane.
-            with FileLock(self.state_dir / "usage-refresh.lock"):
-                if stale(snapshot := read_json(cache, None)):
-                    try:
-                        subprocess.run([self.machine.python, "-I", str(self.machine.usage_script)], capture_output=True, timeout=120)
-                    except subprocess.TimeoutExpired:
-                        pass  # a stale or missing cache below means usage unknown, which blocks safely
-                    snapshot = read_json(cache, None)
+            try:
+                with FileLock(self.state_dir / "usage-refresh.lock", timeout_seconds=USAGE_REFRESH_LOCK_SECONDS):
+                    if stale(snapshot := read_json(cache, None)) and not backing_off():
+                        try:
+                            subprocess.run([self.machine.python, "-I", str(self.machine.usage_script)], capture_output=True,
+                                           timeout=USAGE_SCRIPT_SECONDS, check=False)
+                        except subprocess.TimeoutExpired:
+                            pass  # a stale or missing cache below means usage unknown, which blocks safely
+                        snapshot = read_json(cache, None)
+                        if stale(snapshot):
+                            write_atomically(failed_stamp, {"at": time.time()})
+            except TimeoutError:
+                snapshot = read_json(cache, None)  # read what there is; the freshness rule below decides
         if snapshot is None:
             return {family: None for family in SUBSCRIPTION_FAMILIES}
-        return {family["family"]: (None if family.get("error") else list(family["windows"])) for family in snapshot["families"]}
+        windows = {}
+        for family in snapshot["families"]:
+            readings = None if family.get("error") else list(family["windows"])
+            fetched = float(family.get("fetched_at") or snapshot["fetched_at"])
+            if refresh and fresh_only and time.time() - fetched > self.machine.usage_max_reading_age_seconds:
+                readings = None
+            windows[family["family"]] = readings
+        return windows
 
     def cap_forecast(self, family: str) -> CapForecast | None:
         """The family's usage window that will reach its cap first at the recent burn rate, or None
@@ -1091,6 +1116,7 @@ class AvailabilityOracle:
         self.health = router.load_health()
         self._family_cache: dict[str, Availability] = {}
         self._windows: dict[str, list[dict] | None] | None = None
+        self._raw_windows: dict[str, list[dict] | None] | None = None
         self._native: dict[str, Availability | None] = {}  # T3 target checks by route id
 
     def cooldown(self, key: str) -> Availability | None:
@@ -1181,9 +1207,10 @@ class AvailabilityOracle:
         group = settings.get("groups", {}).get(provider) if provider else None
         if not group:
             return None
-        if self._windows is None:
-            self._windows = self.router.usage_windows()
-        windows = {window["label"]: window for window in self._windows.get(group["family"]) or []}
+        # Unfiltered: unknown usage allows a group's routes, so a stale reading must still be able to block.
+        if self._raw_windows is None:
+            self._raw_windows = self.router.usage_windows(fresh_only=False)
+        windows = {window["label"]: window for window in self._raw_windows.get(group["family"]) or []}
         now = now_utc()
         blocked_until: datetime | None = None
         reasons = []
