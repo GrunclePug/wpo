@@ -114,7 +114,11 @@ Do not fabricate token counts, context progress, compactions or tool events.
 
 WPO verifies scoped mutations after read/reviewer/evaluator/docs/worker sessions. Read/reviewer
 sessions must leave repository files unchanged; the others may change only their listed paths.
-Within a checkout, these sessions serialize so the mutation check has a clear boundary. A lead
+Within a checkout, these sessions serialize so the mutation check has a clear boundary: a scope
+lease names each one's request before it is published, and the next may start once that request has
+finished. `t3 complete` records the paths such a session changed, and the check judges it on those,
+not on later edits; recording them writes nothing into the repository, so a coordinator needs no
+write access to `.git`. A lead
 must stop writing while delegated workers run; lanes in different checkouts remain parallel.
 A scope violation preserves the changes, blocks the WP, and requires inspection. T3's native
 permission mode still governs tools, external files, network access and approval prompts; WPO's

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import subprocess
@@ -38,6 +39,11 @@ CAPABILITIES = {
     ],
 }
 ROUTE = {"id": "gpt-sol-high", "family": "gpt", "harness": "gpt", "model": "sol", "effort": "high", "cost_class": "subscription"}
+
+
+def finished_read(bridge, request, callback=None) -> dict:
+    """A `Bridge.wait` whose native task completed at once."""
+    return bridge.update(request["id"], state="done", result={"text": "read"})
 
 
 class T3BackendTests(unittest.TestCase):
@@ -469,6 +475,109 @@ class T3BackendTests(unittest.TestCase):
             result = [json.loads(line) for line in log.read_text().splitlines() if '"type": "result"' in line][-1]
             self.assertTrue(result["is_error"])
             self.assertIn("outside its access contract", result["result"])
+
+    def repository(self) -> None:
+        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            git(self.root, *arguments)
+        (self.root / ".gitignore").write_text(".orchestration/\nstate/\n")
+        (self.root / "src").mkdir()
+        (self.root / "src" / "code.txt").write_text("original\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "base")
+
+    def worker_request(self, log: Path) -> dict:
+        """A pending worker session limited to `src/**`, begun in the scratch repository."""
+        from wpo.commands import worktree_tree_id
+        payload = {**self.submit()["payload"], "route": ROUTE, "log_path": str(log), "cwd": str(self.root), "access": "worker",
+                   "write_paths": ["src/**"], "before_tree": worktree_tree_id(self.root), "wp": None, "stop_on_compaction": False}
+        with mock.patch.object(Bridge, "wake"):
+            return self.bridge.begin_session(log, payload, "coordinator")[0]
+
+    def test_a_task_is_judged_on_the_changes_it_had_at_completion(self) -> None:
+        from wpo.t3 import finish_attempt
+        self.repository()
+        clean = self.worker_request(self.project.runs_dir / "clean.log")
+        (self.root / "src" / "code.txt").write_text("the worker's edit\n")
+        self.bridge.complete(clean["id"], {"state": "done", "text": "done"})
+        self.assertEqual(read_json(self.bridge.request_path(clean["id"]))["completed_changes"], ["src/code.txt"])
+        (self.root / "notes.txt").write_text("written after it completed\n")
+        self.assertEqual(finish_attempt(self.context, clean, recovery=True), "ok")
+        late = self.worker_request(self.project.runs_dir / "late.log")
+        (self.root / "outside.txt").write_text("written before it completed\n")
+        self.bridge.complete(late["id"], {"state": "done", "text": "done"})
+        self.assertEqual(finish_attempt(self.context, late, recovery=True), "scope_violation")
+
+    def test_the_completion_snapshot_writes_nothing_into_the_repository(self) -> None:
+        from wpo.commands import changed_since, worktree_tree_id
+        self.repository()
+        checkout = self.root / "checkout"
+        git(self.root, "worktree", "add", "-q", str(checkout))
+        before = worktree_tree_id(checkout)
+        objects = self.root / ".git" / "objects"
+        loose = sorted(objects.glob("??/*"))
+        (checkout / "src" / "code.txt").write_text("changed\n")
+        (checkout / "src" / "new.txt").write_text("new\n")
+        self.assertEqual(changed_since(checkout, before), ["src/code.txt", "src/new.txt"])
+        self.assertEqual(sorted(objects.glob("??/*")), loose)
+
+    def test_a_failed_snapshot_is_named_in_the_violation(self) -> None:
+        from wpo.t3 import finish_attempt
+        self.repository()
+        request = self.worker_request(self.project.runs_dir / "failed.log")
+        (self.root / "outside.txt").write_text("an edit\n")
+        with mock.patch("wpo.commands.changed_since", side_effect=RuntimeError("git broke")):
+            self.bridge.complete(request["id"], {"state": "done", "text": "done"})
+        stored = read_json(self.bridge.request_path(request["id"]))
+        self.assertEqual((stored["completed_changes"], stored["completed_changes_error"]), (None, "git broke"))
+        self.assertEqual(finish_attempt(self.context, request, recovery=True), "scope_violation")
+        self.assertIn("snapshot failed (git broke); checked against the checkout as it is now",
+                      read_json(self.bridge.request_path(request["id"]))["violation"])
+
+    def read_session(self, log: str) -> tuple[session.SessionSettings, Path]:
+        return (session.SessionSettings("read", [], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "read"}),
+                self.project.runs_dir / log)
+
+    def test_the_scope_lease_names_a_request_before_it_is_published(self) -> None:
+        self.repository()
+        settings, log = self.read_session("first.log")
+        with mock.patch.object(Bridge, "submit", side_effect=RuntimeError("killed at the submit")), self.assertRaises(RuntimeError):
+            run_attempt(self.context, ROUTE, "Read", log, settings)
+        receipt = read_json(log.with_name(log.name + ".t3-invocation.json"))
+        lease = read_json(next((self.bridge.directory / "scope").glob("*.json")))
+        self.assertEqual(lease["request_id"], receipt["request_id"])
+        settings, log = self.read_session("second.log")
+        with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", finished_read):
+            run_attempt(self.context, ROUTE, "Read", log, settings)  # the request it names was never published
+
+    def test_lease_admission_waits_for_a_running_task_and_checks_a_reused_log(self) -> None:
+        self.repository()
+        settings, log = self.read_session("held.log")
+        with mock.patch.object(Bridge, "wait", side_effect=T3Error("stopped waiting")), mock.patch.object(Bridge, "wake"), \
+                self.assertRaisesRegex(T3Error, "stopped waiting"):
+            run_attempt(self.context, ROUTE, "Read", log, settings)
+        other_settings, other = self.read_session("other.log")
+        with self.assertRaisesRegex(T3Error, "no terminal callback"):
+            run_attempt(self.context, ROUTE, "Read", other, other_settings)
+        with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", finished_read):
+            run_attempt(self.context, ROUTE, "Read", log, settings)  # its own reconnect is admitted
+        receipt = log.with_name(log.name + ".t3-invocation.json")
+        held = read_json(next((self.bridge.directory / "scope").glob("*.json")))["request_id"]
+        self.bridge.update(held, state="running", consumed_at=None)
+        write_json(receipt, {**read_json(receipt), "consumed": True})
+        with self.assertRaisesRegex(T3Error, "no terminal callback"):
+            run_attempt(self.context, ROUTE, "Read", log, settings)  # a new generation of the same log is checked
+
+    def test_the_coordinator_is_woken_after_the_guard_exits(self) -> None:
+        events = []
+
+        @contextlib.contextmanager
+        def guard(request_id):
+            events.append("enter")
+            yield
+            events.append("exit")
+        with mock.patch.object(Bridge, "wake", side_effect=lambda *a, **k: events.append("wake")):
+            self.bridge.begin_session(self.root / "guarded.log", self.submit()["payload"], "coordinator", guard)
+        self.assertEqual(events, ["enter", "exit", "wake"])
 
     def test_a_cancelled_builder_is_recorded_as_the_writer_before_the_stop(self) -> None:
         settings = session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "builder"})
