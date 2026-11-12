@@ -2191,6 +2191,46 @@ class AutofixTests(unittest.TestCase):
         self.assertEqual(reports, ["trailing-whitespace fixed 1 file(s): a.py", "upper fixed 1 file(s): a.py", "failing exited 3: boom"])
 
 
+class AutofixLinkTests(unittest.TestCase):
+    """A fixer never writes through a link: what it changes must be inside the tree the checks see."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        base = Path(scratch.name)
+        self.tree, outside = base / "tree", base / "outside"
+        (self.tree / "src" / "inner").mkdir(parents=True)
+        outside.mkdir()
+        self.outside_file = outside / "target.rs"
+        self.outside_file.write_bytes(b"outside   \n")
+        (outside / "via_dir.rs").write_bytes(b"outside dir   \n")
+        (self.tree / "src" / "inner" / "real.rs").write_bytes(b"inside dir   \n")
+        (self.tree / "src" / "owned.rs").write_bytes(b"owned   \n")
+        try:
+            (self.tree / "src" / "link.rs").symlink_to(self.outside_file)
+            (self.tree / "src" / "out").symlink_to(outside, target_is_directory=True)
+            (self.tree / "src" / "in").symlink_to(self.tree / "src" / "inner", target_is_directory=True)
+        except OSError:
+            self.skipTest("This account cannot create symlinks")
+        self.files = ["src/owned.rs", "src/link.rs", "src/out/via_dir.rs", "src/in/real.rs"]
+
+    def fixers(self):
+        from wpo.autofix import Fixer
+        upper = (sys.executable, "-c", "import sys,pathlib\nfor f in sys.argv[1:]: p=pathlib.Path(f); p.write_bytes(p.read_bytes().upper())")
+        return [Fixer("trailing-whitespace", ("*.rs",), (), None, "trailing-whitespace"), Fixer("upper", ("*.rs",), (), upper, None)]
+
+    def test_only_files_reached_without_a_link_are_fixed(self) -> None:
+        from wpo.autofix import run_fixers
+        for fixer in self.fixers():
+            reports = run_fixers(self.tree, self.files, [fixer], {}, 1)
+            self.assertIn(f"{fixer.name} skipped 3 file(s) reached through a link: src/in/real.rs, src/link.rs, src/out/via_dir.rs", reports)
+            self.assertIn(f"{fixer.name} fixed 1 file(s): src/owned.rs", reports)
+        self.assertEqual((self.tree / "src" / "owned.rs").read_bytes(), b"OWNED\n")
+        self.assertEqual(self.outside_file.read_bytes(), b"outside   \n", "a symlinked file's target is untouched")
+        self.assertEqual((self.outside_file.parent / "via_dir.rs").read_bytes(), b"outside dir   \n", "nothing under a linked directory")
+        self.assertEqual((self.tree / "src" / "inner" / "real.rs").read_bytes(), b"inside dir   \n", "a link inside the tree is still a link")
+
+
 class ReviewBriefTests(unittest.TestCase):
     def test_symbols_and_line_numbers_from_a_rust_diff(self) -> None:
         from wpo.review_brief import DEFAULT_SYMBOL_PATTERNS, parse_diff, symbol_sites
