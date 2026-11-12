@@ -157,7 +157,8 @@ quota over the week, counting account-wide usage, so one project cannot spend th
 - **Leads and workers.** Every builder is a lead: it writes precise task specs to
   `.orchestration/tasks/<WP>/<name>.md` and hands them to free/local workers with
   `wpo delegate start|wait|list` (the builder prompt explains it). Workers edit only paths inside
-  `owns` that the lead names. `delegate: none` keeps a WP whole.
+  `owns` that the lead names. `delegate: none` keeps a WP whole. Once the builder session has ended,
+  `delegate start` is refused and the session's workers are stopped and scope-checked.
 - **Worker subagents.** A lead on a claude or gpt route also gets the Agent tool with one `worker`
   subagent (`session_workers`: haiku, low effort; null disables it) for small mechanical pieces it can
   specify in a few lines; their reading and tool output stay out of the lead's context.

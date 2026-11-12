@@ -570,7 +570,7 @@ class T3BackendTests(unittest.TestCase):
                 self.assertRaisesRegex(T3Error, "stopped waiting"):
             run_attempt(self.context, ROUTE, "Read", log, settings)
         other_settings, other = self.read_session("other.log")
-        with self.assertRaisesRegex(T3Error, "no terminal callback"):
+        with self.assertRaisesRegex(T3Error, "is unfinished"):
             run_attempt(self.context, ROUTE, "Read", other, other_settings)
         with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", finished_read):
             run_attempt(self.context, ROUTE, "Read", log, settings)  # its own reconnect is admitted
@@ -578,7 +578,7 @@ class T3BackendTests(unittest.TestCase):
         held = read_json(next((self.bridge.directory / "scope").glob("*.json")))["request_id"]
         self.bridge.update(held, state="running", consumed_at=None)
         write_json(receipt, {**read_json(receipt), "consumed": True})
-        with self.assertRaisesRegex(T3Error, "no terminal callback"):
+        with self.assertRaisesRegex(T3Error, "is unfinished"):
             run_attempt(self.context, ROUTE, "Read", log, settings)  # a new generation of the same log is checked
 
     def test_the_coordinator_is_woken_after_the_guard_exits(self) -> None:
@@ -721,7 +721,7 @@ class T3BackendTests(unittest.TestCase):
         write_json(self.bridge.request_path(reviewer["id"]), stored)
         for request in (builder, reviewer):
             self.bridge.update(request["id"], state="done", result={"text": "ok", "outcome": "ok"})
-        with mock.patch("wpo.runner.stop_delegated_workers"):
+        with mock.patch("wpo.runner.stop_delegated_workers", return_value=[]):
             violations = settle_native_sessions(self.context, SimpleNamespace(id="WP-0001", path=wp_path), lambda role, route: None)
         self.assertEqual(violations, [], "neither survivor edited anything")
         self.assertEqual(wp_path.read_text().count("settled a"), 2)
@@ -746,7 +746,7 @@ class T3BackendTests(unittest.TestCase):
 
     def test_nothing_outstanding_changes_nothing(self) -> None:
         from wpo.runner import settle_native_sessions
-        with mock.patch("wpo.runner.stop_delegated_workers") as barrier:
+        with mock.patch("wpo.runner.stop_delegated_workers", return_value=[]) as barrier:
             self.assertEqual(settle_native_sessions(self.context, SimpleNamespace(id="WP-0001", path=self.root / "x.md"), lambda role, route: None), [])
         barrier.assert_not_called()
 
