@@ -582,7 +582,8 @@ class Bridge:
     def outstanding_sessions(self, wp_id: str) -> list[dict]:
         """The WP's native sessions no runner has finished, oldest first, read from the request store
         (a request made before receipts were written first can lack one): every non-worker session
-        not consumed, and every worker session not terminal (today's worker barrier stops those).
+        not consumed, and every worker session not terminal or, unless legacy, not consumed (the
+        worker barrier finishes those).
         A request with `consumed_at` is consumed exactly when it is set. One from before that field
         is consumed when its receipt is, or names a later request; without a receipt it counts only
         while it is not terminal: finishing a long-ended one now would scope-check it against a
@@ -593,7 +594,8 @@ class Bridge:
             if not request or request.get("kind") != "session" or request["payload"].get("wp") != wp_id:
                 continue
             if request["payload"].get("role") == "worker":
-                if request["state"] not in TERMINAL_STATES:
+                # The worker barrier finishes a stopped worker, once nothing of the WP still runs.
+                if not request.get("consumed_at") and not is_legacy(request):
                     found.append(request)
                 continue
             if "consumed_at" in request:

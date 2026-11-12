@@ -212,27 +212,43 @@ def start(context: Context, lane: str, wp_ids: list[str]) -> int:
 
 
 def stop(context: Context, lane: str) -> None:
-    if context.machine.execution_mode == "t3":
-        from .t3 import Bridge
-        bridge = Bridge(context)
-        for wp in context.effective_wps():
-            if wp.lane == lane:
-                bridge.cancel_wp(wp.id, f"lane {lane} stopped by the operator", "operator")
+    """Stops a lane: its native sessions are asked to cancel, its supervisor is killed, and its
+    delegated workers are fenced, also when the supervisor or the coordinator is already gone. It
+    does not wait for native sessions: the WP's next run settles them, and reports any violation."""
+    from .runner import stop_delegated_workers
+    from .t3 import Bridge, T3Error
+    wps = [wp for wp in context.effective_wps() if wp.lane == lane]
+    bridge = Bridge(context) if context.machine.execution_mode == "t3" else None
+    # First, so a lead's cancel is queued before its workers are fenced. Each intent is on its
+    # request before its wake, so a dead coordinator stops nothing that follows.
+    for wp in wps if bridge else ():
+        try:
+            bridge.cancel_wp(wp.id, f"lane {lane} stopped by the operator", "operator")
+        except T3Error as error:
+            print(f"{lane}: {error}")
     pid = supervisor_pid(context, lane)
     if pid is None:
         print(f"{lane}: no live supervisor")
-        return
-    other_supervisors = [other_pid for state_file in context.project.runs_dir.glob("supervisor-*.state")
-                         if (other := state_file.stem.removeprefix("supervisor-")) != lane and (other_pid := supervisor_pid(context, other))]
-    kill_tree(pid, spared=other_supervisors)
-    # Delegated workers run detached, outside the supervisor's process tree.
-    from .runner import stop_delegated_workers
-    for wp in context.effective_wps():
-        if wp.lane == lane:
-            stop_delegated_workers(context, wp)
-    (context.project.runs_dir / f"supervisor-{lane}.state").write_text("stopped", encoding="utf-8")
-    context.journal.emit("lane-stopped", f"lane {lane} stopped by the orchestrator (pid {pid})", {"supervisor": lane})
-    print(f"{lane}: stopped supervisor {pid} and its sessions; WPs keep their status and resume where they were")
+    else:
+        other_supervisors = [other_pid for state_file in context.project.runs_dir.glob("supervisor-*.state")
+                             if (other := state_file.stem.removeprefix("supervisor-")) != lane and (other_pid := supervisor_pid(context, other))]
+        kill_tree(pid, spared=other_supervisors)
+        (context.project.runs_dir / f"supervisor-{lane}.state").write_text("stopped", encoding="utf-8")
+        context.journal.emit("lane-stopped", f"lane {lane} stopped by the orchestrator (pid {pid})", {"supervisor": lane})
+        print(f"{lane}: stopped supervisor {pid} and its sessions; WPs keep their status and resume where they were")
+    # Delegated workers run detached, outside the supervisor's process tree. A WP merged into main
+    # has no checkout left to fence.
+    merged = context.merged_done_ids()
+    for wp in wps:
+        if wp.id in merged:
+            continue
+        try:
+            stop_delegated_workers(context, wp, wait=False)
+        except T3Error as error:
+            print(f"{lane}: {error}")
+        if bridge and (outstanding := bridge.outstanding_sessions(wp.id)):
+            print(f"{wp.id}: {len(outstanding)} native session(s) still to finish ({', '.join(request['id'] for request in outstanding)}); "
+                  "its next run settles them and reports any scope violation")
 
 
 def hold(context: Context, lane: str, reason: str) -> None:

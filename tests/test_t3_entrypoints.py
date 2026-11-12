@@ -637,7 +637,8 @@ class T3BackendTests(unittest.TestCase):
         finished = self.wp_session("finished", state="done")  # finished but never consumed
         consumed = self.wp_session("consumed", state="done", consumed_at=time.time())
         worker_running = self.wp_session("worker-running", role="worker")
-        worker_done = self.wp_session("worker-done", role="worker", state="done")
+        worker_done = self.wp_session("worker-done", role="worker", state="done")  # legacy: no completion snapshot
+        worker_stopped = self.wp_session("worker-stopped", role="worker", state="done", completed_changes=[])
         self.wp_session("other", wp="WP-0002")
         legacy = {name: self.wp_session(name, state=state) for name, state in (("legacy-receipt", "done"), ("legacy-none-done", "done"),
                                                                               ("legacy-none-running", "running"), ("legacy-superseded", "done"))}
@@ -651,7 +652,8 @@ class T3BackendTests(unittest.TestCase):
             elif name == "legacy-superseded":
                 write_json(receipt, {**read_json(receipt), "request_id": "0" * 32})
         ids = [request["id"] for request in self.bridge.outstanding_sessions("WP-0001")]
-        self.assertEqual(set(ids), {running["id"], finished["id"], worker_running["id"], legacy["legacy-receipt"]["id"], legacy["legacy-none-running"]["id"]})
+        self.assertEqual(set(ids), {running["id"], finished["id"], worker_running["id"], worker_stopped["id"], legacy["legacy-receipt"]["id"],
+                                    legacy["legacy-none-running"]["id"]})
         self.assertNotIn(consumed["id"], ids)
         self.assertNotIn(worker_done["id"], ids)
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -101,6 +103,13 @@ class DelegationTests(unittest.TestCase):
         with mock.patch.object(Bridge, "wake"):
             request, _ = self.bridge.begin_session(log, payload, "coordinator")
         return self.bridge.update(request["id"], state=state, task_id=f"task-{name}")
+
+    def lead_session(self, worker: dict) -> dict:
+        """The lead's own builder session, pending, in the same checkout as `worker`."""
+        log = self.project.runs_dir / "WP-0001" / "builder.log"
+        payload = {**worker["payload"], "role": "builder", "access": "builder", "log_path": str(log), "before_tree": None, "write_paths": []}
+        with mock.patch.object(Bridge, "wake"):
+            return self.bridge.begin_session(log, payload, "coordinator")[0]
 
     def complete(self, request: dict) -> dict:
         return self.bridge.complete(request["id"], {"state": "done", "text": "done", "task_id": request["task_id"]})
@@ -348,10 +357,7 @@ class DelegationTests(unittest.TestCase):
         worker = self.worker()
         (self.root / "outside.txt").write_text("x\n")
         self.complete(worker)
-        lead_log = self.project.runs_dir / "WP-0001" / "builder.log"
-        payload = {**worker["payload"], "role": "builder", "access": "builder", "log_path": str(lead_log), "before_tree": None, "write_paths": []}
-        with mock.patch.object(Bridge, "wake"):
-            lead, _ = self.bridge.begin_session(lead_log, payload, "coordinator")
+        lead = self.lead_session(worker)
         self.assertEqual(self.barrier(wait=False), [])
         self.assertEqual(self.wp.status, "in_progress")
         self.bridge.complete(lead["id"], {"state": "done", "text": "done"})
@@ -462,6 +468,82 @@ class DelegationTests(unittest.TestCase):
         with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", lambda b, r, c=None: b.update(r["id"], state="done", result={"text": "ok"})):
             run_attempt(self.context, ROUTE, "Read", self.project.runs_dir / "next.log", settings)
 
+
+    # Stopping a lane, and what still counts as unsettled
+
+    def stop_lane(self, *wps, supervisor=None, wake=None):
+        from wpo import lanes
+        output = io.StringIO()
+        with mock.patch.object(self.context, "effective_wps", return_value=list(wps)), \
+                mock.patch.object(self.context, "merged_done_ids", return_value={wp.id for wp in wps if wp.status == "merged"}), \
+                mock.patch("wpo.lanes.supervisor_pid", return_value=supervisor), mock.patch("wpo.lanes.kill_tree") as kill, \
+                mock.patch("wpo.runner.python_process_runs", return_value=False), mock.patch("wpo.runner.stop_delegated_workers", wraps=stop_delegated_workers) as fence, \
+                mock.patch.object(Bridge, "wake", side_effect=wake), mock.patch.object(Bridge, "wait", side_effect=AssertionError("lanes stop never waits")), \
+                contextlib.redirect_stdout(output):
+            lanes.stop(self.context, "alpha")
+        return output.getvalue(), kill, [call.args[1].id for call in fence.call_args_list]
+
+    def lane_wp(self, wp_id: str, status: str = "in_progress") -> SimpleNamespace:
+        return SimpleNamespace(id=wp_id, lane="alpha", status=status, path=self.wp_path)
+
+    def test_lanes_stop_fences_workers_without_a_supervisor(self) -> None:
+        open_delegation(self.context, "WP-0001")
+        task_dir = self.record(pid=4242)
+        output, kill, fenced = self.stop_lane(self.lane_wp("WP-0001"), self.lane_wp("WP-0002", "done"), self.lane_wp("WP-0003", "merged"))
+        self.assertIn("no live supervisor", output)
+        kill.assert_not_called()
+        self.assertEqual(fenced, ["WP-0001", "WP-0002"], "a WP done but unmerged is fenced; one merged into main is not")
+        self.assertEqual(Delegation.read_state(task_dir)["state"], "failed")
+        self.assertFalse(read_json(gate_path(self.context, "WP-0001"))["open"])
+
+    def test_lanes_stop_survives_a_dead_coordinator_and_cancels_the_lead_first(self) -> None:
+        open_delegation(self.context, "WP-0001")
+        task_dir = self.record(pid=4242)
+        worker = self.worker()
+        lead = self.bridge.update(self.lead_session(worker)["id"], state="running", task_id="task-lead")
+        marked_at_first_cancel = []
+        real = Bridge.cancel_request
+
+        def cancel(bridge, request, why, origin):
+            marked_at_first_cancel.append(Delegation.read_state(task_dir).get("stop_requested"))
+            return real(bridge, request, why, origin)
+        with mock.patch.object(Bridge, "cancel_request", cancel):
+            output, _, fenced = self.stop_lane(self.lane_wp("WP-0001"), supervisor=None, wake=T3Error("coordinator gone"))
+        self.assertIsNone(marked_at_first_cancel[0], "the lead's cancel is queued before any worker is fenced")
+        self.assertEqual(fenced, ["WP-0001"])
+        self.assertIn("coordinator gone", output)
+        self.assertIn("still to finish", output)
+        for request in (lead, worker):
+            self.assertEqual(read_json(self.bridge.request_path(request["id"]))["cancel_origin"], "operator")
+        self.assertTrue(Delegation.read_state(task_dir)["stop_requested"])
+
+    def test_a_violation_found_after_lanes_stop_is_reported_by_the_next_run(self) -> None:
+        open_delegation(self.context, "WP-0001")
+        worker = self.worker()
+        (self.root / "outside.txt").write_text("x\n")
+        self.complete(worker)
+        before = self.wp_path.read_text()
+        self.stop_lane(self.lane_wp("WP-0001"))
+        self.assertEqual(self.wp_path.read_text(), before)
+        self.assertIsNotNone(read_json(gate_path(self.context, "WP-0001"))["report_since"])
+        self.assertEqual([request["id"] for request in self.bridge.outstanding_sessions("WP-0001")], [worker["id"]])
+        self.assertEqual(self.settle(), [worker["id"]])
+        self.assertEqual(self.wp.status, "blocked")
+
+    def test_integration_and_the_supervisor_see_unsettled_workers(self) -> None:
+        from wpo.integrate import Integration
+        from wpo.supervisor import Supervisor
+        supervisor = SimpleNamespace(context=self.context)
+        self.assertEqual(Supervisor.surviving_sessions(supervisor, "WP-0001"), 0)
+        open_delegation(self.context, "WP-0001")  # a lead session runs, or its runner died
+        self.assertGreater(Supervisor.surviving_sessions(supervisor, "WP-0001"), 0)
+        with self.assertRaisesRegex(RuntimeError, "delegated workers are not settled"):
+            Integration(self.context, "WP-0001", False).run()
+        self.barrier()
+        self.record(pid=None)  # a worker record still running after its barrier
+        self.assertGreater(Supervisor.surviving_sessions(supervisor, "WP-0001"), 0)
+        with self.assertRaisesRegex(RuntimeError, "delegated workers are not settled"):
+            Integration(self.context, "WP-0001", False).run()
 
 if __name__ == "__main__":
     unittest.main()
