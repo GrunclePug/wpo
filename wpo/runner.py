@@ -711,6 +711,56 @@ or 'DECISION: needs-user <question>'.
 """
 
 
+def record_writer_in(ledger: RoundLedger, role: str, route: dict | Route) -> None:
+    """`WorkPackageRun.record_writer` for a given ledger (also used where no runner is active)."""
+    if role in WRITER_ROLES:
+        ledger.state["builder_model_family"] = model_family_of(route)
+        ledger.save()
+
+
+def settle_native_sessions(context: Context, wp: wpfile.WorkPackage, record_writer) -> list[str]:
+    """Finishes the WP's native sessions that outlived their runner (a T3 restart, a killed
+    supervisor), before anything else touches the WP: no route is chosen, nothing is merged in, no
+    phase starts while one may still be writing. Each non-worker survivor, oldest first, is waited
+    for with its running controls (a staged session still gets its compaction cancel) and finished
+    in recovery mode: its writer recorded through `record_writer(role, route)` (the caller's own
+    ledger), its scope checked, its result consumed. Recovery restores safety, not the session's
+    control flow: an operator's cancel, a failure or a compaction is logged and consumed, and the
+    run goes on. Then today's worker barrier stops any surviving workers, also when settling failed.
+    Returns the requests whose scope check failed (their WP is blocked). T3 only."""
+    if context.machine.execution_mode != "t3":
+        return []
+    from .t3 import Bridge, SessionControls, T3Error, finish_attempt
+    bridge = Bridge(context)
+    outstanding = bridge.outstanding_sessions(wp.id)
+    if not outstanding:
+        return []
+    violations, notes = [], []
+    try:
+        for request in (request for request in outstanding if request["payload"].get("role") != "worker"):
+            payload = request["payload"]
+            role = payload.get("role") or payload.get("access")
+            controls = SessionControls(context, bridge, request, payload["route"], bool(payload.get("stop_on_compaction")), {"wp": wp.id, "role": role})
+            try:
+                bridge.wait(request, controls)
+            except T3Error as error:
+                raise T3Error(f"{wp.id} has a native {role} session ({request['id']}) that outlived its runner and stalled: {error} "
+                              "Reconcile it (wpo t3 recover, or record its completion) before the WP runs again.") from error
+            finally:
+                controls.close()
+            disposition = finish_attempt(context, request, lambda route, role=role: record_writer(role, route), recovery=True)
+            notes.append(f"settled a {role} session that outlived its runner ({payload['route']['id']}): {disposition}")
+            if disposition == "scope_violation":
+                violations.append(request["id"])
+        # Written only once every survivor is checked: a note in the WP file would read as the next
+        # survivor's own edit in its scope check.
+        for note in notes:
+            wpfile.log_progress(wpfile.parse(wp.path), note, "runner")
+    finally:
+        stop_delegated_workers(context, wp)
+    return violations
+
+
 def stop_delegated_workers(context: Context, wp: wpfile.WorkPackage) -> None:
     """A worker still editing after its lead's session ended would race verification and review."""
     if context.machine.execution_mode == "t3":
@@ -815,9 +865,7 @@ class WorkPackageRun:
         """Remembers who made the model of the latest session that built the WP (a builder, or a
         staged executor or assembler): an independent review leaves that family out. Planners,
         reviewers, re-evaluations and mechanical repairs build nothing of the WP's design."""
-        if role in WRITER_ROLES:
-            self.ledger.state["builder_model_family"] = model_family_of(route)
-            self.ledger.save()
+        record_writer_in(self.ledger, role, route)
 
     def mode_recorder(self, mode: str):
         return lambda: record_wp_mode(self.context.project.runs_dir, self.wp_id, mode)
@@ -1298,6 +1346,11 @@ class WorkPackageRun:
             raise WorkPackageEnded
 
     def run(self) -> None:
+        # Native sessions an earlier runner left are finished before the phase is chosen from the
+        # WP's status: a surviving builder may have set review while it was still writing.
+        if violations := settle_native_sessions(self.context, self.wp(), self.record_writer):
+            from .t3 import T3Error
+            raise T3Error(f"{self.wp_id}: a session that outlived its runner changed paths outside its access ({', '.join(violations)}); the WP is blocked")
         wp = self.wp()
         if self.ledger.interrupted:
             self.log(f"the previous runner stopped mid-build; that round is not counted ({self.ledger.rounds} rounds so far)")

@@ -512,6 +512,36 @@ class Bridge:
             request = self.submit("session", key, payload, coordinator, initial={"consumed_at": None})
             return request, receipt
 
+    def outstanding_sessions(self, wp_id: str) -> list[dict]:
+        """The WP's native sessions no runner has finished, oldest first, read from the request store
+        (a request made before receipts were written first can lack one): every non-worker session
+        not consumed, and every worker session not terminal (today's worker barrier stops those).
+        A request with `consumed_at` is consumed exactly when it is set. One from before that field
+        is consumed when its receipt is, or names a later request; without a receipt it counts only
+        while it is not terminal: finishing a long-ended one now would scope-check it against a
+        checkout that has moved on since."""
+        found = []
+        for path in (self.directory / "requests").glob("*.json"):
+            request = read_json(path)
+            if not request or request.get("kind") != "session" or request["payload"].get("wp") != wp_id:
+                continue
+            if request["payload"].get("role") == "worker":
+                if request["state"] not in TERMINAL_STATES:
+                    found.append(request)
+                continue
+            if "consumed_at" in request:
+                if not request["consumed_at"]:
+                    found.append(request)
+                continue
+            log_path = request["payload"].get("log_path")
+            receipt = read_json(Path(log_path).with_name(Path(log_path).name + ".t3-invocation.json")) if log_path else None
+            if receipt is None:
+                if request["state"] not in TERMINAL_STATES:
+                    found.append(request)
+            elif receipt["request_id"] == request["id"] and not receipt["consumed"]:
+                found.append(request)
+        return sorted(found, key=lambda request: request["created_at"])
+
     def cancel_request(self, request: dict, why: str, origin: str) -> dict:
         """Asks for a request to be cancelled; `origin` is one of CANCEL_ORIGIN_RANK. The origin is
         recorded on the request itself, under its lock (cancel requests keep their first payload,
