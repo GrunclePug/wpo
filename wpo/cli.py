@@ -20,14 +20,16 @@ def entrypoint() -> int:
     from .boot import BootError
     from .t3 import T3Error
 
+    from .runner import EXIT_BACKEND
+
     try:
         return main()
     except T3Error as error:
         print(f"T3 backend: {error}", file=sys.stderr)
-        return 4
+        return EXIT_BACKEND
     except BootError as error:
         print(f"Boot safety: {error}", file=sys.stderr)
-        return 4
+        return EXIT_BACKEND
 
 
 def split_list(values: list[str] | None) -> list[str]:

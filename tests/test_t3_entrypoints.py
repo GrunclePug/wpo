@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -298,21 +299,108 @@ class T3BackendTests(unittest.TestCase):
         request = self.submit()
         self.bridge.update(request["id"], state="running", task_id="native-task")
         with mock.patch.object(Bridge, "wake"):
-            self.bridge.cancel_wp("WP-0001", "stop")
+            self.bridge.cancel_wp("WP-0001", "stop", "operator")
         plans = [self.bridge.tool_plan(r) for r in self.bridge.pending("coordinator") if r["kind"] == "cancel"]
         self.assertEqual(plans[0], {"tool": "task_cancel", "arguments": {"taskId": "native-task"}})
 
     def test_late_launch_after_pending_cancellation_is_cancelled_natively(self) -> None:
         request = self.submit()
-        self.bridge.cancel_request(request, "stop before launch callback")
+        with mock.patch.object(Bridge, "wake"):
+            self.bridge.cancel_request(request, "stop before launch callback", "operator")
+        # Only the coordinator knows whether it launched it: not settled locally.
+        self.assertEqual(read_json(self.bridge.request_path(request["id"]))["state"], "pending")
         with mock.patch.object(Bridge, "wake"):
             self.bridge.record_started(request["id"], {"taskId": "late-native", "childThreadId": "late-child"})
         original = read_json(self.bridge.request_path(request["id"]))
-        self.assertEqual(original["state"], "cancelled")
+        self.assertEqual((original["state"], original["cancel_origin"]), ("running", "operator"))
         cancels = [r for r in self.bridge.pending("coordinator") if r["kind"] == "cancel"]
         self.assertEqual(cancels[0]["payload"]["task_id"], "late-native")
+        result = self.root / "cancel-done.json"
+        write_json(result, {"state": "done"})
+        cli_command(self.context, SimpleNamespace(t3_command="complete", request=cancels[0]["id"], result_file=result))
+        self.assertEqual(read_json(self.bridge.request_path(request["id"]))["state"], "cancelled")
         self.bridge.complete(request["id"], {"state": "done", "task_id": "late-native", "text": "late output"})
         self.assertEqual(read_json(self.bridge.request_path(request["id"]))["state"], "cancelled")
+
+    def test_backend_and_boot_failures_exit_8_not_the_no_route_code(self) -> None:
+        from wpo import cli
+        from wpo.boot import BootError
+        from wpo.runner import EXIT_BACKEND, EXIT_NO_ROUTE
+        self.assertNotEqual(EXIT_BACKEND, EXIT_NO_ROUTE)
+        for error in (T3Error("coordinator gone"), BootError("foreign host")):
+            with mock.patch("wpo.cli.main", side_effect=error), mock.patch("sys.stderr"):
+                self.assertEqual(cli.entrypoint(), EXIT_BACKEND)
+
+    def finished_attempt(self, completed: dict, settings=None):
+        """Runs a native attempt whose request comes back as `completed` (merged over the request)."""
+        settings = settings or session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, False, 30, {"role": "builder"})
+        with mock.patch.object(Bridge, "wake"), mock.patch.object(Bridge, "wait", lambda _bridge, request, callback=None: {**request, "task_id": "t", **completed}):
+            return run_attempt(self.context, ROUTE, "Task", self.root / f"attempt-{uuid.uuid4().hex}.log", settings)
+
+    def test_an_operator_cancel_ends_the_session_whatever_state_the_task_reached(self) -> None:
+        for state in ("cancelled", "failed", "done"):
+            with self.assertRaises(session.SessionCancelled) as raised:
+                self.finished_attempt({"state": state, "cancel_origin": "operator", "result": {"outcome": "session_error"}})
+            self.assertEqual((raised.exception.origin, raised.exception.route_id), ("operator", ROUTE["id"]))
+        with self.assertRaises(session.SessionCancelled) as raised:
+            self.finished_attempt({"state": "cancelled", "cancel_origin": "cleanup"})
+        self.assertEqual(raised.exception.origin, "cleanup")
+        outcome = self.finished_attempt({"state": "cancelled", "cancel_origin": "cutoff"})
+        self.assertEqual(outcome.outcome, "session_error", "a quota cut-off keeps the failure path")
+
+    def test_a_staged_compaction_stop_is_not_a_cleanup_cancel(self) -> None:
+        settings = session.SessionSettings("builder", ["src/**"], self.root, SessionBrief(None, "", "rules"), {}, False, True, 30, {"role": "executor"})
+        with self.assertRaises(session.CompactionStop):
+            self.finished_attempt({"state": "cancelled", "compacted": True, "cancel_origin": "cleanup"}, settings)
+
+    def test_the_stronger_cancel_origin_wins_in_either_order(self) -> None:
+        for first, second in (("cutoff", "operator"), ("operator", "cutoff"), ("cleanup", "operator"), ("operator", "cleanup")):
+            request = self.submit(key=f"{first}-{second}")
+            self.bridge.update(request["id"], state="running", task_id="native-task")
+            with mock.patch.object(Bridge, "wake"):
+                self.bridge.cancel_request(request, "first", first)
+                self.bridge.cancel_request(request, "second", second)
+            self.assertEqual(read_json(self.bridge.request_path(request["id"]))["cancel_origin"], "operator")
+
+    def test_an_operator_cancel_starts_no_other_route(self) -> None:
+        other = {**ROUTE, "id": "gpt-sol-xhigh", "effort": "xhigh"}
+        selection = SimpleNamespace(candidates=[{**ROUTE, "downgrade": False}, {**other, "downgrade": False}], skipped=[], next_available_at=None)
+        with mock.patch.object(self.context.router, "select", return_value=selection), \
+                mock.patch("wpo.session.build_brief", return_value=SessionBrief(None, "", "rules")), \
+                mock.patch.object(self.context.router, "mark") as mark, \
+                mock.patch("wpo.session.attempt", side_effect=session.SessionCancelled(ROUTE["id"], "cleanup")) as attempt, \
+                self.assertRaises(session.SessionCancelled):
+            session.run_session(self.context, "code", "builder", "Task", self.root / "stem", self.root, write_paths=["src/**"])
+        attempt.assert_called_once()
+        mark.assert_not_called()
+
+    def test_a_cancel_before_launch_waits_for_the_coordinator(self) -> None:
+        import argparse
+        request = self.submit()
+        with mock.patch.object(Bridge, "wake"):
+            self.bridge.cancel_request(request, "lane stopped", "operator")
+        stored = read_json(self.bridge.request_path(request["id"]))
+        self.assertEqual((stored["state"], stored["cancel_requested"]), ("pending", True))
+        with mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as output:
+            cli_command(self.context, SimpleNamespace(t3_command="next", coordinator="coordinator"))
+        entry = next(e for e in json.loads(output.getvalue()) if e["request"]["id"] == request["id"])
+        self.assertNotIn("native_tool", entry, "no launch plan for a cancelled request")
+        command = entry["cancelled_before_launch"].split("t3 complete ", 1)[1].split(". If", 1)[0]
+        parser = argparse.ArgumentParser()
+        from wpo.t3 import add_cli
+        add_cli(parser.add_subparsers(dest="command"))
+        arguments = parser.parse_args(["t3", "complete", *__import__("shlex").split(command)])
+        cli_command(self.context, arguments)
+        self.assertEqual(read_json(self.bridge.request_path(request["id"]))["state"], "cancelled")
+
+    def test_completion_outcomes_are_validated(self) -> None:
+        builder = self.submit(key="builder")
+        with self.assertRaisesRegex(T3Error, "not one of"):
+            self.bridge.complete(builder["id"], {"state": "done", "outcome": "bogus"})
+        with self.assertRaisesRegex(T3Error, "not one of"):
+            self.bridge.complete(builder["id"], {"state": "done", "outcome": "compacted"})
+        staged = self.submit(key="staged", payload={**builder["payload"], "stop_on_compaction": True})
+        self.assertEqual(self.bridge.complete(staged["id"], {"state": "done", "outcome": "compacted"})["state"], "done")
 
     def test_terminal_and_wrong_task_callbacks_cannot_replace_results(self) -> None:
         request = self.submit()
@@ -517,7 +605,7 @@ class T3BackendTests(unittest.TestCase):
             self.bridge.register_workspace(request["id"], "another-thread", tree)
         self.assertEqual(self.bridge.workspace("WP-0001"), recorded)
         cancelled = self.submit("workspace", "WP-0002", {"wp": "WP-0002", "base_commit": base})
-        self.bridge.cancel_request(cancelled, "lane stopped")
+        self.bridge.complete(cancelled["id"], {"state": "cancelled", "detail": "lane stopped"})
         with self.assertRaisesRegex(T3Error, "already cancelled"):
             self.bridge.register_workspace(cancelled["id"], "wp-thread", tree)
         state = read_json(self.bridge.request_path(cancelled["id"]))

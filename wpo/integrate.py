@@ -32,6 +32,7 @@ EXIT_MEANINGS = {
     EXIT_CONFLICT: "merge conflict with main",
     EXIT_VERIFY_FAILED: "verification failed after merging main",
     EXIT_FAST_FORWARD_FAILED: "main could not fast-forward",
+    8: "the T3 backend or the boot fence failed",
 }
 
 

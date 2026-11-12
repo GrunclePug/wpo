@@ -327,7 +327,7 @@ class SchedulingTests(unittest.TestCase):
         from wpo.boot import BootError
         output = io.StringIO()
         with mock.patch("wpo.cli.main", side_effect=BootError("fixture boot changed")), contextlib.redirect_stderr(output):
-            self.assertEqual(cli.entrypoint(), 4)
+            self.assertEqual(cli.entrypoint(), 8, "not 4, the no-route code a supervisor sleeps on")
         self.assertIn("Boot safety: fixture boot changed", output.getvalue())
 
     def test_receipt_cannot_authorize_another_project(self):
