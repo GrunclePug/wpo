@@ -1107,6 +1107,35 @@ class ResumeTests(unittest.TestCase):
             resume_targets(self.context, ["nowhere"])
 
 
+class LaneHoldTests(unittest.TestCase):
+    """Concurrent holds and releases of different lanes all take effect."""
+
+    def test_concurrent_holds_and_a_release_lose_nothing(self) -> None:
+        import threading
+        from types import SimpleNamespace
+
+        from wpo import lanes
+        context = SimpleNamespace(project=SimpleNamespace(runs_dir=Path(tempfile.mkdtemp())))
+        lanes.write_holds(context, {"old": "held before"})
+        names = [f"lane-{n}" for n in range(12)]
+        barrier = threading.Barrier(len(names) + 1)
+
+        def hold(name):
+            barrier.wait()
+            lanes.hold(context, name, f"{name} paused")
+
+        def release():
+            barrier.wait()
+            lanes.release(context, "old")
+        threads = [threading.Thread(target=hold, args=(name,)) for name in names] + [threading.Thread(target=release)]
+        with mock.patch("sys.stdout"):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(lanes.read_holds(context), {name: f"{name} paused" for name in names})
+
+
 class CatchUpWithMainTests(unittest.TestCase):
     """An existing worktree takes main in before its WP's sessions, without touching uncommitted work."""
 
