@@ -129,6 +129,8 @@ DEFAULTS: dict = {
     "env": {},
     # Directories removed once a WP merges (per-WP build output); "{wp}" is the WP id.
     "remove_after_merge": [],
+    # Free GiB required on a WP checkout's volume before its runner starts; null disables.
+    "minimum_build_free_gib": None,
     # Commands run in a new worktree before its first session (generated build inputs).
     "worktree_setup": [],
     # Lock files that conflict on every parallel dependency change, and how to regenerate them.
@@ -330,7 +332,9 @@ class Project:
         return {key: str(value).replace("{wp}", wp_id or "none") for key, value in self.config["env"].items()}
 
     def paths_removed_after_merge(self, wp_id: str) -> list[Path]:
-        return [Path(template.replace("{wp}", wp_id)) for template in self.config["remove_after_merge"]]
+        """The WP's configured build output, including its actual retained native checkout."""
+        from .artifacts import cleanup_paths
+        return cleanup_paths(self, wp_id)
 
     def lane(self, name: str) -> dict:
         return self.config["lanes"].get(name, {})
