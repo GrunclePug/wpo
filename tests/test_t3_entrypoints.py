@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -172,16 +173,20 @@ class T3BackendTests(unittest.TestCase):
         self.assertEqual(context_file.read_text(encoding="utf-8"), request["payload"]["prompt"])
         self.assertIn(context_file.resolve().as_posix(), plan["arguments"]["task"])
 
-    def test_wake_is_debounced_but_later_requests_get_their_own_wake(self) -> None:
+    def test_wake_is_debounced_and_a_later_request_waits_out_the_window(self) -> None:
         response = SimpleNamespace(returncode=0, stderr="", stdout="{}")
-        with mock.patch("wpo.t3.subprocess.run", return_value=response) as send, mock.patch("wpo.t3.time.time", return_value=100):
+        clock = [100.0]
+        with mock.patch("wpo.t3.subprocess.run", return_value=response) as send, \
+                mock.patch("wpo.t3.time.time", side_effect=lambda: clock[0]), \
+                mock.patch("wpo.t3.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
             self.bridge.wake("coordinator", created_after=99)
             self.bridge.wake("coordinator", created_after=99)
+            self.assertEqual(send.call_count, 1, "a request older than the last send is covered by it")
             self.bridge.wake("coordinator", created_after=101)
-            self.assertEqual(send.call_count, 1)
-        with mock.patch("wpo.t3.subprocess.run", return_value=response) as send, mock.patch("wpo.t3.time.time", return_value=106):
+            self.assertEqual(send.call_count, 2, "a newer request inside the window waits it out and is sent, not dropped")
+            self.assertGreaterEqual(clock[0], 105)
             self.bridge.wake("coordinator", created_after=101)
-            self.assertEqual(send.call_count, 1)
+            self.assertEqual(send.call_count, 2)
             self.assertEqual(send.call_args.args[0][1:5], ["thread", "send", "coordinator", "-"])
             self.assertIn("coordinator wake", send.call_args.kwargs["input"])
 
@@ -412,6 +417,113 @@ class T3BackendTests(unittest.TestCase):
         with mock.patch("wpo.project.git", side_effect=with_setup_tree), self.assertRaisesRegex(T3Error, "escapes its checkout"):
             self.bridge.migrate_legacy("WP-0001", target)
         self.assertFalse((outside / "file.txt").exists())
+
+    def stub_sends(self, block=None):
+        """Stubs only the T3 CLI send, so the real wake and debounce logic runs; returns the sends made."""
+        sends = []
+
+        def send(command, **kwargs):
+            if block is not None and not sends:
+                sends.append(kwargs["input"])
+                block.wait(5)
+            else:
+                sends.append(kwargs["input"])
+            return subprocess.CompletedProcess(command, 0, "", "")
+        patcher = mock.patch("wpo.t3.subprocess.run", side_effect=send)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return sends
+
+    def test_attention_recurring_after_acknowledgement_wakes_again(self) -> None:
+        self.bridge.settings["wake_debounce_seconds"] = 0.3
+        sends = self.stub_sends()
+        event = {"kind": "supervisor-finished", "supervisor": "core", "message": "core finished; not done: none"}
+        self.bridge.attention(event)
+        self.bridge.attention(event)  # still pending: the same request, no second wake
+        first = [r for r in self.bridge.pending("coordinator") if r["kind"] == "attention"]
+        self.assertEqual((len(first), len(sends)), (1, 1))
+        self.bridge.complete(first[0]["id"], {"state": "done"})
+        self.bridge.attention(event)  # inside the debounce window: waits it out, then sends
+        second = [r for r in self.bridge.pending("coordinator") if r["kind"] == "attention"]
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(second[0]["id"], first[0]["id"])
+        self.assertEqual(len(sends), 2)
+
+    def test_a_request_created_during_a_send_is_not_covered_by_it(self) -> None:
+        self.bridge.settings["wake_debounce_seconds"] = 0.2
+        release = threading.Event()
+        sends = self.stub_sends(block=release)
+        first = threading.Thread(target=self.bridge.attention, args=({"kind": "wp-blocked", "wp": "WP-0001", "message": "one"},))
+        first.start()
+        while not sends:
+            time.sleep(0.01)
+        second = threading.Thread(target=self.bridge.attention, args=({"kind": "wp-blocked", "wp": "WP-0002", "message": "two"},))
+        second.start()
+        time.sleep(0.1)  # the second request now exists and waits for the wake lock
+        release.set()
+        first.join(5)
+        second.join(5)
+        self.assertEqual(len(sends), 2)
+
+    def test_the_wake_lock_outlasts_a_send(self) -> None:
+        from wpo import t3
+        locks = []
+        real = t3.FileLock
+        with mock.patch("wpo.t3.FileLock", side_effect=lambda path, **kwargs: locks.append(kwargs) or real(path, **kwargs)):
+            self.stub_sends()
+            self.bridge.wake("coordinator", force=True)
+        self.assertGreater(locks[0]["timeout_seconds"], t3.WAKE_SEND_TIMEOUT_SECONDS + float(self.bridge.settings.get("wake_debounce_seconds", 5)))
+
+    def test_failed_workspace_request_is_asked_again(self) -> None:
+        first = self.submit("workspace", "WP-0001", {"wp": "WP-0001", "base_commit": "x"})
+        self.bridge.complete(first["id"], {"state": "failed", "detail": "T3 could not prepare it"})
+        second = self.submit("workspace", "WP-0001", {"wp": "WP-0001", "base_commit": "y"})
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual((second["state"], second["generation"], second["payload"]["base_commit"]), ("pending", 2, "y"))
+        self.assertEqual(self.submit("workspace", "WP-0001", {"wp": "WP-0001"})["id"], second["id"], "a pending one is reused")
+
+    def test_request_ids_keep_generation_one_and_never_collide(self) -> None:
+        import hashlib
+
+        from wpo.t3 import request_id_for
+        legacy = hashlib.sha256(b"attention:K").hexdigest()[:32]
+        self.assertEqual(request_id_for("attention", "K"), legacy)
+        ids = {request_id_for("attention", key, generation) for key in ("K", "K#2", "K#2#2") for generation in (1, 2, 3)}
+        self.assertEqual(len(ids), 9)
+        first = self.submit("attention", "K", {"event": {}})
+        self.assertEqual(first["id"], legacy, "an existing generation-1 file is found under its old id")
+        self.bridge.complete(first["id"], {"state": "done"})
+        again, other = self.submit("attention", "K", {"event": {}}), self.submit("attention", "K#2", {"event": {}})
+        self.assertNotEqual(again["id"], other["id"])
+
+    def native_checkout(self) -> tuple[Path, str]:
+        """A real repository with a separate checkout on its own branch, as T3 prepares one."""
+        for arguments in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+            git(self.root, *arguments)
+        (self.root / "README").write_text("x\n")
+        git(self.root, "add", "README")
+        git(self.root, "commit", "-qm", "base")
+        tree = self.root.parent / f"{self.root.name}-native"
+        git(self.root, "worktree", "add", "-q", "-b", "t3/native", str(tree))
+        self.addCleanup(lambda: __import__("shutil").rmtree(tree, ignore_errors=True))
+        return tree.resolve(), git(self.root, "rev-parse", "main").stdout.strip()
+
+    def test_workspace_registration_is_idempotent_and_refuses_terminal_requests(self) -> None:
+        tree, base = self.native_checkout()
+        request = self.submit("workspace", "WP-0001", {"wp": "WP-0001", "base_commit": base})
+        recorded = self.bridge.register_workspace(request["id"], "wp-thread", tree)
+        self.assertEqual(self.bridge.register_workspace(request["id"], "wp-thread", tree), recorded, "a repeated callback is idempotent")
+        with self.assertRaisesRegex(T3Error, "already done"):
+            self.bridge.register_workspace(request["id"], "another-thread", tree)
+        self.assertEqual(self.bridge.workspace("WP-0001"), recorded)
+        cancelled = self.submit("workspace", "WP-0002", {"wp": "WP-0002", "base_commit": base})
+        self.bridge.cancel_request(cancelled, "lane stopped")
+        with self.assertRaisesRegex(T3Error, "already cancelled"):
+            self.bridge.register_workspace(cancelled["id"], "wp-thread", tree)
+        state = read_json(self.bridge.request_path(cancelled["id"]))
+        self.assertEqual(state["state"], "cancelled")
+        self.assertIn("late_result", state)
+        self.assertIsNone(self.bridge.workspace("WP-0002"))
 
     def test_attention_callbacks_keep_old_journal_and_deduplicate_native_wakes(self) -> None:
         self.context.journal.on_attention = self.bridge.attention

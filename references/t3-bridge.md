@@ -37,6 +37,9 @@ only; running/stalled entries are not new launch requests.
   checkout. The child is a lightweight WP coordinator, not a builder. It registers its actual T3
   checkout/thread using `register-workspace`. Registration verifies repository identity, branch,
   and the expected local-main ancestor. Do not precreate or rebind a checkout with shell commands.
+  A repeated identical registration returns the recorded workspace; one for a request that already
+  failed, was cancelled, or recorded another checkout is kept on the request and refused. A failed
+  or cancelled workspace request is asked again, as a new request, the next time the WP needs it.
 - **Session request:** call its `delegate_task` plan exactly. Every builder, reviewer, re-evaluation,
   repair, staged executor, assembler, worker, audit and placement is a fresh native task. Sessions
   use `isolation: shared` inside the WP coordinator's assigned checkout. Execute the returned target
@@ -54,7 +57,8 @@ only; running/stalled entries are not new launch requests.
   `t3_thread_interrupt`. Record the cancellation callback; Python keeps its task IDs and files.
 - **Attention event:** inspect the reported WPO event and relevant artifacts, take authorized action
   or report the decision needed, then acknowledge the request with a completion callback. Identical
-  repeated attention reasons are deduplicated for model wakes; the original journal keeps every row.
+  attention reasons are deduplicated while one is still pending; once it is acknowledged, the same
+  reason recurring is a new request and wakes the coordinator again. The original journal keeps every row.
 
 Before the first `delegate_task` in each thread, call `orchestrator_capabilities` as required by T3.
 Persist the native response using `wpo t3 started --request <id> --response-file <json>`, preferably
