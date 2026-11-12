@@ -354,7 +354,7 @@ class Supervisor:
         first = "none (verify only)"
         if surviving := self.surviving_sessions(wp.id):
             # The runner settles them first; until then no route is chosen and main is not merged in.
-            self.log(f"{wp.id} has {surviving} native session(s) that outlived their runner; the runner settles them first")
+            self.log(f"{wp.id} has native sessions or delegated workers that outlived their runner ({surviving}); the runner settles them first")
             code = self.run_wp(wp, catch_up=False)
             return self.after_run(wp, code, spec)
         if spec != "none":
@@ -403,11 +403,14 @@ class Supervisor:
         return True
 
     def surviving_sessions(self, wp_id: str) -> int:
-        """How many of the WP's native sessions outlived their runner (T3); 0 standalone."""
+        """How many of the WP's native sessions (T3) outlived their runner, plus one when its
+        delegated workers are not settled yet (both modes)."""
+        from .runner import delegation_unsettled
+        unsettled = int(delegation_unsettled(self.context, wp_id))
         if self.context.machine.execution_mode != "t3":
-            return 0
+            return unsettled
         from .t3 import Bridge
-        return len(Bridge(self.context).outstanding_sessions(wp_id))
+        return len(Bridge(self.context).outstanding_sessions(wp_id)) + unsettled
 
     def after_run(self, wp: wpfile.WorkPackage, code: int, spec: str) -> datetime | None:
         status = self.status_of(wp.id)
