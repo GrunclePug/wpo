@@ -640,6 +640,62 @@ class T3BackendTests(unittest.TestCase):
         self.assertEqual(with_session_prefix(rewritten, prefix), rewritten, "rewriting twice equals rewriting once")
         self.assertEqual(with_session_prefix("wpo statusbar and wpo status", prefix), f"wpo statusbar and {prefix} status")
 
+    def quiet_wait(self, launched: bool, script, idle_minutes: float = 1, hard_minutes: float = 4) -> tuple[list[str], list[bool]]:
+        """Waits on a request with a frozen clock (each poll advances it 30 s; idle limit 1 min,
+        hard limit 4 min). `script(bridge, request_id, clock)` runs on each poll and may end it.
+        Returns the journaled kinds and the force flags of the wakes."""
+        request = self.submit(key=f"quiet-{launched}-{uuid.uuid4().hex}")
+        clock = [1000.0]
+        self.bridge.update(request["id"], created_at=clock[0], payload={**request["payload"], "idle_minutes": idle_minutes})
+        if launched:
+            self.bridge.update(request["id"], state="running", task_id="native", started_at=clock[0])
+        self.bridge.settings["hard_idle_minutes"] = hard_minutes
+        kinds, wakes = [], []
+        with mock.patch("wpo.t3.time.time", side_effect=lambda: clock[0]), \
+                mock.patch("wpo.t3.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + 30)), \
+                mock.patch.object(Bridge, "wake", side_effect=lambda thread, force=False, created_after=None: wakes.append(force)), \
+                mock.patch.object(self.context.journal, "emit", side_effect=lambda kind, message, fields=None: kinds.append(kind)):
+            self.bridge.wait(read_json(self.bridge.request_path(request["id"])), lambda current: script(self.bridge, current["id"], clock))
+        return kinds, wakes
+
+    def test_a_quiet_session_is_reported_once_and_still_finishes(self) -> None:
+        def finish_late(bridge, request_id, clock):
+            if clock[0] >= 1000 + 150:
+                bridge.update(request_id, state="done", result={"text": "late review", "outcome": "ok"})
+        kinds, _ = self.quiet_wait(True, finish_late)
+        self.assertEqual(kinds, ["t3-session-quiet"])
+
+    def test_a_heartbeat_ends_the_quiet_period(self) -> None:
+        def heartbeat_then_finish(bridge, request_id, clock):
+            if clock[0] == 1000 + 90:
+                bridge.update(request_id, last_activity_at=clock[0])
+            if clock[0] >= 1000 + 210:
+                bridge.update(request_id, state="done", result={"text": "ok", "outcome": "ok"})
+        kinds, _ = self.quiet_wait(True, heartbeat_then_finish)
+        self.assertEqual(kinds, ["t3-session-quiet", "t3-session-quiet"], "a later quiet period is reported again")
+
+    def test_the_hard_limit_counts_from_real_activity_only(self) -> None:
+        stalled_at = []
+        def never(bridge, request_id, clock):
+            stalled_at.append(clock[0])
+        with self.assertRaisesRegex(T3Error, "no callback or progress for 4 minutes"):
+            self.quiet_wait(True, never)
+        self.assertEqual(stalled_at[-1], 1000 + 210, "the notice's own write did not move the deadline (stalled at 240 s)")
+
+    def test_the_hard_limit_stands_on_its_own(self) -> None:
+        for idle_minutes in (30, 0):  # a hard limit shorter than the idle limit; no quiet notices at all
+            stalled_at = []
+            with self.assertRaisesRegex(T3Error, "no callback or progress for 2 minutes"):
+                self.quiet_wait(True, lambda bridge, request_id, clock, seen=stalled_at: seen.append(clock[0]), idle_minutes, hard_minutes=2)
+            self.assertEqual(stalled_at[-1], 1000 + 90, f"stalled at 120 s with idle_minutes {idle_minutes}")
+
+    def test_an_unlaunched_request_is_woken_once_more_then_stalls(self) -> None:
+        with self.assertRaisesRegex(T3Error, "never launched") as raised:
+            self.quiet_wait(False, lambda bridge, request_id, clock: None)
+        self.assertIsNotNone(raised.exception)
+        stored = [read_json(path) for path in (self.bridge.directory / "requests").glob("*.json")]
+        self.assertTrue(any(r.get("rewoken_at") and r["state"] == "stalled" for r in stored))
+
     def test_terminal_and_wrong_task_callbacks_cannot_replace_results(self) -> None:
         request = self.submit()
         self.bridge.record_started(request["id"], {"taskId": "native", "childThreadId": "child"})
@@ -664,10 +720,15 @@ class T3BackendTests(unittest.TestCase):
     def test_missing_callback_stalls_without_native_polling_or_automatic_relaunch(self) -> None:
         request = self.submit(payload={"wp": "WP-0001", "idle_minutes": 0.001})
         write_json(self.bridge.request_path(request["id"]), {**request, "updated_at": 1, "created_at": 1})
+        before = sorted((self.bridge.directory / "requests").glob("*.json"))
         with mock.patch.object(Bridge, "wake") as wake, self.assertRaisesRegex(T3Error, "marked stalled"):
             self.bridge.wait(read_json(self.bridge.request_path(request["id"])))
-        wake.assert_not_called()
-        self.assertEqual(read_json(self.bridge.request_path(request["id"]))["state"], "stalled")
+        # The coordinator is woken once more (a lost wake), but nothing is relaunched or polled.
+        self.assertIn(mock.call("coordinator", force=True), wake.call_args_list)
+        self.assertEqual(sorted((self.bridge.directory / "requests").glob("*.json")), before)
+        stored = read_json(self.bridge.request_path(request["id"]))
+        self.assertEqual(stored["state"], "stalled")
+        self.assertIsNotNone(stored["rewoken_at"])
 
     def test_readonly_mutations_are_retained_and_rejected_without_fallback(self) -> None:
         git(self.root, "init", "-q", "-b", "main")

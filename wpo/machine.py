@@ -34,6 +34,9 @@ DEFAULTS: dict = {
         "wake_debounce_seconds": 5,
         "callback_interval_seconds": 0.5,
         "coordinator_idle_minutes": 30,
+        # A launched native session quiet past its idle limit raises `t3-session-quiet` and is waited
+        # for; only after this many minutes without real activity is it marked stalled.
+        "hard_idle_minutes": 240,
         # Route families whose native sessions load instruction files themselves: files named
         # `names` in their checkout and every directory above it, and `files`. Their briefs leave
         # those out (session_brief.native_instruction_files).

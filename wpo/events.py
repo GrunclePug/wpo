@@ -50,6 +50,9 @@ ATTENTION_KINDS = frozenset({
     "audit-done",
     # `wpo audit` crashed before finishing its report; the message says where.
     "audit-failed",
+    # A native T3 session has been quiet for `idle_minutes` (no callback, heartbeat or file write);
+    # wpo keeps waiting until `t3.hard_idle_minutes`, then marks it stalled.
+    "t3-session-quiet",
 })
 INFO_KINDS = frozenset({
     "boot-changed",

@@ -123,8 +123,8 @@ post-run gate is not an OS sandbox or a replacement for native approval.
 Native permission requests are answered in T3. WPO command approvals keep their existing dashboard
 queue and file formats; approving one does not grant permission to a separate native T3 prompt.
 
-An idle request without callbacks or WP progress becomes **stalled**. Its native task may still
-be running: WPO starts no replacement and does not silently fall back to a CLI model. A persistent
+A launched session with no callback, heartbeat or WP progress for its idle limit (`idle_minutes`) raises one `t3-session-quiet` attention event per quiet period and is still waited for: a long review writes nothing. Only after `t3.hard_idle_minutes` (240) without real activity does it become **stalled**. A request never launched is woken once more at its idle limit, and becomes **stalled** if it is still unlaunched one idle period later. A stalled task may still be running: WPO starts no
+replacement and does not silently fall back to a CLI model. A persistent
 scope lease prevents another worker from writing in that checkout until the outstanding task is
 reconciled. `wpo t3 recover`, or the dashboard's **Recover coordinator** button, wakes outstanding
 coordinators once. It never resumes held lanes, polls running tasks, or blindly relaunches them.

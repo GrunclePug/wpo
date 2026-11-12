@@ -286,20 +286,48 @@ class Bridge:
             if current["state"] == "stalled":
                 raise T3Error(current["detail"])
             limit = float(current["payload"].get("idle_minutes", self.settings.get("coordinator_idle_minutes", 30))) * 60
-            activity = max(current.get("updated_at", current["created_at"]), current.get("last_activity_at", 0))
+            hard_limit = float(self.settings.get("hard_idle_minutes", 240)) * 60
+            # Only real activity counts: creation, the launch, callbacks and heartbeats, and the
+            # session's own files. Bookkeeping (`update` moves updated_at) never resets the clock.
+            # A request launched before `started_at` existed falls back to its last update, pinned
+            # once below so the notice's own write cannot move it.
+            started = current.get("started_at") or (current.get("updated_at", 0) if current.get("task_id") else 0)
+            activity = max(current["created_at"], started, current.get("last_activity_at", 0))
             for name in ("heartbeat_file", "progress_file"):
                 if current["payload"].get(name) and Path(current["payload"][name]).is_file():
                     activity = max(activity, Path(current["payload"][name]).stat().st_mtime)
-            if limit > 0 and time.time() - activity >= limit:
-                detail = (f"Native request {current['id']} has no callback/progress for {limit / 60:g} minutes; marked stalled. "
-                          "The native task may still be running. Use wpo t3 recover to reconcile completion; no replacement or CLI fallback was started.")
-                self.update(current["id"], state="stalled", detail=detail)
-                raise T3Error(detail)
+            idle = time.time() - activity
+            if not current.get("task_id"):
+                if limit > 0 and idle >= limit:
+                    # Never launched: a wake may have been lost. Ask once more, then give up.
+                    if not current.get("rewoken_at"):
+                        self.wake(current["coordinator_thread_id"], force=True)
+                        self.update(current["id"], rewoken_at=time.time())
+                    elif time.time() - current["rewoken_at"] >= limit:
+                        self.stall(current, f"was never launched, though the coordinator was woken again {limit / 60:g} minutes ago")
+            elif hard_limit > 0 and idle >= hard_limit:
+                # The hard deadline stands on its own: a shorter one than the idle limit, or no
+                # quiet notices at all (idle_minutes 0), still stalls on time.
+                self.stall(current, f"has had no callback or progress for {hard_limit / 60:g} minutes")
+            elif limit > 0 and idle >= limit and current.get("quiet_reported_for") != activity:
+                # A long session that writes nothing (a review) is not a failure: say so once per
+                # quiet period, and keep waiting.
+                self.update(current["id"], quiet_reported_for=activity, started_at=started or None)
+                wp = current["payload"].get("wp")
+                self.context.journal.emit("t3-session-quiet", f"native {current['payload'].get('role', current['kind'])} session {current['id']}"
+                                          f"{f' of {wp}' if wp else ''} has been quiet for {idle / 60:.0f} minutes; still waiting "
+                                          f"(stalled after {hard_limit / 60:g})", {"wp": wp} if wp else {})
             if current["state"] == "pending":
                 self.wake(current["coordinator_thread_id"], created_after=current["created_at"])
             if callback:
                 callback(current)
             time.sleep(float(self.settings.get("callback_interval_seconds", 0.5)))
+
+    def stall(self, request: dict, why: str) -> None:
+        detail = (f"Native request {request['id']} {why}; marked stalled. The native task may still be running. "
+                  "Use wpo t3 recover to reconcile completion; no replacement or CLI fallback was started.")
+        self.update(request["id"], state="stalled", detail=detail)
+        raise T3Error(detail)
 
     def tool_plan(self, request: dict) -> dict:
         payload = request["payload"]
@@ -481,7 +509,7 @@ class Bridge:
             if request.get("task_id") and request["task_id"] != response.get("taskId"):
                 raise T3Error("A second native task was returned for one request; cancel the duplicate explicitly")
             state = request["state"] if request["state"] in ("done", "failed", "cancelled") else "running"
-            request.update(state=state, task_id=response.get("taskId"), thread_id=response.get("childThreadId"),
+            request.update(state=state, task_id=response.get("taskId"), thread_id=response.get("childThreadId"), started_at=time.time(),
                            link=response.get("link"), native_response=response, updated_at=time.time())
             write_json(path, request)
         if request.get("task_id") and (state == "cancelled" or request.get("cancel_requested")):
