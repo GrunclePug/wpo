@@ -28,6 +28,52 @@ may need their own space checks.
 The skill is source and reusable guidance. Never commit your live machine config, API tokens,
 model-proxy login state, session transcripts, run logs, or account usage history into it.
 
+## Continuous operation
+
+`wpo continuous start [--lane NAME ...]` explicitly enables durable scheduling.
+Legacy behavior stays unchanged until enabled. `stop --reason TEXT` disables new
+selection and asks the selected WPs to checkpoint; it does not kill a geometry
+kernel, remove a checkout or resume any unrelated lane. No native completion or
+scope release is inferred from a pause request. A running task continues to
+occupy its claim/capacity until it actually releases it.
+
+Project settings are configurable, with these defaults:
+
+```json
+{
+  "continuous": {
+    "interval_seconds": 30,
+    "checkpoint_seconds": 3600,
+    "no_progress_seconds": 1800,
+    "failed_rounds": 3
+  }
+}
+```
+
+These are intervention signals, not automatic relaxations of acceptance criteria.
+The coordinator must inspect evidence and set a concrete follow-up milestone;
+the engine cannot judge whether a visible fit, design or research result is useful.
+Use `continuous progress WP-ID --summary TEXT` for an actual measured or visible
+checkpoint. This resets the no-progress clock only, not the milestone deadline.
+Delegated sessions may report progress for their own WP; scheduling administration
+belongs to the coordinator.
+
+`continuous wait WP-ID --reason TEXT` records a material user decision separately
+from a lane hold. Other eligible WPs continue. `continuous continue WP-ID --reason
+TEXT --milestone TEXT` records the coordinator's new plan, retaining history and
+clearing only pause state owned by this policy. It refuses an outstanding native
+request or WP claim. Resolve real WP blockers through the normal WP workflow;
+this command neither changes WP acceptance/status nor adopts unreviewed work.
+
+State lives under `<runs>/continuous/`; native requests retain their existing
+durable receipts. Restarts reconnect through those receipts and claims, never by
+blindly starting another native task. If the scheduler process is stopped while
+enabled, `continuous start` restarts it. A single project mutex prevents concurrent
+scheduler loops. An uncertain scheduling attempt becomes an intervention rather
+than being retried as a new model session. Configuration changes take effect on
+subsequent scheduler ticks; no paid coordinator turn is issued per tick. Do not
+delete run state to recover an outstanding native task.
+
 ## Machine settings
 
 `WPO_MACHINE_CONFIG` selects a JSON file; otherwise the CLI reads

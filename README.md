@@ -105,6 +105,40 @@ Important boundaries:
 - Disabled or unsupported native providers are skipped with an explanation.
   WPO never silently falls back to standalone subprocess models.
 
+## Continuous operation
+
+Continuous mode is opt-in. It uses the existing router, lane limits, build slots,
+claims, native bridge and verification gates. The Python scheduler checks local
+WPO state; it never polls a native task or spends a model turn on each tick.
+
+```sh
+wpo continuous start --lane physics --lane contact
+wpo continuous status
+wpo continuous wait WP-0001 --reason "Choose between two product behaviors"
+wpo continuous continue WP-0001 --reason "Reviewed the evidence" --milestone "Deliver one measured vertical slice"
+wpo continuous progress WP-0001 --summary "Saved the actual before/after recording"
+wpo continuous stop --reason "User stopped project work"
+```
+
+Omit `--lane` to authorize all WP lanes. Explicit lane holds and unrelated pause
+markers remain binding. A human decision blocks only its WP; independent ready
+work can fill freed capacity within quota and ownership limits. A stopped project
+requires an explicit `start`. `continue` requires the old native task and claim
+to be reconciled, a concrete smaller milestone and the reason for the decision.
+It preserves intervention history and does not waive blocked status, dependency,
+ownership, review or integration checks.
+
+Elapsed time, repeated failures and missing useful checkpoints trigger a safe
+wrap-up and durable coordinator attention. The coordinator inspects actual
+results, changes/splits stuck work under the user's authorization, or asks a
+material product question while other work proceeds. Heartbeats alone are not
+evidence of useful progress. Progress reports do not extend the time boundary.
+No available quota, ready work or live native coordinator means progress can
+wait; `status` records the scheduling reasons. Keep T3 and the coordinator usable.
+
+See [continuous configuration](references/configuration.md#continuous-operation)
+for limits and restart behavior.
+
 ## Existing WPO projects
 
 WP files, configuration, ledgers, events, holds, inboxes, and old session logs
