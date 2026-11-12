@@ -374,14 +374,22 @@ def tick(context, now: float | None = None) -> dict:
                 state["waiting"][wp.id] = "; ".join(entry["reason"] for entry in selection.skipped) or "no eligible route"
                 continue
             maximum = context.project.config["max_active_lanes"]
-            active = {item.lane for item in wps if item.lane and lane_active(context, item.lane)}
+            supervised = {item.lane for item in wps if item.lane and lane_active(context, item.lane)}
+            reserved = {item.id for item in wps if item.id not in merged and item.status != "done"
+                        and state["records"].get(item.id, {}).get("state") == "scheduled"
+                        and "started_at" in state["records"][item.id]}
+            active = set(supervised)
             active.update(item.lane for item in wps if item.id in busy or claimed_elsewhere(context, item.id))
+            active.update(item.lane for item in wps if item.id in reserved)
             if maximum and len(active) >= maximum:
                 state["waiting"][wp.id] = "active lane limit reached"
                 continue
             from .lint import patterns_overlap
+            # A native/claimed WP occupies its lane's capacity, not every sibling's paths.
+            # Live supervisors retain lane reservations, including their claim-startup gap.
             occupied = [item for item in wps if item.id != wp.id and
-                        (item.id in busy or claimed_elsewhere(context, item.id) or item.lane in active)]
+                        (item.id in busy or item.id in reserved or claimed_elsewhere(context, item.id)
+                         or item.lane in supervised)]
             if any(patterns_overlap(left, right) for item in occupied for left in wp.owns for right in item.owns):
                 state["waiting"][wp.id] = "owned paths overlap active work"
                 continue

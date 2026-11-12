@@ -127,6 +127,43 @@ class ContinuousTests(unittest.TestCase):
         self.assertEqual(self.launches, [])
         self.assertIn("overlap", state["waiting"]["WP-0002"])
 
+    def test_native_lane_does_not_reserve_inactive_sibling_ownership(self):
+        self.enable()
+        self.wps.append(SimpleNamespace(id="WP-0003", lane="first", status="blocked",
+                                       depends_on=[], owns=["second/shared.py"]))
+        with patch.object(continuous, "native_busy", return_value={"WP-0001"}):
+            continuous.tick(self.context, now=100)
+        self.assertEqual(self.launches, ["WP-0002"])
+
+    def test_claimed_lane_does_not_reserve_inactive_sibling_ownership(self):
+        self.enable()
+        self.wps.append(SimpleNamespace(id="WP-0003", lane="first", status="blocked",
+                                       depends_on=[], owns=["second/shared.py"]))
+        with patch("wpo.lanes.claimed_elsewhere", side_effect=lambda _context, wp_id: wp_id == "WP-0001"):
+            continuous.tick(self.context, now=100)
+        self.assertEqual(self.launches, ["WP-0002"])
+
+    def test_supervisor_lane_keeps_conservative_ownership_before_claim(self):
+        self.enable()
+        self.wps.append(SimpleNamespace(id="WP-0003", lane="first", status="blocked",
+                                       depends_on=[], owns=["second/shared.py"]))
+        with patch("wpo.lanes.supervisor_pid", side_effect=lambda _context, lane: 123 if lane == "first" else None), \
+                patch("wpo.lanes.lane_active", side_effect=lambda _context, lane: lane == "first"):
+            state = continuous.tick(self.context, now=100)
+        self.assertEqual(self.launches, [])
+        self.assertIn("overlap", state["waiting"]["WP-0002"])
+
+    def test_scheduled_ownership_is_reserved_before_supervisor_claim(self):
+        self.enable()
+        state = continuous.status(self.context)
+        state["records"]["WP-0001"] = {"state": "scheduled", "started_at": 100,
+                                             "progress_at": 100, "failure_base": 0}
+        continuous.save(self.context, state)
+        self.wps[0].owns = ["second/shared.py"]
+        state = continuous.tick(self.context, now=101)
+        self.assertEqual(self.launches, [])
+        self.assertIn("overlap", state["waiting"]["WP-0002"])
+
     def test_guard_checks_failure_before_another_session(self):
         self.enable()
         continuous.tick(self.context, now=100)
