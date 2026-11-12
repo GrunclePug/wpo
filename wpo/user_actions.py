@@ -120,12 +120,15 @@ def lane_output(function: Callable[..., object], *arguments: object) -> str:
 
 def effective_wp(context: Context, wp_id: str) -> tuple[wpfile.WorkPackage, bool]:
     """The file holding the WP's live state, as `Context.effective_wps` reads it: its worktree's
-    copy when the worktree has one, else the main checkout's; and whether it is the worktree's."""
+    copy when the worktree has one and main does not hold the WP as done, else the main checkout's;
+    and whether it is the worktree's."""
     checked_wp_id(wp_id)
     try:
         main_copy = wpfile.find(context.project.wp_dir(), wp_id)
     except wpfile.WorkPackageError as error:
         raise UnknownTargetError(f"{wp_id}: {error}") from None
+    if main_copy.status == "done":
+        return main_copy, False
     worktree_copy = context.project.wp_dir(context.project.worktree(wp_id)) / main_copy.file_name
     if worktree_copy.exists():
         return wpfile.parse(worktree_copy), True
