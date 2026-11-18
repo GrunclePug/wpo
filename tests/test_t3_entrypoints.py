@@ -62,7 +62,7 @@ class T3BackendTests(NativeTestCase):
             self.bridge.pending("coordinator")
 
     def test_target_uses_exact_native_provider_model_and_effort_option(self) -> None:
-        self.assertEqual(self.bridge.target(ROUTE), {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "high"}})
+        self.assertEqual(self.bridge.target(ROUTE), {"providerInstanceId": "codex", "model": "gpt-6.2-sol", "options": {"reasoningEffort": "high"}})
         with self.assertRaisesRegex(T3Error, "unavailable or disabled"):
             self.bridge.target({**ROUTE, "family": "claude"})
         with self.assertRaisesRegex(T3Error, "does not advertise effort"):
@@ -143,7 +143,7 @@ class T3BackendTests(NativeTestCase):
 
     def test_session_context_files_survive_replanning_and_keep_requests_separate(self) -> None:
         self.bridge.directory = self.root / "run state with spaces" / "t3"
-        target = {"providerInstanceId": "codex", "model": "gpt-6.1-sol", "options": {"reasoningEffort": "high"}}
+        target = {"providerInstanceId": "codex", "model": "gpt-6.2-sol", "options": {"reasoningEffort": "high"}}
         first = self.submit(key="first", payload={"wp": "WP-0001", "prompt": "First task", "title": "first",
                                                   "native_role": "implementation", "target": target})
         second = self.submit(key="second", payload={"wp": "WP-0001", "prompt": "Independent review", "title": "second",
