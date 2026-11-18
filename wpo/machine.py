@@ -28,7 +28,7 @@ DEFAULTS: dict = {
         "coordinator_thread_id": None,
         "project_id": None,
         "providers": {"gpt": "codex", "claude": "claudeAgent", "free": "opencode", "agy": "antigravity", "xai": "grok"},
-        "models": {"sol": "gpt-6.1-sol", "terra": "gpt-6.1-terra", "luna": "gpt-6-luna", "astra": "gpt-6-astra",
+        "models": {"sol": "gpt-6.2-sol", "terra": "gpt-6.1-terra", "luna": "gpt-6-luna", "astra": "gpt-6.2-astra",
                    "haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5"},
         "options": {},
         "wake_debounce_seconds": 5,

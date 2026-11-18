@@ -22,7 +22,7 @@ from wpo.t3 import Bridge
 CAPABILITIES = {
     "parentThreadId": "coordinator", "providers": [
         {"providerInstanceId": "codex", "canRunChildTask": True, "models": [
-            {"id": "gpt-6.1-sol", "options": [{"id": "reasoningEffort", "values": ["low", "high"]}]}
+            {"id": "gpt-6.2-sol", "options": [{"id": "reasoningEffort", "values": ["low", "high"]}]}
         ]},
         {"providerInstanceId": "claudeAgent", "canRunChildTask": False, "models": []},
     ],
