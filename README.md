@@ -63,6 +63,8 @@ usage adapters, and dashboard ports are configurable. Model scores/prices in
 `models/` are dated example snapshots, not current availability guarantees.
 
 See [configuration](references/configuration.md) for precedence and all settings.
+To keep builds from crowding out interactive use, see
+[sharing the machine](references/configuration.md#sharing-the-machine).
 Machine routing can exclude individual routes or whole families and reserve
 routes for reviews. Ordered `user_rules` entries can include selected sections
 or whole instruction files from the shared source.
