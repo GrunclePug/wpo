@@ -299,6 +299,8 @@ only while they are logged on.
   Let each worktree use its own default `target/`: a per-worktree `CARGO_TARGET_DIR` (or any
   per-worktree `CARGO_*` variable) enters sccache's hash and leaves the shared cache with no hits.
   Keep build directories and the compiler cache on an SSD; a spinning array stalls parallel builds.
+  For a jobs limit that also reaches a session's own builds, see
+  [sharing the machine](references/configuration.md#sharing-the-machine).
 - Only WPs committed on the main branch are scheduled (worktrees come from main); a draft in the
   main checkout's working tree is invisible to lanes and the board until committed.
 - Integration verifies unless the commit is exactly the tree the runner verified and main has not

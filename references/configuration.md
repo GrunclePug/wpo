@@ -28,6 +28,86 @@ may need their own space checks.
 The skill is source and reusable guidance. Never commit your live machine config, API tokens,
 model-proxy login state, session transcripts, run logs, or account usage history into it.
 
+## Sharing the machine
+
+WPO can limit how many lanes and checks run at once; both limits are off by default. It does not
+lower their priority or limit the cores each check uses. On a computer you also use interactively,
+combine its limits with a jobs limit in the build tools and, where the operating system offers one,
+a CPU cap.
+
+Where the work runs decides which limits reach it:
+
+- Lane processes are the lane supervisors, their WP runners, and the commands those run: runner
+  checks, `worktree_prewarm`, integration's verify, lockfile reconcilers, post-merge hooks, and,
+  under the standalone backend, `worktree_setup` and every session. Supervisors are started by
+  `wpo lanes resume`, by `wpo continuous start`, or by a dashboard action. On Linux they stay in
+  the cgroup of whatever started them, even after it exits.
+- Under T3, sessions belong to T3. A `wpo verify` they run takes a build slot and uses the
+  project `env`. Their other shell commands, such as an ad-hoc build or test run, take no slot
+  and use T3's environment.
+
+WPO's own limits:
+
+- `max_active_lanes` limits how many lanes a project schedules at once. `0` means no limit.
+  `wpo lanes resume` counts only non-pool lanes toward it, and a pool lane handing a WP back can
+  start that WP's lane past it.
+- `build_slots` caps how many check runs (`wpo verify`'s and the runner's) go at once. Projects
+  share the slots, so give every project the same value for a common cap; `0` means no limit.
+  Autofix runs before the slot is taken. Integration, setup, prewarm, hooks, staged task checks,
+  and `wpo gate` take no slot, so several lanes' integration verifies can run at once, on top of
+  the slotted checks.
+- Set `max_active_lanes` and `build_slots` in machine `project_defaults` and leave them out of
+  the project JSON, whose values win. `max_active_lanes` still applies to each project on its
+  own.
+- `worktree_prewarm` is a project setting, empty by default. Its commands start warm-up builds
+  when a worktree is created.
+
+A slot limits how many checks run at once, not the cores each one uses. Set a jobs limit where every
+build reads it, a session's ad-hoc builds included: `[build] jobs` in the user's Cargo config
+(`~/.cargo/config.toml`, or `$CARGO_HOME/config.toml`), or `MAKEFLAGS=-jN` for GNU Make in the
+environment that both the lanes and the backend start with. Under T3, the project `env` reaches
+only the commands WPO runs. Cargo's jobs limit covers compilation only. Test runners have their
+own, for example `cargo test -- --test-threads=N` or `CTEST_PARALLEL_LEVEL`. Changing `env`,
+`shell`, or `command_timeout_minutes` invalidates `wpo verify` passes already recorded, so change
+them between WPs.
+
+Priority and CPU weights only share CPU time between processes that want it at once. They do not
+stop builds from filling every core an interactive program leaves idle, and that still costs it
+boost clocks, cache, and memory bandwidth. Fewer parallel jobs do.
+
+On Linux with systemd, `nice` ranks a process only within its CPU scheduling group (its cgroup,
+or its autogroup), so against a program in another group it does little. For a hard cap, put a
+quota on each slice builds run in. For the lanes you start yourself:
+
+```sh
+systemctl --user set-property wpo.slice CPUQuota=800%
+systemd-run --user --scope --slice=wpo.slice wpo lanes resume
+```
+
+- `800%` is eight logical CPUs' worth of time, shared by all processes in the slice. Choose a value
+  below the machine's capacity, and keep the jobs limit too.
+- Start `wpo continuous start` the same way. A wrapper moves only the processes it starts:
+  supervisors and a continuous scheduler already running stay where they are.
+- Under T3, sessions run where T3 puts them, and lanes a coordinator starts stay with its
+  session. When T3 uses systemd scopes, it puts provider processes in scopes under its own slice
+  (`app-t3code.slice` in current releases), wherever T3 itself was started. Check with
+  `systemd-cgls` before choosing which slice to cap, and put a quota on T3's slice too; the two
+  quotas add up.
+- The dashboard runs in the cgroup of the `wpo` command that last started it (most `wpo` commands
+  start it again after an upgrade or a crash), so lanes it starts land there.
+- A compiler cache server keeps the cgroup it was started in. Its compiles count toward a cap
+  only if it was started inside the slice.
+- `CPUQuota=` on a user slice needs the cpu controller delegated to the user manager (the default
+  in recent systemd). `CPUWeight=idle` makes a unit yield, but only to cgroups beside it under
+  the same parent. `AllowedCPUs=` needs the cpuset controller delegated, and `IOWeight=` the io
+  controller plus BFQ or the io cost controller. `ionice` needs an I/O scheduler that honours
+  priority, such as BFQ.
+
+On Windows, the jobs limit, `build_slots`, and `max_active_lanes` are the controls.
+
+A cap makes builds take longer. If checks start hitting `command_timeout_minutes`, raise it
+between WPs.
+
 ## Continuous operation
 
 `wpo continuous start [--lane NAME ...]` explicitly enables durable scheduling.
